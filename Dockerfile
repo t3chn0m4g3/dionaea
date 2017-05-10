@@ -1,44 +1,85 @@
-# dionaea dockerfile by MO
+# Todo, get libemu from source (may not be uninstalled!)
+        # find better solution for libpython3.5 (currently python3-dev must not be uninstalled)
+
+# Dionaea Dockerfile by MO
 #
 # VERSION 17.06
-FROM debian:jessie-slim
+FROM alpine:edge
 MAINTAINER MO
 
 # Include dist
 ADD dist/ /root/dist/
 
-# Install dependencies and packages
-RUN apt-get update -y && \
-    apt-get upgrade -y && \
-    apt-get install -y git supervisor autoconf automake build-essential check cython3 libcurl4-openssl-dev libemu-dev libev-dev \
-                       libglib2.0-dev libloudmouth1-dev libnetfilter-queue-dev libnl-3-dev libpcap-dev libssl-dev libtool libudns-dev \
-                       python3 python3-dev python3-yaml && \
+# Get and install packages for building dionaea
+#RUN echo "http://dl-6.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories && \
+RUN apk -U add autoconf automake build-base check cython libev-dev git glib-dev glib-static loudmouth-dev libnetfilter_queue-dev libnl-dev libpcap-dev openssl-dev libtool udns-dev python3-dev \
+           ca-certificates python3 py3-yaml wget && \
 
-# Get and install dionaea
-    cd /root/ && \
-    git clone https://github.com/dinotools/dionaea && \
-    cd dionaea && \
+# Setup user
+    addgroup -g 2000 tpot && \
+    adduser -S -H -s /bin/bash -u 2000 -D -g 2000 tpot
+
+# Install dionaea and deps 
+RUN pip3 install Cython
+RUN cd /root && \
+
+    ### curl
+    wget https://curl.haxx.se/download/curl-7.54.0.tar.gz && \
+    mkdir -p /root/curl/ && \
+    tar xvfz curl-7.54.0.tar.gz --strip-components=1 -C /root/curl/ && \
+    cd /root/curl && \
     autoreconf -vi && \
-    ./configure --disable-werror --prefix=/opt/dionaea --with-python=/usr/bin/python3 --with-cython-dir=/usr/bin --with-ev-include=/usr/include \
-                --with-ev-lib=/usr/lib --with-emu-lib=/usr/lib/libemu --with-emu-include=/usr/include --with-nl-include=/usr/include/libnl3 \
-                --with-nl-lib=/usr/lib && \
+    ./configure --prefix=/opt/dionaea && \
     make && \
-    make install && \
+    make install
+    
+    ### libemu    
+RUN git clone https://github.com/buffer/libemu /root/libemu/ && \
+    cd /root/libemu/ && \
+    autoreconf -vi && \
+    ./configure --prefix=/opt/dionaea && \
+    make && \
+    make install
 
-# Setup user and groups
-    addgroup --gid 2000 tpot && \
-    adduser --system --no-create-home --shell /bin/bash --uid 2000 --disabled-password --disabled-login --gid 2000 tpot && \
+    ### dionaea
+RUN git clone https://github.com/dinotools/dionaea -b 0.6.0 /root/dionaea/ && \
+    cd /root/dionaea/ && \
+    autoreconf -vi && \
+    ./configure \
+      --prefix=/opt/dionaea \
+      --with-python=/usr/bin/python3 \
+      --with-curl-config=/opt/dionaea/bin \
+      --with-cython-dir=/usr/bin \
+      --enable-ev \
+      --with-ev-include=/usr/include \
+      --with-ev-lib=/usr/lib \
+      --with-emu-lib=/opt/dionaea/lib \
+      --with-emu-include=/opt/dionaea/include \
+      --with-nl-include=/usr/include/netlink \
+      --with-nl-lib=/usr/lib \
+      --enable-netfilter_queue \
+      --with-netfilter_queue-include=/usr/include/libnetfilter_queue \
+      --with-netfilter_queue-lib=/usr/lib \
+      --enable-static && \
+    make && \
+    make install
+
+# Remove packages used to build dionaea
+#    apk del autoconf automake build-base check cython libev-dev git glib-dev glib-static loudmouth-dev libnetfilter_queue-dev libnl-dev libpcap-dev openssl-dev libtool udns-dev python3-dev && \
+
+# Get and install packages for running dionaea
+RUN apk -U add ca-certificates python3 py3-yaml && \
+
+# Get and install libs for running dionaea
+    apk -U add libcurl libev libnl glib-static libnetfilter_queue libpcap udns && \
 
 # Supply configs
     rm -rf /opt/dionaea/etc/dionaea/* && \
-    mv /root/dist/etc/* /opt/dionaea/etc/dionaea/ && \
-    mv /root/dist/supervisord.conf /etc/supervisor/conf.d/ && \
+    mv /root/dist/etc/* /opt/dionaea/etc/dionaea/ 
 
 # Clean up
-    rm -rf /root/* && \
-    apt-get purge git autoconf automake build-essential -y && \
-    apt-get autoremove -y && \
-    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+#    rm -rf /root/* && \
+#    rm -rf /var/cache/apk/*
 
-# Start dionaea
-CMD ["/usr/bin/supervisord","-c","/etc/supervisor/supervisord.conf"]
+# Start cowrie
+CMD ["/opt/dionaea/bin/dionaea", "-u", "tpot", "-g", "tpot", "-c", "/opt/dionaea/etc/dionaea/dionaea.cfg"]
