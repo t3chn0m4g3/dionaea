@@ -50,6 +50,30 @@ Format of the connection information:
     }
 
 
+Further keys of the entry of a connection (added when something happens on it):
+
+``credentials``, ``ftp.commands``
+    Logins and the commands of an FTP client.
+
+    The credentials list retains the first 1000 logins per connection, shared
+    across SMB, FTP, MySQL and MSSQL. Further logins are omitted from JSON;
+    protocol responses and SQLite login logging continue. SMB summary metadata
+    still describes the latest login. This limit also applies with ``flat_data``.
+
+``smb.commands``
+    The commands of an SMB client, ``[{"command": "SMB_COM_NEGOTIATE"}, ...]``;
+    the arguments are not logged. At most 1000 commands per connection.
+
+``downloads``
+    The files that were downloaded by dionaea on behalf of the client (offered
+    by shellcode or a script) or uploaded by the client (FTP, SMB), at most 1000 per
+    connection:
+    ``[{"path": "<file in download.dir>", "url": "<url>", "md5": "<md5>", "sha256": "<sha256>"}, ...]``.
+    The file is named by its md5.
+
+With ``flat_data`` these lists become objects of lists (``{"md5": [...], "url": [...]}``), as
+``credentials`` and ``ftp.commands`` do.
+
 Example config
 --------------
 

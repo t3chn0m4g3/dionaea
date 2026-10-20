@@ -9,22 +9,25 @@ import logging
 import os
 import re
 import sqlite3
-import tempfile
 
 from dionaea.core import incident, connection, g_dionaea
+from dionaea.upload import incoming_file
+from dionaea.logtext import log_text
 from .include.packets import *
 
 from .var import VarHandler
+from .sqlite_policy import protect
 
 logger = logging.getLogger('mysqld')
 
+# the queries arrive as bytes, so the patterns are bytes patterns
 re_show_var = re.compile(
-    r"show\s+((?P<global>global)\s+)?variables(\s+like\s+(?P<sep>\"|')(?P<like>.*?)(?P=sep))?",
+    rb"show\s+((?P<global>global)\s+)?variables(\s+like\s+(?P<sep>\"|')(?P<like>.*?)(?P=sep))?",
     re.I
 )
 
 re_select_var = re.compile(
-    r"select\s+(?P<full_name>@(?P<global>@)?(?P<name>\w+))(\s+limit\s+\d+)?",
+    rb"select\s+(?P<full_name>@(?P<global>@)?(?P<name>\w+))(\s+limit\s+\d+)?",
     re.I
 )
 
@@ -36,13 +39,15 @@ class mysqld(connection):
         "download_suffix"
     ]
     vars = VarHandler()
+    # the configured databases that could not be opened (logged once)
+    _broken_databases = set()
 
     def __init__(self):
         connection.__init__(self, "tcp")
         self.config = None
         self.state = ""
         self.regex_statement = re.compile(
-            r"""([A-Za-z0-9_.]+\(.*?\)+|\(.*?\)+|"(?:[^"]|\"|"")*"+|'[^'](?:|\'|'')*'+|`(?:[^`]|``)*`+|[^ ,]+|,)"""
+            rb"""([A-Za-z0-9_.]+\(.*?\)+|\(.*?\)+|"(?:[^"]|\"|"")*"+|'[^'](?:|\'|'')*'+|`(?:[^`]|``)*`+|[^ ,]+|,)"""
         )
         self.download_dir = None
         self.download_suffix = ".tmp"
@@ -80,16 +85,25 @@ class mysqld(connection):
         self._open_db('information_schema')
 
     def _open_db(self, Database):
-        logger.warn("DATABASE opening %s" % Database)
+        logger.debug("DATABASE opening %s" % Database)
         try:
             p = self.config[Database]['path']
-            logger.warn("open db %s -> %s" % (Database, p))
-            self.dbh = sqlite3.connect(p)
-            self.cursor = self.dbh.cursor()
-            self.database = Database
-            return True
-        except:
+        except (KeyError, TypeError):
+            # a database name of the client that is not configured
             return False
+        logger.debug("open db %s -> %s" % (Database, p))
+        try:
+            self.dbh = sqlite3.connect(p)
+            protect(self.dbh)
+            self.cursor = self.dbh.cursor()
+        except Exception as e:
+            # a database of the configuration: an error of the setup, logged once per database
+            if Database not in mysqld._broken_databases:
+                mysqld._broken_databases.add(Database)
+                logger.warning("Unable to open the database %s (%s): %s", Database, p, e)
+            return False
+        self.database = Database
+        return True
 
     def _handle_COM_INIT_DB(self, p):
         Database = p.Database.decode('utf-8')
@@ -146,7 +160,7 @@ class mysqld(connection):
         if re.match(b'set ', p.Query, re.I):
             r = MySQL_Result_OK(Message="#2")
 
-        elif re.match(r'select\s+database\s*\(\s*\)$', p.Query, re.I):
+        elif re.match(rb'select\s+database\s*\(\s*\)$', p.Query, re.I):
             r = [
                 MySQL_Result_Header(FieldCount=1),
                 MySQL_Result_Field(
@@ -167,7 +181,7 @@ class mysqld(connection):
                 MySQL_Result_EOF(ServerStatus=0x002)
             ]
 
-        elif re.match(r"show\s+databases$", p.Query, re.I):
+        elif re.match(rb"show\s+databases$", p.Query, re.I):
             r = [
                 MySQL_Result_Header(FieldCount=1),
                 MySQL_Result_Field(
@@ -192,7 +206,7 @@ class mysqld(connection):
             # r.append(MySQL_Result_Row_Data(ColumnValues=['information_schema']))
             r.append(MySQL_Result_EOF(ServerStatus=0x002))
 
-        elif re.match(r'show\s+tables$', p.Query, re.I):
+        elif re.match(rb'show\s+tables$', p.Query, re.I):
             r = [
                 MySQL_Result_Header(FieldCount=1),
                 MySQL_Result_Field(
@@ -257,9 +271,14 @@ class mysqld(connection):
                         # x.show()
                         r.append(x),
                     r.append(MySQL_Result_EOF(ServerStatus=0x002))
-            except Exception as e:
-                logger.warn("SQL ERROR %s" % e)
-                logger.warn("SQL ERROR in %s" % p.Query)
+            except (sqlite3.Error, UnicodeDecodeError) as e:
+                # what the client sent: refused by sqlite (or by the policy), or no UTF-8
+                logger.info("SQL ERROR %s" % e)
+                logger.info("SQL ERROR in %s" % p.Query)
+                r = MySQL_Result_Error(Message="Learn SQL!")
+            except Exception:
+                # an error of dionaea
+                logger.warning("SQL ERROR in %r", p.Query[:200], exc_info=True)
                 r = MySQL_Result_Error(Message="Learn SQL!")
         return r
 
@@ -273,8 +292,8 @@ class mysqld(connection):
         if len(query) == 0:
             return False
 
-        regex_function = re.compile(r"(?P<name>[A-Za-z0-9_.]+)\((?P<args>.*?)\)+")
-        regex_url = re.compile(r"(?P<url>(http|ftp|https)://([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])?)")
+        regex_function = re.compile(rb"(?P<name>[A-Za-z0-9_.]+)\((?P<args>.*?)\)+")
+        regex_url = re.compile(rb"(?P<url>(http|ftp|https)://([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])?)")
 
         m = re_select_var.match(p.Query)
         if m:
@@ -300,7 +319,7 @@ class mysqld(connection):
             r.append(MySQL_Result_EOF(ServerStatus=0x002))
 
             r.append(
-                MySQL_Result_Row_Data(ColumnValues=["%s\0" % var])
+                MySQL_Result_Row_Data(ColumnValues=["%s" % var])
             )
             r.append(MySQL_Result_EOF(ServerStatus=0x002))
             return r
@@ -321,7 +340,7 @@ class mysqld(connection):
             try:
                 data = bytearray.fromhex(data.decode("ascii"))
             except (UnicodeDecodeError, ValueError):
-                logger.warning("Unable to decode hex string %r", query[0][2:], exc_info=True)
+                logger.warning("Unable to decode hex string %s", log_text(query[0][2:]), exc_info=True)
                 return False
 
             self._report_raw_data(data)
@@ -339,7 +358,7 @@ class mysqld(connection):
             try:
                 data = bytearray.fromhex(query[0][2:].decode("ascii"))
             except UnicodeDecodeError as e:
-                logger.warning("Unable to decode hex string %r", query[0][2:], exc_info=True)
+                logger.warning("Unable to decode hex string %s", log_text(query[0][2:]), exc_info=True)
                 return False
 
             self._report_raw_data(data)
@@ -351,7 +370,7 @@ class mysqld(connection):
             if m_url:
                 i = incident("dionaea.download.offer")
                 i.con = self
-                i.url = m_url.group("url")
+                i.url = m_url.group("url").decode("ascii")
                 i.report()
             return True
 
@@ -403,7 +422,7 @@ class mysqld(connection):
                 if var_name and not var_name.match(name.encode("ascii")):
                     continue
                 r.append(
-                    MySQL_Result_Row_Data(ColumnValues=[name + '\0', "%s\0" % var])
+                    MySQL_Result_Row_Data(ColumnValues=[name, "%s" % var])
                 )
 
             r.append(MySQL_Result_EOF(ServerStatus=0x002))
@@ -416,12 +435,7 @@ class mysqld(connection):
 
         :param bytes data: File data
         """
-        fp_tmp = tempfile.NamedTemporaryFile(
-            delete=False,
-            dir=self.download_dir,
-            prefix='mysql-',
-            suffix=self.download_suffix
-        )
+        fp_tmp = incoming_file("mysql-", suffix=self.download_suffix, download_dir=self.download_dir)
 
         fp_tmp.write(data)
 

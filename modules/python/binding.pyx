@@ -26,6 +26,10 @@ cdef extern from "module.h":
 	cdef object c_pygetifaddrs "pygetifaddrs"(object self, object args)
 	cdef object c_py_config "py_config"(object self, object args)
 	cdef object c_version "pyversion"(object self, object args)
+	ctypedef struct c_py_timer "struct py_timer":
+		pass
+	c_py_timer *c_py_timer_new "py_timer_new"(object callback, double after, double repeat)
+	void c_py_timer_free "py_timer_free"(c_py_timer *t)
 
 
 #cdef extern from "../../include/dionaea.h":
@@ -34,6 +38,21 @@ cdef extern from "module.h":
 #
 #	cdef extern c_dionaea *g_dionaea
 #
+cdef extern from "../../include/processor.h":
+	ctypedef struct c_processor_stats "struct processor_stats":
+		size_t stream_bytes
+		size_t stream_chunks
+		size_t stream_peak_bytes
+		size_t stream_peak_chunks
+		size_t stream_refused_instance
+		size_t stream_refused_global
+		unsigned int jobs_waiting
+		unsigned int jobs_peak_waiting
+		unsigned int jobs_refused
+		unsigned int overloads
+		unsigned int gave_up
+	void c_processor_stats_get "processor_stats_get"(c_processor_stats *stats)
+
 cdef class dionaea:
 	cdef c_dionaea *thisptr
 	def config(self):
@@ -42,9 +61,66 @@ cdef class dionaea:
 		return c_pygetifaddrs(<object> None, <object> None)
 	def version(self):
 		return c_version(<object> None, <object> None)
+	def processor_stats(self):
+		"""Counters of the native stream processing (diagnostics, read only)."""
+		cdef c_processor_stats stats
+		c_processor_stats_get(&stats)
+		return {
+			"stream_bytes": stats.stream_bytes,
+			"stream_chunks": stats.stream_chunks,
+			"stream_peak_bytes": stats.stream_peak_bytes,
+			"stream_peak_chunks": stats.stream_peak_chunks,
+			"stream_refused_instance": stats.stream_refused_instance,
+			"stream_refused_global": stats.stream_refused_global,
+			"jobs_waiting": stats.jobs_waiting,
+			"jobs_peak_waiting": stats.jobs_peak_waiting,
+			"jobs_refused": stats.jobs_refused,
+			"overloads": stats.overloads,
+			"gave_up": stats.gave_up,
+		}
 
 
 g_dionaea = dionaea()
+
+
+cdef class timer:
+	"""
+	A timer of the event loop: callback() runs in the thread of the loop, as the
+	callbacks of the connections, first after `after` seconds, then every
+	`repeat` seconds (0: once). Create and stop it in that thread too (a handler,
+	a service). stop() ends it; a timer that ran out ends itself. An exception of
+	the callback is logged, the timer goes on.
+	"""
+	cdef c_py_timer *thisptr
+	cdef object callback
+
+	def __cinit__(self):
+		self.thisptr = NULL
+
+	def __init__(self, callback, after, repeat=0.0):
+		if not callable(callback):
+			raise TypeError("callback is not callable")
+		self.stop()
+		self.callback = callback
+		self.thisptr = c_py_timer_new(self._fire, float(after), float(repeat))
+
+	def _fire(self):
+		try:
+			self.callback()
+		except BaseException:
+			logging.error("There was an error in a timer callback", exc_info=True)
+
+	def stop(self):
+		cdef c_py_timer *t = self.thisptr
+		if t != NULL:
+			self.thisptr = NULL
+			c_py_timer_free(t)
+
+	def __dealloc__(self):
+		cdef c_py_timer *t = self.thisptr
+		if t != NULL:
+			self.thisptr = NULL
+			c_py_timer_free(t)
 
 
 
@@ -133,6 +209,7 @@ cdef extern from "../../include/connection.h":
 		c_node_info local
 		c_connection_stats_info stats
 		c_processor_data *processor_data
+		c_bool download_guard
 
 	bint c_connection_transport_from_string "connection_transport_from_string" (char *, c_connection_transport *)
 	const_char_ptr c_connection_transport_to_string "connection_transport_to_string"(c_connection_transport)
@@ -424,7 +501,30 @@ ctypedef enum:
 	ECONDNSTIMEOUT   = 0,
 	ECONUNREACH      = 1,
 	ECONNOSUCHDOMAIN = 2,
-	ECONMANY         = 4
+	ECONMANY         = 4,
+	ECONFILTERED     = 5
+
+# the connection classes whose __init__ has a default for every argument (connection.__init__)
+_init_checked = weakref.WeakSet()
+
+
+def _check_init_defaults(obj):
+	"""LoaderError if an argument of obj.__init__ has no default (the classes are made at run time)."""
+	_sig = inspect.signature(obj.__init__)
+	for n, v in _sig.parameters.items():
+		if n == "self" and v.default == v.empty:
+			continue
+		if v.kind in (v.VAR_POSITIONAL, v.VAR_KEYWORD):
+			# Skip *args and **kwargs type vars
+			continue
+		if v.default == v.empty:
+			msg = "All arguments of __init__ must have a default value. class: '{}', arg: '{}'".format(
+				obj.__class__.__name__,
+				n
+			)
+			logger.warning(msg)
+			raise LoaderError(msg)
+
 
 cdef class connection:
 	"""the connection"""
@@ -441,20 +541,13 @@ cdef class connection:
 
 
 	def __init__(self, con_type=None):
-		_sig = inspect.signature(self.__init__)
-		for n, v in _sig.parameters.items():
-			if n == "self" and v.default == v.empty:
-				continue
-			if v.kind in (v.VAR_POSITIONAL, v.VAR_KEYWORD):
-				# Skip *args and **kwargs type vars
-				continue
-			if v.default == v.empty:
-				msg = "All arguments of __init__ must have a default value. class: '{}', arg: '{}'".format(
-					self.__class__.__name__,
-					n
-				)
-				logger.warning(msg)
-				raise LoaderError(msg)
+		# once per class: the wrapper of every incident.con comes through here (about 7 per
+		# connection in the log handlers), and inspect.signature of the Cython __init__
+		# parses its text signature and leaves a class in a reference cycle each time
+		cls = type(self)
+		if cls not in _init_checked:
+			_check_init_defaults(self)
+			_init_checked.add(cls)
 
 		cdef c_connection_transport enum_type
 		if self.thisptr == NULL:
@@ -619,7 +712,7 @@ cdef class connection:
 			raise ReferenceError(u'the object requested does not exist')
 		return c_connection_listen(self.thisptr, size)
 
-	def connect(self, addr, port, iface=u''):
+	def connect(self, addr, port, iface=u'', download=False):
 		"""connect a remote host by ipv4/6 or domain on a given port using a specified iface (for ipv6 local scope)"""
 		if self.thisptr == NULL:
 			raise ReferenceError(u'the object requested does not exist')
@@ -634,6 +727,8 @@ cdef class connection:
 		else:
 			raise ValueError(u"iface requires text input, got %s" % type(iface))
 
+		if download:
+			self.thisptr.download_guard = True
 		c_connection_connect(self.thisptr,addr_utf8,port,iface_utf8)
 
 	def send(self, data, local=None, remote=None):
@@ -843,6 +938,11 @@ cdef c_bool handle_error_cb(c_connection *con, c_connection_error err) except * 
 			connection=instance,
 			error_id=err
 		)
+	elif err == ECONFILTERED:
+		i = exception.ConnectionRefusedByFilter(
+			connection=instance,
+			error_id=err
+		)
 	else:
 		i = exception.ConnectionUnknownError(
 			connection=connection,
@@ -899,6 +999,26 @@ cdef c_bool process_process(c_connection *con, void *config) except * with gil:
 	cdef connection instance
 	instance = <connection>c_connection_protocol_ctx_get(con)
 	instance.bistream = []
+
+cdef extern from "../../include/download_log.h":
+	void c_download_refused "download_refused" (char *url)
+	void c_download_failed "download_failed" (char *url, char *reason)
+
+def _log_text(value, none=u"(no url)"):
+	"""bytes of value for download_log.c, which makes them printable and cuts them; none for None."""
+	if value is None:
+		value = none
+	if isinstance(value, bytes):
+		return value
+	return unicode(value).encode(u'UTF-8', u'backslashreplace')
+
+def download_refused(url):
+	"""The download target filter refused the target of url: one info line (download_log.h)."""
+	c_download_refused(_log_text(url))
+
+def download_failed(url, reason):
+	"""The download of url failed for reason: one info line, at most one warning a minute sums them up."""
+	c_download_failed(_log_text(url), _log_text(reason, u"no reason"))
 
 def dlhfn(name, number, path, line, msg):
 	if isinstance(name, unicode):

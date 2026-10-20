@@ -16,13 +16,17 @@
 # our gpl project
 
 from dionaea import IHandlerLoader, ServiceLoader
-from dionaea.core import connection, ihandler, g_dionaea, incident
-from dionaea.exception import ServiceConfigError
+from dionaea.core import connection, ihandler, g_dionaea, incident, download_failed, download_refused
+from dionaea.exception import ConnectionRefusedByFilter, ServiceConfigError
+from dionaea.logtext import log_text
+from dionaea.mirror_policy import normalize
+from dionaea.upload import incoming_file
 
-import tempfile
+from collections import OrderedDict
 import struct
 import logging
 import os
+import time
 
 
 DEF_BLKSIZE = 512
@@ -32,6 +36,138 @@ MAX_BLKSIZE = 65536
 
 logger = logging.getLogger('tftp')
 logger.setLevel(logging.INFO)
+
+# Sessions of the server (TftpServerHandler) at a time: each one is a UDP socket of
+# its own until the transfer ends or its idle timeout runs out. At most MAX_SESSIONS
+# at a time, MAX_SESSIONS_PER_SOURCE of one source address.
+MAX_SESSIONS = 64
+MAX_SESSIONS_PER_SOURCE = 4
+
+
+class TftpSessionLimits(object):
+    """The open server sessions of all TFTP services, in all and per source address."""
+
+    def __init__(self, total_max=MAX_SESSIONS, per_source_max=MAX_SESSIONS_PER_SOURCE):
+        self.total_max = total_max
+        self.per_source_max = per_source_max
+        self.reset()
+
+    def reset(self):
+        self.total = 0
+        self.per_source = {}
+        self.refused = 0
+        self.full = False
+
+    def claim(self, source):
+        """True and the session counted, or False when a limit is reached."""
+        if self.total >= self.total_max or self.per_source.get(source, 0) >= self.per_source_max:
+            self.refused += 1
+            if self.total >= self.total_max and not self.full:
+                self.full = True
+                logger.warning("TFTP session limit reached (%d sessions), refusing read requests", self.total_max)
+            return False
+        self.total += 1
+        self.per_source[source] = self.per_source.get(source, 0) + 1
+        return True
+
+    def release(self, source):
+        count = self.per_source.get(source, 0)
+        if count <= 0:
+            return
+        if count == 1:
+            del self.per_source[source]
+        else:
+            self.per_source[source] = count - 1
+        self.total -= 1
+        if self.full and self.total < self.total_max:
+            self.full = False
+            logger.info("TFTP sessions below the limit again, %d read requests refused so far", self.refused)
+
+
+SESSIONS = TftpSessionLimits()
+
+
+def source_key(host):
+    """The source address of a request as SESSIONS and ERRORS count it: an IPv4-mapped
+    IPv6 address (a dual-stack socket) is the IPv4 address."""
+    address = normalize(host)
+    return str(address) if address is not None else host
+
+
+# ERROR replies of the server socket (a refused or unsupported request) and of the
+# sessions (file missing, path outside the root, mode other than octet): every one
+# answers a single UDP packet, so they are rate limited
+# per source address and in all, in the same buckets; above that a request gets no reply.
+ERRORS_PER_SOURCE_RATE = 10.0     # a second
+ERRORS_PER_SOURCE_BURST = 20
+ERRORS_RATE = 200.0               # a second, all sources
+ERRORS_BURST = 200
+ERRORS_MAX_SOURCES = 4096         # sources remembered (least recently seen go first)
+ERRORS_LOG_INTERVAL = 60.0        # seconds: a limited source is logged once in it
+ERRORS_LOG_SOURCES = 10           # sources logged in one interval, then one line for the rest
+
+
+class TftpErrorLimiter(object):
+    """Token buckets for the ERROR replies of the server socket and of the sessions: per source address and in all."""
+
+    def __init__(self, rate=ERRORS_PER_SOURCE_RATE, burst=ERRORS_PER_SOURCE_BURST, total_rate=ERRORS_RATE,
+                 total_burst=ERRORS_BURST, max_sources=ERRORS_MAX_SOURCES, log_interval=ERRORS_LOG_INTERVAL,
+                 log_sources=ERRORS_LOG_SOURCES, clock=time.monotonic):
+        self.rate = rate
+        self.burst = burst
+        self.total_rate = total_rate
+        self.total_burst = total_burst
+        self.max_sources = max_sources
+        self.log_interval = log_interval
+        self.log_sources = log_sources
+        self.clock = clock
+        now = clock()
+        self.total_tokens = float(total_burst)
+        self.total_time = now
+        # source -> [tokens, time of the tokens, time it was last logged, replies dropped]
+        self.sources = OrderedDict()
+        self.dropped = 0
+        self.log_window = now
+        self.logged_in_window = 0
+
+    def allow(self, source):
+        """True: send the ERROR reply to source. False: drop it."""
+        now = self.clock()
+        self.total_tokens = min(self.total_burst, self.total_tokens + (now - self.total_time) * self.total_rate)
+        self.total_time = now
+        entry = self.sources.get(source)
+        if entry is None:
+            entry = [float(self.burst), now, None, 0]
+            self.sources[source] = entry
+            while len(self.sources) > self.max_sources:
+                self.sources.popitem(last=False)
+        else:
+            self.sources.move_to_end(source)
+            entry[0] = min(self.burst, entry[0] + (now - entry[1]) * self.rate)
+            entry[1] = now
+        if entry[0] >= 1.0 and self.total_tokens >= 1.0:
+            entry[0] -= 1.0
+            self.total_tokens -= 1.0
+            return True
+        entry[3] += 1
+        self.dropped += 1
+        if entry[2] is None or now - entry[2] >= self.log_interval:
+            entry[2] = now
+            self._log(source, entry[3], now)
+        return False
+
+    def _log(self, source, dropped, now):
+        if now - self.log_window >= self.log_interval:
+            self.log_window = now
+            self.logged_in_window = 0
+        self.logged_in_window += 1
+        if self.logged_in_window <= self.log_sources:
+            logger.warning("TFTP error replies to %s are rate limited, %d dropped", source, dropped)
+        elif self.logged_in_window == self.log_sources + 1:
+            logger.warning("TFTP error replies to more sources are rate limited, %d dropped in all", self.dropped)
+
+
+ERRORS = TftpErrorLimiter()
 
 
 class TFTPDownloadHandlerLoader(IHandlerLoader):
@@ -494,12 +630,15 @@ ERROR | 05    |  ErrorCode |   ErrMsg   |   0  |
     def encode(self):
         """Encode the DAT packet based on instance variables, populating
         self.buffer, returning self."""
-        format = "!HH%dsx" % len(self.errmsgs[self.errorcode])
+        errmsg = self.errmsg if self.errmsg is not None else self.errmsgs[self.errorcode]
+        if isinstance(errmsg, str):
+            errmsg = errmsg.encode("utf-8")
+        format = "!HH%dsx" % len(errmsg)
         logger.debug("encoding ERR packet with format %s" % format)
         self.buffer = struct.pack(format,
                                   self.opcode,
                                   self.errorcode,
-                                  self.errmsgs[self.errorcode].encode("utf-8"))
+                                  errmsg)
         return self
 
     def decode(self):
@@ -511,7 +650,7 @@ ERROR | 05    |  ErrorCode |   ErrMsg   |   0  |
         logger.debug("Decoding ERR packet with format: %s" % format)
         self.opcode, self.errorcode, self.errmsg = struct.unpack(format,
                                                                  self.buffer)
-        logger.warn("ERR packet - errorcode: %d, message: %s"
+        logger.info("ERR packet - errorcode: %d, message: %s"
                     % (self.errorcode, self.errmsg))
         return self
 
@@ -616,10 +755,24 @@ class TftpPacketFactory(object):
 
 
 class TftpServerHandler(TftpSession):
-    def __init__ (self, state, root, localhost, remotehost, remoteport, packet):
-        TftpSession.__init__(self)
-        self.bind(localhost,0)
-        self.connect(remotehost, remoteport)
+    def __init__ (self, state=None, root=None, localhost=None, remotehost=None, remoteport=None, packet=None,
+                  session_source=None):
+        # the place of the session in SESSIONS (claimed by TftpServer): set before bind,
+        # whose error callback can come first, and given back once
+        self.session_source = session_source
+        # the source its ERROR replies are counted for in ERRORS (kept after the place is back)
+        self.error_source = session_source if session_source is not None else source_key(remotehost)
+        self.fileobj = None
+        try:
+            TftpSession.__init__(self)
+            # False: no socket (socket() failed: EMFILE, ENFILE, ENOBUFS; the core has called
+            # handle_error and frees the connection, no disconnect follows) or bind failed
+            self.bound = bool(self.bind(localhost, 0))
+            if self.bound:
+                self.connect(remotehost, remoteport)
+        except BaseException:
+            self.release_session()
+            raise
         self.packet = packet
         self.state = state
         self.root = root
@@ -628,15 +781,39 @@ class TftpServerHandler(TftpSession):
         self.options = { 'blksize': DEF_BLKSIZE }
         self.blocknumber = 0
         self.buffer = None
-        self.fileobj = None
         self.timeouts.idle = 3
         self.timeouts.sustain = 120
+
+    def senderror(self, errorcode):
+        """An ERROR reply of the session (file missing, path outside the root, mode, packet):
+        rate limited with those of the server socket; a session that ends at once gives its
+        place back for the next request."""
+        if ERRORS.allow(self.error_source):
+            TftpSession.senderror(self, errorcode)
+
+    def release_session(self):
+        """Give the place in SESSIONS back and close the file, once."""
+        source, self.session_source = getattr(self, "session_source", None), None
+        if source is not None:
+            SESSIONS.release(source)
+        fileobj, self.fileobj = getattr(self, "fileobj", None), None
+        if fileobj is not None:
+            fileobj.close()
+
+    def handle_error(self, err):
+        # socket() failed: the connection is freed without a disconnect
+        self.release_session()
+        return False
 
     def handle_timeout_idle(self):
         return False
 
     def handle_timeout_sustain(self):
         return False
+
+    def handle_disconnect(self):
+        self.release_session()
+        return TftpSession.handle_disconnect(self)
 
     def handle_io_in(self, data):
         """This method informs a handler instance that it has data waiting on
@@ -652,8 +829,9 @@ class TftpServerHandler(TftpSession):
             if recvpkt.mode != 'octet':
                 self.senderror(TftpErrors.IllegalTftpOp)
                 #raise TftpException("Unsupported mode: %s" % recvpkt.mode)
-                logger.warn("Unsupported mode: %s" % recvpkt.mode)
+                logger.info("Unsupported mode: %s" % recvpkt.mode)
                 self.close()
+                return len(data)
 
 
             if self.state.state == 'rrq':
@@ -671,7 +849,7 @@ class TftpServerHandler(TftpSession):
                     self.errors += 1
                     self.senderror(TftpErrors.AccessViolation)
 #                    raise TftpException("Insecure path: %s" % self.filename)
-                    logger.warn("Insecure path: %s" % self.filename)
+                    logger.info("Insecure path: %s" % self.filename)
                     self.close()
                     return len(data)
 
@@ -692,7 +870,7 @@ class TftpServerHandler(TftpSession):
                                         % blksize)
                             self.options['blksize'] = blksize
                         else:
-                            logger.warning("Client %s requested invalid "
+                            logger.info("Client %s requested invalid "
                                            "blocksize %d, responding with default"
                                            % (self.remote.host, blksize))
                             self.options['blksize'] = DEF_BLKSIZE
@@ -704,7 +882,7 @@ class TftpServerHandler(TftpSession):
                         del recvpkt.options['tsize']
 
                     if len(list(recvpkt.options.keys())) > 0:
-                        logger.warning("Client %s requested unsupported options: %s"
+                        logger.info("Client %s requested unsupported options: %s"
                                        % (self.remote.host, recvpkt.options))
 
                     if self.options['blksize'] != DEF_BLKSIZE or 'tsize' in self.options:
@@ -716,18 +894,17 @@ class TftpServerHandler(TftpSession):
                         self.start_download()
 
                 else:
-                    logger.warn("Requested file %s does not exist." %
+                    logger.info("Requested file %s does not exist." %
                                 self.filename)
                     self.senderror(TftpErrors.FileNotFound)
 #                    raise TftpException("Requested file not found: %s" % self.filename)
-                    logger.warn("Requested file not found: %s" % self.filename)
                     self.close()
                     return len(data)
 
 
             else:
                 # We're receiving an RRQ when we're not expecting one.
-                logger.warn("Received an RRQ in handler %s "
+                logger.info("Received an RRQ in handler %s "
                             "but we're in state %s" % (self.remote.host, self.state))
                 self.errors += 1
 
@@ -751,33 +928,31 @@ class TftpServerHandler(TftpSession):
                     elif recvpkt.blocknumber < self.blocknumber:
                         # Don't resend a DAT due to an old ACK. Fixes the
                         # sorceror's apprentice problem.
-                        logger.warn("Received old ACK for block number %d"
+                        logger.info("Received old ACK for block number %d"
                                     % recvpkt.blocknumber)
                     else:
-                        logger.warn("Received ACK for block number "
+                        logger.info("Received ACK for block number "
                                     "%d, apparently from the future"
                                     % recvpkt.blocknumber)
                 else:
-                    logger.warn("Received ACK with block number %d "
+                    logger.info("Received ACK with block number %d "
                                 "while in state %s"
                                 % (recvpkt.blocknumber,
                                     self.state.state))
 
         elif isinstance(recvpkt, TftpPacketERR):
-            logger.warn("Received error packet from client: %s" % recvpkt)
+            logger.info("Received error packet from client: %s" % recvpkt)
             self.state.state = 'err'
-            logger.warn("Received error from client")
 #            raise TftpException("Received error from client")
             self.close()
             return len(data)
 
         # Handle other packet types.
         else:
-            logger.warn("Received packet %s while handling a download"
+            logger.info("Received packet %s while handling a download"
                         % recvpkt)
             self.senderror(TftpErrors.IllegalTftpOp)
 #            raise TftpException("Invalid packet received during download")
-            logger.warn("Invalid packet received during download")
             self.close()
             return len(data)
         return len(data)
@@ -786,7 +961,13 @@ class TftpServerHandler(TftpSession):
         """This method opens self.filename, stores the resulting file object
         in self.fileobj, and calls send_dat()."""
         self.state.state = 'dat'
-        self.fileobj = open(self.filename, "rb")
+        try:
+            self.fileobj = open(self.filename, "rb")
+        except OSError as e:
+            # e.g. EMFILE: no reply, the session ends and gives its place back
+            logger.warning("Unable to open %s: %s", log_text(self.filename), e.strerror)
+            self.close()
+            return
         self.send_dat()
 
     def send_dat(self, resend=False):
@@ -803,7 +984,7 @@ class TftpServerHandler(TftpSession):
                 logger.debug("Blocknumber rolled over to zero")
                 self.blocknumber = 0
         else:
-            logger.warn("Resending block number %d" % self.blocknumber)
+            logger.warning("Resending block number %d" % self.blocknumber)
         dat = TftpPacketDAT()
         dat.data = self.buffer
         dat.blocknumber = self.blocknumber
@@ -855,12 +1036,45 @@ class TftpServer(TftpSession):
         if isinstance(recvpkt, TftpPacketRRQ):
             logger.debug("RRQ packet from %s:%i" %
                          (self.remote.host, self.remote.port))
-            t = TftpServerHandler(TftpState(
-                'rrq'), self.root, self.local.host, self.remote.host, self.remote.port, self.packet)
-            t.handle_io_in(data)
+            source = source_key(self.remote.host)
+            state = TftpState('rrq')
+            if not SESSIONS.claim(source):
+                # no session and no socket: the ERROR goes out of the server socket
+                logger.debug("Too many TFTP sessions, refusing the RRQ of %s:%i", source, self.remote.port)
+                if ERRORS.allow(source):
+                    errpkt = TftpPacketERR()
+                    errpkt.errorcode = TftpErrors.NotDefined
+                    errpkt.errmsg = "Too many sessions"
+                    self.send(errpkt.encode().buffer)
+                return len(data)
+            # the handler gives the place back (also when its constructor fails)
+            try:
+                t = TftpServerHandler(state, self.root, self.local.host, self.remote.host,
+                                      self.remote.port, self.packet, session_source=source)
+            except Exception:
+                # as below: an exception here would close the server socket
+                logger.error("Unable to make the TFTP session of %s:%i", source, self.remote.port, exc_info=True)
+                return len(data)
+            if not t.bound:
+                # no socket for the session: its place is back, the request goes no further
+                t.release_session()
+                logger.debug("No socket for the TFTP session of %s:%i", source, self.remote.port)
+                t.close()
+                return len(data)
+            try:
+                t.handle_io_in(data)
+            except Exception:
+                # the binding closes a connection whose handle_io_in raises: the error of a
+                # session ends that session only, the server socket stays open
+                logger.error("Error in the TFTP session of %s:%i", source, self.remote.port, exc_info=True)
+                try:
+                    t.close()
+                except ReferenceError:   # it is closed already
+                    pass
         elif isinstance(recvpkt, TftpPacketWRQ):
-            logger.warn("Write requests not implemented at this time.")
-            self.senderror(TftpErrors.IllegalTftpOp)
+            logger.info("Write requests not implemented at this time.")
+            if ERRORS.allow(source_key(self.remote.host)):
+                self.senderror(TftpErrors.IllegalTftpOp)
         return len(data)
 
 
@@ -877,9 +1091,14 @@ class TftpClient(TftpSession):
         self.curblock = 0
         self.bytes = 0
         self.filename = None
+        self.fileobj = None
         self.port = 0
         self.connected = False
+        self.download_peer = None
         self.idlecount = 0
+        self.url = None
+        # the end of the download is logged once (download_failed / download_refused)
+        self.reported = False
 
     def __del__(self):
         if self.con != None:
@@ -905,7 +1124,7 @@ class TftpClient(TftpSession):
             self.bind(con.local.host, 0)
             self.con.ref()
 
-        self.connect(host,0)
+        self.connect(host, 0, download=True)
         if con != None:
             i = incident("dionaea.connection.link")
             i.parent = con
@@ -916,6 +1135,7 @@ class TftpClient(TftpSession):
     def handle_established(self):
         logger.info("connection to %s established" % self.remote.host)
         logger.info("port %i established" % self.port)
+        self.download_peer = self.remote.host
         self.remote.port = self.port
         pkt = TftpPacketRRQ()
         pkt.filename = self.filename
@@ -924,8 +1144,9 @@ class TftpClient(TftpSession):
         self.last_packet = pkt.encode().buffer
         self.send(self.last_packet)
         self.state.state = 'rrq'
-        self.fileobj = tempfile.NamedTemporaryFile(delete=False, prefix='tftp-', suffix=g_dionaea.config(
-        )['downloads']['tmp-suffix'], dir=g_dionaea.config()['downloads']['dir'])
+        dionaea_config = g_dionaea.config().get("dionaea")
+        self.fileobj = incoming_file("tftp-", suffix=dionaea_config.get("download.suffix"),
+                                     download_dir=dionaea_config.get("download.dir"))
 
 #    def handle_disconnect(self):
 #        if self.con:
@@ -936,8 +1157,12 @@ class TftpClient(TftpSession):
         logger.debug('Received packet from server %s:%i' %
                      (self.remote.host, self.remote.port))
 
+        if self.remote.host != self.download_peer:
+            logger.warning("Ignoring TFTP packet from a different download host")
+            return len(data)
+
         if self.connected == False:
-            self.connect(self.remote.host, self.remote.port)
+            self.connect(self.remote.host, self.remote.port, download=True)
             self.connected = True
             if self.con != None:
                 i = incident("dionaea.connection.link")
@@ -946,7 +1171,13 @@ class TftpClient(TftpSession):
                 i.report()
 
 
-        recvpkt = self.packet.parse(data)
+        try:
+            recvpkt = self.packet.parse(data)
+        except (TftpException, struct.error, ValueError, IndexError) as e:
+            logger.debug("packet of the download server not read: %s", e)
+            self.state.state = 'err'
+            self.fail("the server sent a packet that can not be read")
+            return len(data)
         if isinstance(recvpkt, TftpPacketDAT):
             logger.debug("recvpkt.blocknumber = %d" % recvpkt.blocknumber)
             logger.debug("curblock = %d" % self.curblock)
@@ -989,11 +1220,11 @@ class TftpClient(TftpSession):
                     icd.con = self.con
                     icd.report()
                     self.close()
-                    self.fileobj.unlink(self.fileobj.name)
+                    os.unlink(self.fileobj.name)
 
 
             elif recvpkt.blocknumber == self.curblock:
-                logger.warn("dropping duplicate block %d" % self.curblock)
+                logger.warning("dropping duplicate block %d" % self.curblock)
                 logger.debug(
                     "ACKing block %d again, just in case" % self.curblock)
                 ackpkt = TftpPacketACK()
@@ -1003,13 +1234,13 @@ class TftpClient(TftpSession):
             else:
                 msg = "Whoa! Received block %d but expected %d" % (recvpkt.blocknumber,
                                                                    self.curblock+1)
-                logger.warn(msg)
+                logger.warning(msg)
 
         # Check other packet types.
         elif isinstance(recvpkt, TftpPacketOACK):
             if not self.state.state == 'rrq':
                 self.errors += 1
-                logger.warn("Received OACK in state %s" % self.state.state)
+                logger.warning("Received OACK in state %s" % self.state.state)
 #                continue
             self.state.state = 'oack'
             logger.info("Received OACK from server.")
@@ -1027,63 +1258,73 @@ class TftpClient(TftpSession):
                     self.send(self.last_packet)
                     self.state.state = 'ack'
                 else:
-                    logger.warn("failed to negotiate options")
                     self.senderror(TftpErrors.FailedNegotiation)
                     self.state.state = 'err'
 #                    raise TftpException("Failed to negotiate options")
-                    self.fail()
+                    self.fail("the options of the server do not match")
 
         elif isinstance(recvpkt, TftpPacketACK):
             # Umm, we ACK, the server doesn't.
             self.state.state = 'err'
 #            self.senderror(TftpErrors.IllegalTftpOp)
-            logger.warn("Received ACK from server while in download")
 #            tftpassert(False, "Received ACK from server while in download")
-            self.fail()
+            self.fail("the server sent an ACK")
 
         elif isinstance(recvpkt, TftpPacketERR):
             self.state.state = 'err'
 #            self.senderror(TftpErrors.IllegalTftpOp)
-            logger.warn("Received ERR from server: " + str(recvpkt))
-            self.fail()
+            self.fail("the server answered ERROR %d (%s)" % (
+                recvpkt.errorcode, recvpkt.errmsgs.get(recvpkt.errorcode, "not defined")))
 
         elif isinstance(recvpkt, TftpPacketWRQ):
             self.state.state = 'err'
 #            self.senderror(TftpErrors.IllegalTftpOp)
 #            tftpassert(False, "Received WRQ from server: " + str(recvpkt))
-            logger.warn("Received WRQ from server: " + str(recvpkt))
-            self.fail()
+            self.fail("the server sent a write request")
         else:
             self.state.state = 'err'
 #            self.senderror(TftpErrors.IllegalTftpOp)
 #            tftpassert(False, "Received unknown packet type from server: " + str(recvpkt))
-            logger.warn(
-                "Received unknown packet type from server: " + str(recvpkt))
-            self.fail()
+            self.fail("the server sent a packet of an unknown type")
 
         return len(data)
 
     def handle_error(self, err):
-        pass
+        # the connect of the download failed; the core closes the connection afterwards
+        if isinstance(err, ConnectionRefusedByFilter):
+            if not self.reported:
+                self.reported = True
+                download_refused(self.url)
+        else:
+            self.report(str(err))
+        return False
 
     def handle_timeout_sustain(self):
         logger.debug("tftp sustain timeout!")
-        self.fail()
+        self.fail("the transfer took too long")
         return False
 
     def handle_timeout_idle(self):
         logger.debug("tftp idle timeout!")
         if self.idlecount > 10:
-            self.fail()
+            self.fail("no answer from the server")
             return False
         self.idlecount+=1
         self.send(self.last_packet)
         return True
 
-    def fail(self):
+    def report(self, reason):
+        """The download failed: once, at info, with the summary of download_log.c."""
+        if not self.reported:
+            self.reported = True
+            download_failed(self.url, reason)
+
+    def fail(self, reason):
+        self.report(reason)
         if self.fileobj:
             self.fileobj.close()
-            self.fileobj.unlink(self.fileobj.name)
+            os.unlink(self.fileobj.name)
+            self.fileobj = None
         self.close()
 
 
@@ -1098,14 +1339,20 @@ class tftpdownloadhandler(ihandler):
         if isinstance(url, bytes):
             try:
                 url = url.decode(encoding="utf-8")
-            except UnicodeEncodeError as e:
-                logger.warning("Error decoding URL %s", url, exc_info=True)
+            except UnicodeDecodeError:
+                logger.warning("Invalid download URL encoding")
                 return
 
         if url.startswith('tftp://'):
             # python fails parsing tftp://, ftp:// works, so ...
             logger.info("do download")
-            x = parse.urlsplit(url[1:])
+            try:
+                x = parse.urlsplit(url)
+                host, port = x.hostname, x.port or 69
+                if not host:
+                    return
+            except (ValueError, TypeError):
+                return
             if x.netloc == '0.0.0.0':
                 logger.info("Discarding download from INADDR_ANY")
                 return
@@ -1114,4 +1361,4 @@ class tftpdownloadhandler(ihandler):
             except AttributeError:
                 con = None
             t=TftpClient()
-            t.download(con, x.netloc, 69, x.path[1:], url)
+            t.download(con, host, port, x.path[1:], url)

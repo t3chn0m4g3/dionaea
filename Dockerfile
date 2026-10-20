@@ -4,81 +4,104 @@
 #
 # SPDX-License-Identifier: CC0-1.0
 
-FROM ubuntu:18.04
+# Install layout as in the T-Pot image: prefix /opt/dionaea, configuration in
+# /opt/dionaea/etc/dionaea, data in /opt/dionaea/var, runs as uid/gid 2000.
+
+FROM ubuntu:26.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-COPY . /code
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      cython3 \
+      libcurl4-openssl-dev \
+      libev-dev \
+      libglib2.0-dev \
+      libnetfilter-queue-dev \
+      libpcap-dev \
+      libssl-dev \
+      libudns-dev \
+      pkg-config \
+      python3 \
+      python3-dev \
+      python3-setuptools
+
+COPY . /src
+
+RUN mkdir -p /src/build && \
+    cd /src/build && \
+    cmake -DCMAKE_INSTALL_PREFIX:PATH=/opt/dionaea -DCMAKE_BUILD_TYPE=RelWithDebInfo .. && \
+    make -j"$(nproc)" && \
+    make install
+
+
+# Unit tests of the bundled libemu (third_party/libemu), not part of the image:
+#   docker build --target libemu-test .
+#   docker build --target libemu-test \
+#     --build-arg LIBEMU_TEST_CFLAGS="-fsanitize=address,undefined -fno-sanitize=shift,signed-integer-overflow -fno-omit-frame-pointer" .
+FROM builder AS libemu-test
+
+ARG LIBEMU_TEST_CFLAGS=""
+
+RUN mkdir -p /src/build-test && \
+    cd /src/build-test && \
+    cmake -DDIONAEA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="${LIBEMU_TEST_CFLAGS}" .. && \
+    make -j"$(nproc)" test_libemu test_synthetic_pe && \
+    ctest -R '^(libemu|synthetic_pe)$' --output-on-failure
+
+
+# Unit tests of the stream processing (tests/processor: bistream limits, streamdumper, processor
+# jobs and threadpool admission, emu detection windows and file hooks, curl sessions, listen of the
+# core, the buffering of the log files, the log lines of failed downloads), not part of the image:
+#   docker build --target processor-test .
+#   docker build --target processor-test \
+#     --build-arg PROCESSOR_TEST_CFLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer" .
+#   docker build --target processor-test \
+#     --build-arg PROCESSOR_TEST_CFLAGS="-fsanitize=thread -O1 -g -fno-omit-frame-pointer" .
+FROM builder AS processor-test
+
+ARG PROCESSOR_TEST_CFLAGS=""
+
+RUN mkdir -p /src/build-processor-test && \
+    cd /src/build-processor-test && \
+    cmake -DDIONAEA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="${PROCESSOR_TEST_CFLAGS}" .. && \
+    make -j"$(nproc)" test_bistream test_processor test_streamdumper test_detect test_emu_hooks test_curl_session \
+      test_connection_listen test_log test_download_log && \
+    ctest -R '^(bistream|processor|streamdumper|detect|emu_hooks|curl_session|connection_listen|log|download_log)$' --output-on-failure
+
+
+FROM ubuntu:26.04
+
+ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \
-      # Install build deps
-      apt-get install -y --no-install-recommends \
-            build-essential \
-            cmake \
-            check \
-            cython3 \
-            libcurl4-openssl-dev \
-            libemu-dev \
-            libev-dev \
-            libglib2.0-dev \
-            libloudmouth1-dev \
-            libnetfilter-queue-dev \
-            libpcap-dev \
-            libssl-dev \
-            libtool \
-            libudns-dev \
-            python3 \
-            python3-dev \
-            python3-bson \
-            python3-yaml \
-            python3-boto3 \
-            fonts-liberation && \
-      # Build
-      mkdir -p /code/build && \
-      cd /code/build && \
-      cmake -DCMAKE_INSTALL_PREFIX:PATH=/opt/dionaea /code && \
-      make && \
-      make install && \
-      # Create user and group
-      addgroup --gid 1000 dionaea && \
-      adduser --system --no-create-home --shell /bin/bash --uid 1000 --disabled-password --disabled-login --gid 1000 dionaea && \
-      # Set permissions
-      chown -R dionaea:dionaea /opt/dionaea/var && \
-      # Prepare additional stuff
-      cp /code/docker/entrypoint.sh /usr/local/sbin/entrypoint.sh && \
-      mkdir -p /opt/dionaea/template && \
-      (cd /opt/dionaea && mv var/lib template/ && mv var/log template/ && mv etc template/) && \
-      # Remove dev packages
-      apt-get purge -y \
-            build-essential \
-            cmake \
-            check \
-            cython3 \
-            libcurl4-openssl-dev \
-            libemu-dev \
-            libev-dev \
-            libglib2.0-dev \
-            libloudmouth1-dev \
-            libnetfilter-queue-dev \
-            libpcap-dev \
-            libssl-dev \
-            libtool \
-            libudns-dev \
-            python3-dev  && \
-      # Install required packages
-      apt-get install -y --no-install-recommends \
-            ca-certificates \
-            libcurl4 \
-            libemu2 \
-            libev4 \
-            libglib2.0-0 \
-            libnetfilter-queue1 \
-            libpcap0.8 \
-            libpython3.6 \
-            libudns0 && \
-      # Clean up
-      apt-get autoremove --purge -y && \
-      apt-get clean && \
-      rm -rf /code/ /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      libcap2-bin \
+      libcurl4t64 \
+      libev4t64 \
+      libglib2.0-0t64 \
+      libnetfilter-queue1 \
+      libpcap0.8t64 \
+      libpython3.14 \
+      libudns0t64 \
+      python3 \
+      python3-boto3 \
+      python3-bson \
+      python3-yaml && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/*
 
-ENTRYPOINT ["/usr/local/sbin/entrypoint.sh"]
+COPY --from=builder /opt/dionaea /opt/dionaea
+
+RUN addgroup --gid 2000 dionaea && \
+    adduser --system --no-create-home --shell /bin/bash --uid 2000 --disabled-password --disabled-login --gid 2000 dionaea && \
+    setcap cap_net_bind_service=+ep /opt/dionaea/sbin/dionaea && \
+    chown -R dionaea:dionaea /opt/dionaea/var
+
+STOPSIGNAL SIGINT
+USER dionaea:dionaea
+CMD ["/opt/dionaea/sbin/dionaea", "-u", "dionaea", "-g", "dionaea", "-c", "/opt/dionaea/etc/dionaea/dionaea.cfg"]

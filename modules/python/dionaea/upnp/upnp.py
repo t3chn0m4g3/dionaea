@@ -11,7 +11,6 @@ import os
 import sys
 import datetime
 import io
-import cgi
 import urllib.parse
 import re
 import tempfile

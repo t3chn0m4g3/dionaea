@@ -6,12 +6,30 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <Python.h>
 #include <stdbool.h>
 #include "connection.h"
 
-#define PY_CLONE(T)  (T)->ob_type->tp_new((T)->ob_type, __pyx_empty_tuple, NULL)
-#define PY_NEW(T) (((PyTypeObject*)(T))->tp_new( (PyTypeObject*)(T), __pyx_empty_tuple, NULL))
-#define PY_INIT(P, O) (P)->ob_type->tp_init((O), __pyx_empty_tuple, NULL)
+/*
+ * Cython 3.1 no longer exports __pyx_empty_tuple. Use an empty tuple of our own
+ * that is created once and kept for the life of the process. The result is a
+ * borrowed reference, so there is nothing to release at the call sites.
+ */
+#ifndef DIONAEA_EMPTY_TUPLE_DEFINED
+#define DIONAEA_EMPTY_TUPLE_DEFINED
+/* binding.pyx includes this header more than once */
+static inline PyObject *dionaea_empty_tuple(void)
+{
+	static PyObject *empty_tuple = NULL;
+	if( empty_tuple == NULL )
+		empty_tuple = PyTuple_New(0);
+	return empty_tuple;
+}
+#endif
+
+#define PY_CLONE(T)  (T)->ob_type->tp_new((T)->ob_type, dionaea_empty_tuple(), NULL)
+#define PY_NEW(T) (((PyTypeObject*)(T))->tp_new( (PyTypeObject*)(T), dionaea_empty_tuple(), NULL))
+#define PY_INIT(P, O) (P)->ob_type->tp_init((O), dionaea_empty_tuple(), NULL)
 #define REFCOUNT(T) printf("obj refcount %i\n", (int)(T)->ob_refcnt)
 
 #define REMOTE(C) (C)->remote
@@ -26,6 +44,14 @@ void traceback(void);
 PyObject *pygetifaddrs(PyObject *self, PyObject *args);
 PyObject *py_config(PyObject *self, PyObject *args);
 PyObject *pyversion(PyObject *self, PyObject *args);
+
+/*
+ * A timer of the event loop for Python (dionaea.core.timer): the callable runs
+ * in the thread of the loop, as the callbacks of the connections do.
+ */
+struct py_timer;
+struct py_timer *py_timer_new(PyObject *callback, double after, double repeat);
+void py_timer_free(struct py_timer *t);
 
 
 struct ihandler;

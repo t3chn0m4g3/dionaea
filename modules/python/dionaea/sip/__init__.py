@@ -130,7 +130,7 @@ g_reg_manager = RegistrationManager()
 class RtpUdpStream(connection):
     """RTP stream that can send data and writes the whole conversation to a
     file"""
-    def __init__(self, name, call, session, local_address, local_port, remote_address, remote_port, bistream_enabled = False, pcap = None):
+    def __init__(self, name=None, call=None, session=None, local_address=None, local_port=None, remote_address=None, remote_port=None, bistream_enabled = False, pcap = None):
         logger.debug("{!s} __init__".format(self))
         connection.__init__(self, 'udp')
 
@@ -233,7 +233,7 @@ class SipCall(connection):
     """
     CLOSED, SESSION_SETUP, ACTIVE_SESSION, SESSION_TEARDOWN, INVITE, INVITE_TRYING, INVITE_RINGING, INVITE_CANCEL, CALL = range(9)
 
-    def __init__(self, proto, call_id, session, invite_message):
+    def __init__(self, proto=None, call_id=None, session=None, invite_message=None):
         logger.debug("{!s} __init__".format(self))
 
         logger.debug("SipCall {} session {} ".format(self, session))
@@ -446,7 +446,7 @@ class SipCall(connection):
 
             logger.debug("SipCall timer {} active {} pending {}".format(timer,timer.active,timer.pending))
             #if timer.active == True or timer.pending == True:
-            #    logger.warn("SipCall Stopping {}".format(name))
+            #    logger.warning("SipCall Stopping {}".format(name))
 
             timer.stop()
         self._timers = {}
@@ -681,7 +681,7 @@ class SipSession(connection):
 
     def handle_unknown(self, msg):
         logger.debug("{!s} unknown".format(self))
-        logger.warn("Unknown SIP header: {}".format(repr(msg.method)[:128]))
+        logger.warning("Unknown SIP header: {}".format(repr(msg.method)[:128]))
 
         icd = incident("dionaea.modules.python.sip.command")
         icd.con = self
@@ -706,7 +706,7 @@ class SipSession(connection):
 
         # Find SipSession and delete it
         if call_id not in g_call_ids or g_call_ids[call_id] is None:
-            logger.warn("{!s} request does not match any existing SIP session".format(handler_name))
+            logger.warning("{!s} request does not match any existing SIP session".format(handler_name))
             icd = incident("dionaea.modules.python.sip.command")
             icd.con = self
             msg_to_icd(msg,d=icd)
@@ -717,7 +717,7 @@ class SipSession(connection):
         try:
             g_call_ids[call_id].handle_msg_in(msg)
         except AuthenticationError:
-            logger.warn("Authentication failed for {!s} request".format(handler_name))
+            logger.warning("Authentication failed for {!s} request".format(handler_name))
 
 
     def handle_INVITE(self, msg):
@@ -734,7 +734,7 @@ class SipSession(connection):
         call_id = msg.headers.get(b"call-id").value
 
         if call_id in g_call_ids and g_call_ids[call_id] is None:
-            logger.warn("SIP session with Call-ID {} already exists".format(call_id[:128]))
+            logger.warning("SIP session with Call-ID {} already exists".format(call_id[:128]))
             # ToDo: error
             return
 
@@ -757,7 +757,7 @@ class SipSession(connection):
         try:
             new_call.handle_msg_in(msg)
         except AuthenticationError:
-            logger.warn("Authentication failed, not creating SIP session")
+            logger.warning("Authentication failed, not creating SIP session")
             new_call.close()
             del new_call
 
@@ -787,7 +787,7 @@ class SipSession(connection):
 
         # ToDo: check for request-uri?
         if not msg.headers_exist([b"to", b"from", b"call-id", b"cseq"]):
-            logger.warn("REGISTER, header missing")
+            logger.warning("REGISTER, header missing")
             # ToDo: return error
             return
 

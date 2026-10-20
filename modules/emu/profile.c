@@ -40,7 +40,9 @@
 
 #define	CODE_OFFSET 0x417000
 
-char *indents(int i)
+/* static: libemu (emu_profile.c) has a global indents() of its own, which the
+ * linker would find twice with the bundled static libemu */
+static char *indents(int i)
 {
 	static char indents[255];
 	memset(indents, ' ', 255);

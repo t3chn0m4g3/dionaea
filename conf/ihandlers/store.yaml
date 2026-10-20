@@ -2,3 +2,11 @@
 # SPDX-License-Identifier: CC0-1.0
 
 - name: store
+  config:
+    # Stored samples (download.dir/<md5>) are read-only (0440) and never executable.
+    # max_size: limit of the total size of download.dir in MiB, 0 or absent: no limit.
+    # A new sample that would exceed it is not stored (a warning is logged); its md5 is
+    # still logged (sqlite, json) because dionaea.download.complete.hash is reported, but
+    # dionaea.download.complete.unique is not. A sample that is stored already is not affected.
+    # The environment variable DIONAEA_STORE_MAX_SIZE (MiB) replaces it when set.
+    # max_size: 1024

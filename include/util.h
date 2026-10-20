@@ -35,6 +35,30 @@ struct tempfile
 
 struct tempfile *tempfile_new(char *path, char *prefix);
 struct tempfile *tempdownload_new(char *prefix);
+
+/*
+ * The temporary files of samples are in <download.dir>/.incoming, not in
+ * download.dir itself: the same filesystem (the store links a sample from there
+ * as <download.dir>/<md5>), but a file made and removed there does not change
+ * the mtime of download.dir, which the size cap of the store (store.py,
+ * DirQuota) watches to read the folder again. modules/python/dionaea/upload.py
+ * (incoming_file) is the same for the services in Python.
+ */
+#define INCOMING_DIR ".incoming"
+/* <download_dir>/.incoming, newly allocated */
+char *incoming_path(const char *download_dir);
+/*
+ * At the start of dionaea, as its user: makes the folder (0700), sets its mode
+ * to 0700, and removes what an earlier run left in it (a run that
+ * ended without its cleanup). Reads only that folder, never download.dir. NULL: nothing.
+ */
+void incoming_prepare(const char *download_dir);
+/*
+ * A temporary file for a sample in <download_dir>/.incoming, the folder made
+ * again (0700) if it is gone; NULL download_dir: in the folder of the system for
+ * temporary files. NULL and a warning if it can not be made.
+ */
+struct tempfile *tempincoming_new(const char *download_dir, char *prefix);
 void tempfile_close(struct tempfile *tf);
 void tempfile_unlink(struct tempfile *tf);
 void tempfile_free(struct tempfile *tf);

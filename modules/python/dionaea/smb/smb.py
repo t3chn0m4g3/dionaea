@@ -11,22 +11,27 @@
 
 from dionaea.core import incident, connection, g_dionaea
 
-import traceback
+import struct
 import hashlib
 import logging
 import os
-import tempfile
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from .include.smbfields import *
-from .rpcservices import __shares__
-from .include.gssapifields import GSSAPI,SPNEGO, NegTokenTarg
-from .include.ntlmfields import NTLMSSP_Header, NTLM_Negotiate, NTLM_Challenge, NTLMSSP_REQUEST_TARGET
+from .rpcservices import __shares__, STYPE_DEVICE, STYPE_DISKTREE, STYPE_IPC, STYPE_PRINTQ, STYPE_SPECIAL
 from .include.packet import Raw
-from .include.asn1.ber import BER_len_dec, BER_len_enc, BER_identifier_dec
-from .include.asn1.ber import BER_CLASS_APP, BER_CLASS_CON,BER_identifier_enc
-from .include.asn1.ber import BER_Exception
+from .ntlm import Exchange, filetime, legacy_password, negotiate_token, variant
+from .smb2 import SMB2, MAX_MESSAGE
 from dionaea.util import calculate_doublepulsar_opcode, xor
+from dionaea.logtext import log_text
+from dionaea.upload import (
+    DEFAULT_MAX_UPLOAD_SIZE,
+    UploadError,
+    UploadFile,
+    UploadTooLarge,
+    incoming_file,
+    upload_url,
+)
 
 
 smblog = logging.getLogger('SMB')
@@ -40,6 +45,111 @@ STATE_NTREAD = 5
 
 registered_services = {}
 
+# Per connection: files (and pipes) a client can have open at the same time,
+# and the bytes kept for a DCERPC fragment that is not complete yet (the
+# fragment length is a 16 bit value)
+MAX_OPEN_FIDS = 32
+# Per connection: trees (TREE_CONNECT_ANDX) and sessions (SESSION_SETUP_ANDX) that are kept
+MAX_TREES = 32
+# the share a tree keeps, in characters: the name is the client's (any length for a name that ends in
+# "share", CVE-2017-7494), Windows takes paths of shares of at most 256 characters
+MAX_SHARE_LENGTH = 256
+MAX_SESSIONS = 16
+MAX_DCERPC_BUFFER = 65536 + 1024
+
+STATUS_UNSUCCESSFUL = 0xc0000001
+STATUS_ACCESS_DENIED = 0xc0000022
+STATUS_BAD_NETWORK_NAME = 0xc00000cc
+STATUS_INVALID_PARAMETER = 0xc000000d
+STATUS_DISK_FULL = 0xc000007f
+STATUS_TOO_MANY_OPENED_FILES = 0xc000011f
+
+# Transactions are sent in pieces: the first request carries the start, the
+# *_SECONDARY requests the rest. Nothing of them is kept (no totals, offsets
+# or displacements are used), dionaea only knows that a transaction was started.
+TRANS_SECONDARIES = frozenset((
+    SMB_COM_TRANSACTION_SECONDARY, SMB_COM_TRANSACTION2_SECONDARY, SMB_COM_NT_TRANSACT_SECONDARY,
+))
+# the start of a session, or its end, leaves no transaction pending
+TRANS_ENDS = frozenset((
+    SMB_COM_NEGOTIATE, SMB_COM_SESSION_SETUP_ANDX, SMB_COM_LOGOFF_ANDX, SMB_COM_TREE_DISCONNECT,
+))
+
+
+# Names of the named pipes of the services in rpcservices.py: a write to them is DCERPC, not a file
+PIPE_NAMES = frozenset((
+    "atsvc", "browser", "eventlog", "initshutdown", "lsarpc", "lsass", "netlogon", "ntsvcs",
+    "samr", "spoolss", "srvsvc", "svcctl", "wkssvc", "winreg", "epmapper", "plugplay",
+    "protected_storage", "trkwks", "w32time", "scerpc", "msgsvc",
+))
+
+
+# The UID of a new session: a Windows server counts them for all its connections in
+# steps of 0x0800. The n-th UID is step (n % 31 + 1) * 0x0800 plus round n // 31:
+# 0x0800, 0x1000, ..., 0xf800, then 0x0801, ..., 0xf801, 0x0802, ...; every value
+# from 0x0800 to 0xfffe once in 63,487 sessions (31 * 0x0800 = 63,488 steps, of which the
+# last is 0xffff and skipped; 0 and 0xffff never), then again.
+_uid_counter = [0]
+UID_STEPS = 31
+UID_ROUNDS = 0x0800
+
+
+def new_uid(in_use=()):
+    """The UID of a new session, not one of in_use."""
+    while True:
+        n = _uid_counter[0]
+        _uid_counter[0] = (n + 1) % (UID_STEPS * UID_ROUNDS)
+        uid = (n % UID_STEPS + 1) * 0x0800 + n // UID_STEPS
+        if uid != 0xffff and uid not in in_use:
+            return uid
+
+
+# Reply of a TREE_CONNECT_ANDX per type of share (MS-CIFS 2.2.4.55.2): Service, NativeFileSystem
+TREE_SERVICES = {
+    STYPE_DISKTREE: ("A:", "NTFS"),
+    STYPE_PRINTQ: ("LPT1:", ""),
+    STYPE_DEVICE: ("COMM", ""),
+    STYPE_IPC: ("IPC", ""),
+}
+# what a Windows server gives an administrator in an extended tree connect reply (and a guest)
+MAXIMAL_SHARE_ACCESS = 0x001f01ff
+
+
+def is_admin_share(name, share_type):
+    """True for an administrative share: ADMIN$, C$, ... (special, or a name ending in $ but IPC$ and PRINT$)."""
+    if share_type & STYPE_SPECIAL and share_type & 0x3 != STYPE_IPC:
+        return True
+    return name.endswith("$") and name.upper() not in ("IPC$", "PRINT$")
+
+
+def share_name(path):
+    """The share of the path of a TREE_CONNECT_ANDX (\\\\server\\share, str), as the client sent it."""
+    return path.split("\x00")[0].replace("/", "\\").rstrip("\\").rsplit("\\", 1)[-1]
+
+
+def is_pipe_name(name):
+    """True if name is the name of a pipe of a service, as \\srvsvc or \\PIPE\\srvsvc."""
+    name = name.replace("/", "\\").lower().lstrip("\\")
+    if name.startswith("pipe\\"):
+        name = name[len("pipe\\"):]
+    return name in PIPE_NAMES
+
+
+def decode_smb_name(raw, unicode_names):
+    """
+    File name from a field of a request, str.
+
+    :param raw: Value of the field (bytes, UTF-16LE with SMB_FLAGS2_UNICODE, else the OEM code page)
+    :param unicode_names: True if the client uses unicode names
+    """
+    if isinstance(raw, str):
+        name = raw
+    elif unicode_names:
+        name = raw.decode("utf-16-le", errors="replace")
+    else:
+        name = raw.decode("utf-8", errors="replace")
+    return name.split("\x00")[0]
+
 def register_rpc_service(service):
     uuid = service.uuid
     registered_services[uuid] = service
@@ -47,7 +157,7 @@ def register_rpc_service(service):
 
 class smbd(connection):
     shared_config_values = [
-        "config"
+        "config", "server_guid", "server_start"
     ]
 
     def __init__ (self, proto="tcp", config=None):
@@ -61,9 +171,24 @@ class smbd(connection):
         self.buf2 = b''  # ms17-010 SMB_COM_TRANSACTION2
         self.outbuf = None
         self.fids = {}
+        # TID -> share of the trees of the client; UID of a session -> True while it is
+        # anonymous (or a guest): no login yet, or one with an empty user name or "guest"
+        self.trees = {}
+        self.uids = {}
+        self.smb_message = None
+        self.next_tid = 0x0800
         self.printer = b'' # spoolss file "queue"
 
         self.config = None
+        self.server_guid = uuid4().bytes_le
+        self.server_start = filetime()
+        self.ntlm = Exchange()
+        self.smb2 = SMB2(self)
+        # a SMB_COM_TRANSACTION, _TRANSACTION2 or _NT_TRANSACT was started
+        # and the connection has not been through TRANS_ENDS since
+        self.trans = False
+        # process() has nothing to answer on purpose (the continuation of a transaction)
+        self.no_answer = False
 
     def apply_config(self, config=None):
         # Avoid import loops
@@ -82,18 +207,96 @@ class smbd(connection):
 #		self._out.accounting.limit = 2000*1024
         self.processors()
 
-    def handle_io_in(self,data):
+    def handle_io_in(self, data):
+        """Process every complete NetBIOS session message of the input.
+
+        A client may send several requests at once (the MS17-010 exploits send
+        their *_SECONDARY packets in bursts, and TCP puts them into one read).
+        Each message is cut out by its own length, so the rest of the buffer is
+        neither taken as the data of the first request nor left unprocessed until
+        more data arrives. Returns the number of bytes used; an incomplete
+        message stays in the buffer.
+        """
+        done = 0
+        while len(data) - done >= 4:
+            # Direct TCP uses the full 24-bit length, not the NBT 17-bit mask.
+            size = 4 + int.from_bytes(data[done + 1:done + 4], "big")
+            if size > MAX_MESSAGE + 4:
+                smblog.info("SMB message exceeds limit")
+                self.close()
+                return len(data)
+            if len(data) - done < size:
+                # we probably do not have the whole packet yet
+                smblog.info('=== SMB did not get enough data')
+                break
+            used = self.handle_message(data[done:done + size])
+            if used is None:
+                # the connection has no more use for the input
+                return len(data)
+            done += used
+        return done
+
+    def report_login(self, login, dialect):
+        icd = incident("dionaea.modules.python.smb.login")
+        icd.con = self
+        icd.password = ""
+        icd.dialect = dialect
+        for name, value in login.items():
+            setattr(icd, name, value)
+        icd.report()
+
+    def handle_message(self, data):
         try:
-            p = NBTSession(data, _ctx=self)
-        except:
-            t = traceback.format_exc()
-            smblog.error(t)
+            if data[0] == 0x85 and len(data) == 4:
+                return len(data)
+            if data[0] == 0 and data[4:8] == b"\xfeSMB":
+                self.smb2.process(data[4:])
+                return len(data)
+            if self.smb2.active:
+                raise ValueError("SMB1 message after SMB2 negotiation")
+            return self.handle_smb1_message(data)
+        except (ValueError, IndexError, KeyError, AttributeError, TypeError, struct.error, UnicodeError) as e:
+            smblog.warning("Invalid SMB request: %s", log_text(e))
+            if self.smb2.active or data[4:8] != b"\xffSMB":
+                self.close()
+                return None
             return len(data)
 
-        if len(data) < (p.LENGTH+4):
-            #we probably do not have the whole packet yet -> return 0
-            smblog.info('=== SMB did not get enough data')
-            return 0
+    def handle_smb1_message(self, data):
+        """One complete NetBIOS session message; returns its length, None if the rest of the input is to be dropped.
+
+        self.smb_message holds the message only while it is handled, on every path."""
+        try:
+            return self._handle_smb1_message(data)
+        finally:
+            self.smb_message = None
+
+    def _handle_smb1_message(self, data):
+        if data[0] == 0:
+            if len(data) < 39 or data[4:8] != b"\xffSMB":
+                raise ValueError("invalid SMB1 header")
+            # Session setup and negotiation have bounded security/dialect data.
+            # Transaction secondaries deliberately keep their permissive handling
+            # for exploit capture (their declared counts need not match the body).
+            if data[8] in (SMB_COM_NEGOTIATE, SMB_COM_SESSION_SETUP_ANDX):
+                words = data[36]
+                bytecount_at = 37 + words * 2
+                if bytecount_at + 2 > len(data):
+                    raise ValueError("truncated SMB1 parameters")
+                count = struct.unpack_from("<H", data, bytecount_at)[0]
+                if bytecount_at + 2 + count > len(data):
+                    raise ValueError("SMB1 byte count outside message")
+                if data[8] == SMB_COM_SESSION_SETUP_ANDX:
+                    if words not in (12, 13):
+                        raise ValueError("unsupported SMB1 session setup")
+                    blobsize = struct.unpack_from("<H", data, 51)[0]
+                    if words == 13:
+                        blobsize += struct.unpack_from("<H", data, 53)[0]
+                    if blobsize > count:
+                        raise ValueError("SMB1 security data outside message")
+        # the SMB message (without the NetBIOS header), for the requests of a chain
+        self.smb_message = data[4:]
+        p = NBTSession(data, _ctx=self)
 
         if p.TYPE == 0x81:
             self.send(NBTSession(TYPE=0x82).build())
@@ -106,7 +309,7 @@ class smbd(connection):
             # not really SMB Header -> bail out
             smblog.error('=== not really SMB')
             self.close()
-            return len(data)
+            return None
 
         p.show()
         r = None
@@ -124,7 +327,7 @@ class smbd(connection):
         smblog.debug("packet: %s" % p.summary())
 
         if p.haslayer(Raw):
-            smblog.warning("p.haslayer(Raw): %s" % p.getlayer(Raw).build())
+            smblog.debug("p.haslayer(Raw): %s" % p.getlayer(Raw).build())
             p.show()
 
 #		i = incident("dionaea.module.python.smb.info")
@@ -135,7 +338,7 @@ class smbd(connection):
 
         if self.state['stop']:
             smblog.info("faint death.")
-            return len(data)
+            return None
 
         if r:
             smblog.debug("response: %s" % r.summary())
@@ -150,17 +353,11 @@ class smbd(connection):
 #			r.build()
             #r.show2()
             self.send(r.build())
-        else:
+        elif not self.no_answer:
             smblog.error('process() returned None.')
 
-        if p.haslayer(Raw):
-            smblog.warning("p.haslayer(Raw): %s" % p.getlayer(Raw).build())
-            p.show()
-            # some rest seems to be not parsed correctly
-            # could be start of some other packet, junk, or failed packet dissection
-            # TODO: recover from this...
-            return len(data) - len(p.getlayer(Raw).load)
-
+        # a rest that is not parsed (junk, or a failed dissection) is inside
+        # the message, which ends where its length says
         return len(data)
 
     def process(self, p):
@@ -170,14 +367,37 @@ class smbd(connection):
         # if self.state == STATE_START and p.getlayer(SMB_Header).Command ==
         # 0x72:
         rstatus = 0
+        # the reply carries the TID and the UID of the request, but the TID of a new tree
+        # and the UID of a new session (as a Windows server)
+        reply_tid = None
+        reply_uid = None
+        # the request of a chain behind the first one (AndX), parsed: (request, chained header)
+        chained = None
         smbh = p.getlayer(SMB_Header)
         Command = smbh.Command
+
+        icd = incident("dionaea.modules.python.smb.command")
+        # the client chooses the command byte, not every value has a name
+        icd.command = SMB_Commands.get(Command, "0x%02x" % Command)
+        icd.con = self
+        icd.report()
+
+        self.no_answer = False
+        if Command in TRANS_ENDS:
+            self.trans = False
         if Command == SMB_COM_NEGOTIATE:
+            requests = p.getlayer(SMB_Negociate_Protocol_Request_Counts).Requests
+            dialects = [request.BufferData.rstrip(b"\0") for request in requests]
+            if b"NT LM 0.12" not in dialects and (b"SMB 2.???" in dialects or b"SMB 2.002" in dialects):
+                self.smb2.negotiate(0x02ff if b"SMB 2.???" in dialects else 0x0202)
+                self.no_answer = True
+                return None
             # Negociate Protocol -> Send response that supports minimal features in NT LM 0.12 dialect
             # (could be randomized later to avoid detection - but we need more dialects/options support)
             r = SMB_Negociate_Protocol_Response(
                 OemDomainName=self.config.oem_domain_name + "\0",
-                ServerName=self.config.server_name + "\0"
+                ServerName=self.config.server_name + "\0",
+                ServerGUID=self.server_guid, SecurityBlob=negotiate_token()
             )
             # we have to select dialect
             c = 0
@@ -203,177 +423,54 @@ class smbd(connection):
                     NativeLanManager=self.config.native_lan_manager + "\0",
                     PrimaryDomain=self.config.primary_domain
                 )
-                ntlmssp = None
-                sb = p.getlayer(
-                    SMB_Sessionsetup_ESEC_AndX_Request).SecurityBlob
-
-                if sb.startswith(b"NTLMSSP"):
-                    # GSS-SPNEGO without OID
-                    ntlmssp = NTLMSSP_Header(sb)
-                    ntlmssp.show()
-                    # FIXME what is a proper reply?
-                    # currently there windows calls Sessionsetup_AndX2_request
-                    # after this one with bad reply
-                    if ntlmssp.MessageType == 1:
-                        r.Action = 0
-                        ntlmnegotiate = ntlmssp.getlayer(NTLM_Negotiate)
-                        rntlmssp = NTLMSSP_Header(MessageType=2)
-                        rntlmchallenge = NTLM_Challenge(
-                            NegotiateFlags=ntlmnegotiate.NegotiateFlags)
-#						if ntlmnegotiate.NegotiateFlags & NTLMSSP_REQUEST_TARGET:
-#							rntlmchallenge.TargetNameFields.Offset = 0x38
-#							rntlmchallenge.TargetNameFields.Len = 0x1E
-#							rntlmchallenge.TargetNameFields.MaxLen = 0x1E
-
-                        rntlmchallenge.ServerChallenge = b"\xa4\xdf\xe8\x0b\xf5\xc6\x1e\x3a"
-                        rntlmssp = rntlmssp / rntlmchallenge
-                        rntlmssp.show()
-                        raw = rntlmssp.build()
-                        r.SecurityBlob = raw
-                        rstatus = 0xc0000016 # STATUS_MORE_PROCESSING_REQUIRED
-                elif sb.startswith(b"\x04\x04") or sb.startswith(b"\x05\x04"):
-                    # GSSKRB5 CFX wrapping
-                    # FIXME is this relevant at all?
-                    pass
+                sb = p.getlayer(SMB_Sessionsetup_ESEC_AndX_Request).SecurityBlob
+                r.SecurityBlob, login = self.ntlm.process(sb, self.config)
+                r.Action = 0
+                reply_uid = self.session_uid(smbh.UID)
+                if login is None:
+                    rstatus = 0xc0000016  # STATUS_MORE_PROCESSING_REQUIRED
                 else:
-                    # (hopefully) the SecurityBlob is prefixed with
-                    # * BER encoded identifier
-                    # * BER encoded length of the data
-                    cls,pc,tag,sb = BER_identifier_dec(sb)
-                    l,sb = BER_len_dec(sb)
-                    if cls == BER_CLASS_APP and pc > 0 and tag == 0:
-                        # NTLM NEGOTIATE
-                        #
-                        # reply NTML CHALLENGE
-                        # SMB_Header.Status = STATUS_MORE_PROCESSING_REQUIRED
-                        # SMB_Sessionsetup_ESEC_AndX_Response.SecurityBlob is
-                        # \xa1 BER_length NegTokenTarg where
-                        # NegTokenTarg.responseToken is NTLM_Header / NTLM_Challenge
-                        gssapi = GSSAPI(sb)
-                        sb = gssapi.getlayer(Raw).load
-                        cls,pc,tag,sb = BER_identifier_dec(sb)
-                        l,sb = BER_len_dec(sb)
-                        spnego = SPNEGO(sb)
-                        spnego.show()
-                        sb = spnego.NegotiationToken.mechToken.__str__()
-                        try:
-                            cls,pc,tag,sb = BER_identifier_dec(sb)
-                        except BER_Exception as e:
-                            smblog.warning("BER Exception", exc_info=True)
-                            return rp
-                        l,sb = BER_len_dec(sb)
-                        ntlmssp = NTLMSSP_Header(sb)
-                        ntlmssp.show()
-                        if ntlmssp.MessageType == 1:
-                            r.Action = 0
-                            ntlmnegotiate = ntlmssp.getlayer(NTLM_Negotiate)
-                            rntlmssp = NTLMSSP_Header(MessageType=2)
-                            rntlmchallenge = NTLM_Challenge(
-                                NegotiateFlags=ntlmnegotiate.NegotiateFlags)
-                            rntlmchallenge.TargetInfoFields.Offset = rntlmchallenge.TargetNameFields.Offset = 0x30
-#							if ntlmnegotiate.NegotiateFlags & NTLMSSP_REQUEST_TARGET:
-#								rntlmchallenge.TargetNameFields.Offset = 0x38
-#								rntlmchallenge.TargetNameFields.Len = 0x1E
-#								rntlmchallenge.TargetNameFields.MaxLen = 0x1E
-                            rntlmchallenge.ServerChallenge = b"\xa4\xdf\xe8\x0b\xf5\xc6\x1e\x3a"
-                            rntlmssp = rntlmssp / rntlmchallenge
-                            rntlmssp.show()
-                            negtokentarg = NegTokenTarg(
-                                negResult=1,supportedMech='1.3.6.1.4.1.311.2.2.10')
-                            negtokentarg.responseToken = rntlmssp.build()
-                            negtokentarg.mechListMIC = None
-                            raw = negtokentarg.build()
-                            #r.SecurityBlob = b'\xa1' + BER_len_enc(len(raw)) + raw
-                            r.SecurityBlob = BER_identifier_enc(
-                                BER_CLASS_CON,1,1) + BER_len_enc(len(raw)) + raw
-                            # STATUS_MORE_PROCESSING_REQUIRED
-                            rstatus = 0xc0000016
-                    elif cls == BER_CLASS_CON and pc == 1 and tag == 1:
-                        # NTLM AUTHENTICATE
-                        #
-                        # reply
-                        # \xa1 BER_length NegTokenTarg('accepted')
-                        negtokentarg = NegTokenTarg(sb)
-                        negtokentarg.show()
-                        ntlmssp = NTLMSSP_Header(
-                            negtokentarg.responseToken.val)
-                        ntlmssp.show()
-                        rnegtokentarg = NegTokenTarg(
-                            negResult=0, supportedMech=None)
-                        raw = rnegtokentarg.build()
-                        #r.SecurityBlob = b'\xa1' + BER_len_enc(len(raw)) + raw
-                        r.SecurityBlob = BER_identifier_enc(
-                            BER_CLASS_CON,1,1) + BER_len_enc(len(raw)) + raw
+                    self.report_login(login, "NT LM 0.12")
+                    self.session_login(reply_uid, login.get("username", ""))
             elif p.haslayer(SMB_Sessionsetup_AndX_Request2):
+                setup = p.getlayer(SMB_Sessionsetup_AndX_Request2)
+                unicode_names = bool(p.Flags2 & SMB_FLAGS2_UNICODE)
+                username = decode_smb_name(setup.Account, unicode_names)
+                self.report_login(dict(
+                    username=username,
+                    domain=decode_smb_name(setup.PrimaryDomain, unicode_names),
+                    workstation="", ntlm_version=variant(setup.UnicodePassword),
+                    password=legacy_password(setup.Password, setup.UnicodePassword, unicode_names),
+                ), "NT LM 0.12")
                 r = SMB_Sessionsetup_AndX_Response2(
                     NativeOS=self.config.native_os + "\0",
                     NativeLanManager=self.config.native_lan_manager + "\0",
                     PrimaryDomain=self.config.primary_domain + "\0"
                 )
+                reply_uid = self.session_uid(smbh.UID)
+                self.session_login(reply_uid, username)
+                if setup.AndXCommand == SMB_COM_TREE_CONNECT_ANDX:
+                    # a TREE_CONNECT_ANDX chained behind it (the only chain dionaea answers)
+                    chained = self.chained_tree_connect(setup, smbh, reply_uid)
             else:
                 smblog.warning("Unknown Session Setup Type used")
 
         elif Command == SMB_COM_TREE_CONNECT_ANDX:
-            r = SMB_Treeconnect_AndX_Response()
             h = p.getlayer(SMB_Treeconnect_AndX_Request)
-#			print ("Service : %s" % h.Path)
-
-            # for SMB_Treeconnect_AndX_Request.Flags = 0x0008
-            if h.Flags & 0x08:
-                r = SMB_Treeconnect_AndX_Response_Extended()
-
-            # get Path as ascii string
-            f,v = h.getfield_and_val('Path')
-            Service = f.i2repr(h,v)
-
-            # compile Service from the last part of path
-            # remove \\
-            if Service.startswith('\\\\'):
-                Service = Service[1:]
-            Service = Service.split('\\')[-1]
-            if Service[-1] == '\x00':
-                Service = Service[:-1]
-            if Service[-1] == '$':
-                Service = Service[:-1]
-            r.Service = Service + '\x00'
-
-            # specific for NMAP smb-enum-shares.nse support
-            if h.Path == b'nmap-share-test\0':
-                r = SMB_Treeconnect_AndX_Response2(
-                    NativeOS=self.config.native_os + "\0",
-                    NativeLanManager=self.config.native_lan_manager + "\0",
-                    PrimaryDomain=self.config.primary_domain + "\0"
-                )
-                rstatus = 0xc00000cc #STATUS_BAD_NETWORK_NAME
-            elif h.Path == b'ADMIN$\0' or h.Path == b'C$\0':
-                r = SMB_Treeconnect_AndX_Response2(
-                    NativeOS=self.config.native_os + "\0",
-                    NativeLanManager=self.config.native_lan_manager + "\0",
-                    PrimaryDomain=self.config.primary_domain + "\0"
-                )
-                rstatus = 0xc0000022 #STATUS_ACCESS_DENIED
-            # support for CVE-2017-7494 Samba SMB RCE
-            elif h.Path[-6:] == b'share\0':
-                smblog.info('Possible CVE-2017-7494 Samba SMB RCE attempts..')
-                r.AndXOffset = 0
-                r.Service = "A:\0"
-                r.NativeFileSystem = "NTFS\0"
+            r, rstatus, reply_tid = self.tree_connect(h, smbh, smbh.UID, 32)
         elif Command == SMB_COM_TREE_DISCONNECT:
+            self.trees.pop(smbh.TID, None)
             r = SMB_Treedisconnect()
         elif Command == SMB_COM_CLOSE:
             r = p.getlayer(SMB_Close)
-            if p.FID in self.fids and self.fids[p.FID] is not None:
-                self.fids[p.FID].close()
-                fileobj = self.fids[p.FID]
-                icd = incident("dionaea.download.complete")
-                icd.path = fileobj.name
-                icd.url = "smb://" + self.remote.host
-                icd.con = self
-                icd.report()
-                os.unlink(self.fids[p.FID].name)
-                del self.fids[p.FID]
-                r = SMB_Close_Response()
+            if p.FID in self.fids:
+                upload = self.fids.pop(p.FID)
+                if upload is not None:
+                    # the client has closed the file: it is complete
+                    upload.complete(self, upload_url("smb", self.remote.host, upload.client_name, upload.share))
+                    r = SMB_Close_Response()
         elif Command == SMB_COM_LOGOFF_ANDX:
+            self.uids.pop(smbh.UID, None)
             r = SMB_Logoff_AndX()
         elif Command == SMB_COM_NT_CREATE_ANDX:
             # FIXME return NT_STATUS_OBJECT_NAME_NOT_FOUND=0xc0000034
@@ -382,36 +479,14 @@ class smbd(connection):
             # requires mapping of TreeConnect ids to names/objects
             r = SMB_NTcreate_AndX_Response()
             h = p.getlayer(SMB_NTcreate_AndX_Request)
-            r.FID = 0x4000
-            while r.FID in self.fids:
-                r.FID += 0x200
-            if h.FileAttributes & (SMB_FA_HIDDEN|SMB_FA_SYSTEM|SMB_FA_ARCHIVE|SMB_FA_NORMAL):
+            r.FID = self.new_fid()
+            if r.FID is None:
+                r.FID = 0
+                rstatus = STATUS_TOO_MANY_OPENED_FILES
+            elif h.FileAttributes & (SMB_FA_HIDDEN|SMB_FA_SYSTEM|SMB_FA_ARCHIVE|SMB_FA_NORMAL):
                 # if a normal file is requested, provide a file
-
-                dionaea_config = g_dionaea.config().get("dionaea")
-                download_dir = dionaea_config.get("download.dir")
-                download_suffix = dionaea_config.get("download.suffix", ".tmp")
-                self.fids[r.FID] = tempfile.NamedTemporaryFile(
-                    delete=False,
-                    prefix="smb-",
-                    suffix=download_suffix,
-                    dir=download_dir
-                )
-
-                # get pretty filename
-                f,v = h.getfield_and_val('Filename')
-                filename = f.i2repr(h,v)
-                for j in range(len(filename)):
-                    if filename[j] != '\\' and filename[j] != '/':
-                        break
-                filename = filename[j:]
-
-                i = incident("dionaea.download.offer")
-                i.con = self
-                i.url = "smb://%s/%s" % (self.remote.host, filename)
-                i.report()
-                smblog.info("OPEN FILE! %s" % filename)
-
+                filename = decode_smb_name(h.Filename, smbh.Flags2 & SMB_FLAGS2_UNICODE)
+                self.open_upload(r, filename, self.trees.get(smbh.TID))
             elif h.FileAttributes & SMB_FA_DIRECTORY:
                 pass
             else:
@@ -419,34 +494,13 @@ class smbd(connection):
         elif Command == SMB_COM_OPEN_ANDX:
             h = p.getlayer(SMB_Open_AndX_Request)
             r = SMB_Open_AndX_Response()
-            r.FID = 0x4000
-            while r.FID in self.fids:
-                r.FID += 0x200
-
-            dionaea_config = g_dionaea.config().get("dionaea")
-            download_dir = dionaea_config.get("download.dir")
-            download_suffix = dionaea_config.get("download.suffix", ".tmp")
-
-            self.fids[r.FID] = tempfile.NamedTemporaryFile(
-                delete=False,
-                prefix="smb-",
-                suffix=download_suffix,
-                dir=download_dir
-            )
-
-            # get pretty filename
-            f,v = h.getfield_and_val('FileName')
-            filename = f.i2repr(h,v)
-            for j in range(len(filename)):
-                if filename[j] != '\\' and filename[j] != '/':
-                    break
-            filename = filename[j:]
-
-            i = incident("dionaea.download.offer")
-            i.con = self
-            i.url = "smb://%s/%s" % (self.remote.host, filename)
-            i.report()
-            smblog.info("OPEN FILE! %s" % filename)
+            r.FID = self.new_fid()
+            if r.FID is None:
+                r.FID = 0
+                rstatus = STATUS_TOO_MANY_OPENED_FILES
+            else:
+                filename = decode_smb_name(h.FileName, smbh.Flags2 & SMB_FLAGS2_UNICODE)
+                self.open_upload(r, filename, self.trees.get(smbh.TID))
 
         elif Command == SMB_COM_ECHO:
             r = p.getlayer(SMB_Header).payload
@@ -454,12 +508,24 @@ class smbd(connection):
             r = SMB_Write_AndX_Response()
             h = p.getlayer(SMB_Write_AndX_Request)
             r.CountLow = h.DataLenLow
-            if h.FID in self.fids and self.fids[h.FID] is not None:
-                smblog.warning("WRITE FILE!")
-                self.fids[h.FID].write(h.Data)
+            if self.fids.get(h.FID) is not None:
+                smblog.debug("WRITE FILE!")
+                offset = h.Offset
+                if h.WordCount == 14:
+                    # 64 bit offset, the high part is only there with the longer form of the request
+                    offset |= h.HighOffset << 32
+                written, rstatus = self.write_upload(h.FID, h.Data, offset)
+                # Low 16 bits of written
+                r.CountLow = written & 0xffff
+                # High 16 bits of written
+                r.CountHigh = (written >> 16) & 0xffff
             else:
                 self.buf += h.Data
 #				self.process_dcerpc_packet(p.getlayer(SMB_Write_AndX_Request).Data)
+                if len(self.buf) > MAX_DCERPC_BUFFER:
+                    # not a DCERPC fragment, do not keep what the client sends without limit
+                    smblog.warning("dropping %i bytes written to a pipe", len(self.buf))
+                    self.buf = b''
                 if len(self.buf) >= 10:
                     # we got the dcerpc header
                     inpacket = DCERPC_Header(self.buf[:10])
@@ -475,10 +541,11 @@ class smbd(connection):
                         self.buf = b''
         elif Command == SMB_COM_WRITE:
             h = p.getlayer(SMB_Write_Request)
-            if h.FID in self.fids and self.fids[h.FID] is not None:
-                smblog.warning("WRITE FILE!")
-                self.fids[h.FID].write(h.Data)
-            r = SMB_Write_Response(CountOfBytesWritten = h.CountOfBytesToWrite)
+            count = h.CountOfBytesToWrite
+            if self.fids.get(h.FID) is not None:
+                smblog.debug("WRITE FILE!")
+                count, rstatus = self.write_upload(h.FID, h.Data, h.WriteOffsetInBytes)
+            r = SMB_Write_Response(CountOfBytesWritten = count)
         elif Command == SMB_COM_READ_ANDX:
             r = SMB_Read_AndX_Response()
             h = p.getlayer(SMB_Read_AndX_Request)
@@ -513,6 +580,7 @@ class smbd(connection):
             self.state['readcount'] = newreadcount
 
         elif Command == SMB_COM_TRANSACTION:
+            self.trans = True
             h = p.getlayer(SMB_Trans_Request)
             r = SMB_Trans_Response()
             rdata = SMB_Data()
@@ -610,6 +678,7 @@ class smbd(connection):
 
             r /= rdata
         elif Command == SMB_COM_TRANSACTION2:
+            self.trans = True
             h = p.getlayer(SMB_Trans2_Request)
             if h.Setup[0] == SMB_TRANS2_SESSION_SETUP:
                 smblog.info('Possible DoublePulsar connection attempts..')
@@ -630,7 +699,7 @@ class smbd(connection):
 
                 # make sure the payload size not larger than 10MB
                 if len(self.buf2) > 10485760:
-                    self.buf2 = ''
+                    self.buf2 = b''
                 elif len(self.buf2) == 0 and h.DataCount == 4096:
                     self.buf2 = self.buf2 + h.Data
                 elif len(self.buf2) != 0 and h.DataCount == 4096:
@@ -662,12 +731,7 @@ class smbd(connection):
                     download_dir = dionaea_config.get("download.dir")
                     download_suffix = dionaea_config.get("download.suffix", ".tmp")
 
-                    fp = tempfile.NamedTemporaryFile(
-                        delete=False,
-                        prefix="smb-",
-                        suffix=download_suffix,
-                        dir=download_dir
-                    )
+                    fp = incoming_file("smb-", suffix=download_suffix, download_dir=download_dir)
                     fp.write(xor_output[offset:])
                     fp.close()
                     self.buf2 = b''
@@ -691,11 +755,21 @@ class smbd(connection):
         elif Command == SMB_COM_DELETE:
             h = p.getlayer(SMB_Delete_Request)
             r = SMB_Delete_Response()
-        elif Command == SMB_COM_TRANSACTION2_SECONDARY:
-            h = p.getlayer(SMB_Trans2_Secondary_Request)
-            # TODO: need some extra works
-            pass
+        elif Command in TRANS_SECONDARIES:
+            # MS17-010 / EternalBlue starts with an SMB_COM_NT_TRANSACT and goes on with
+            # SMB_COM_TRANSACTION2_SECONDARY, so the kinds, the order and the displacements
+            # of the pieces are not checked. A continuation is not answered, as a
+            # server does until the transaction is complete; without a transaction
+            # before it, it is an error.
+            if self.trans:
+                self.no_answer = True
+            else:
+                r = SMB_Trans2_Response()
+                # the answer to a continuation has the command and the ids of the request
+                r.smb_cmd = Command
+                rstatus = STATUS_INVALID_PARAMETER
         elif Command == SMB_COM_NT_TRANSACT:
+            self.trans = True
             h = p.getlayer(SMB_NT_Trans_Request)
             r = SMB_NT_Trans_Response()
             rstatus = 0x00000000  # STATUS_SUCCESS
@@ -710,6 +784,10 @@ class smbd(connection):
 #			smbh.Flags2 = p.getlayer(SMB_Header).Flags2 & ~SMB_FLAGS2_EXT_SEC
             smbh.MID = p.getlayer(SMB_Header).MID
             smbh.PID = p.getlayer(SMB_Header).PID
+            smbh.TID = p.getlayer(SMB_Header).TID if reply_tid is None else reply_tid
+            smbh.UID = p.getlayer(SMB_Header).UID if reply_uid is None else reply_uid
+            if chained is not None:
+                r = self.chain_tree_connect(r, smbh, chained)
             # Deception for DoublePulsar, we fix the XOR key first as 0x5273365E
             # WannaCry will use the XOR key to encrypt and deliver next payload, so we can decode easily later
             if Command == SMB_COM_TRANSACTION2:
@@ -811,12 +889,176 @@ class smbd(connection):
     def handle_timeout_idle(self):
         return False
 
+    def new_fid(self):
+        """The next free file id, None if the client has too many files open."""
+        if len(self.fids) >= MAX_OPEN_FIDS:
+            # once per connection, a client can ask as often as it likes
+            if not self.state.get('fid_limit_logged'):
+                self.state['fid_limit_logged'] = True
+                smblog.warning("%i files are open, no more allowed", len(self.fids))
+            return None
+        fid = 0x4000
+        while fid in self.fids:
+            fid += 0x200
+        return fid
+
+    def session_uid(self, uid):
+        """The UID of the session of a SESSION_SETUP_ANDX with uid: that one if the session is known, else a new one."""
+        if uid in self.uids:
+            return uid
+        if len(self.uids) >= MAX_SESSIONS:
+            del self.uids[next(iter(self.uids))]
+        uid = new_uid(self.uids)
+        self.uids[uid] = True
+        return uid
+
+    def session_login(self, uid, username):
+        """The session uid logged in as username: an empty name or guest stays anonymous."""
+        if uid in self.uids:
+            self.uids[uid] = not username or username.lower() == "guest"
+
+    def share_type(self, share):
+        """The type (STYPE_*) of a share of the config (smb.yaml shares, names in any case), None if there is none."""
+        for name, options in self.config.shares.items():
+            if name.lower() == share.lower():
+                return options["type"]
+        return None
+
+    def tree_connect(self, h, smbh, uid, offset):
+        """
+        The reply to a TREE_CONNECT_ANDX as a Windows server with the shares of the config gives it.
+
+        A share that is not in the config gets STATUS_BAD_NETWORK_NAME (except one whose name
+        ends in "share", CVE-2017-7494), an administrative share (ADMIN$, C$, ...)
+        STATUS_ACCESS_DENIED for an anonymous or guest session; otherwise a new TID, and the
+        Service and NativeFileSystem of the type of the share.
+
+        :param h: The request (SMB_Treeconnect_AndX_Request)
+        :param uid: UID of the session of the request
+        :param offset: Where the response starts in the reply, from the start of the SMB header
+        :return: (response, status, TID or None)
+        """
+        unicode_names = smbh.Flags2 & SMB_FLAGS2_UNICODE
+        share = share_name(decode_smb_name(h.Path, unicode_names))
+        share_type = self.share_type(share)
+        if share_type is None and share.lower().endswith("share"):
+            # support for CVE-2017-7494 Samba SMB RCE
+            smblog.info('Possible CVE-2017-7494 Samba SMB RCE attempts..')
+            share_type = STYPE_DISKTREE
+        if share_type is None:
+            return SMB_Treeconnect_AndX_Response2(), STATUS_BAD_NETWORK_NAME, None
+        if is_admin_share(share, share_type) and self.uids.get(uid, True):
+            return SMB_Treeconnect_AndX_Response2(), STATUS_ACCESS_DENIED, None
+
+        if h.Flags & 0x08:
+            # TREE_CONNECT_ANDX_EXTENDED_RESPONSE
+            r = SMB_Treeconnect_AndX_Response_Extended(
+                MaximalShareAccessRights=MAXIMAL_SHARE_ACCESS, GuestMaximalShareAccessRights=0)
+        else:
+            r = SMB_Treeconnect_AndX_Response()
+        service, file_system = TREE_SERVICES.get(share_type & 0x3, TREE_SERVICES[STYPE_DISKTREE])
+        r.Service = service + "\0"
+        r.NativeFileSystem = file_system + "\0"
+        # a unicode NativeFileSystem is word-aligned from the start of the SMB header
+        end_of_service = offset + 1 + 2 * r.WordCount + 2 + len(r.Service)
+        r.Padding = b"\0" if unicode_names and end_of_service % 2 else b""
+        return r, 0, self.new_tree(share)
+
+    def new_tree(self, share):
+        """The TID of a new tree of the client on share (the oldest one is forgotten when there are too many);
+        the tree keeps at most MAX_SHARE_LENGTH characters of the share, which go into the url of an upload."""
+        if len(self.trees) >= MAX_TREES:
+            del self.trees[next(iter(self.trees))]
+        tid = self.next_tid
+        while tid in self.trees or tid in (0, 0xffff):
+            tid = (tid + 1) % 0x10000
+        self.next_tid = (tid + 1) % 0x10000
+        self.trees[tid] = share[:MAX_SHARE_LENGTH]
+        return tid
+
+    def chained_tree_connect(self, setup, smbh, uid):
+        """The TREE_CONNECT_ANDX behind a SESSION_SETUP_ANDX (at its AndXOffset), None if it is not there."""
+        message = self.smb_message
+        offset = setup.AndXOffset
+        if message is None or offset < 32 or offset >= len(message):
+            return None
+        try:
+            request = SMB_Treeconnect_AndX_Request(message[offset:], _underlayer=smbh)
+            request.Path
+        except (ValueError, IndexError, KeyError, AttributeError, TypeError, struct.error, UnicodeError) as e:
+            smblog.info("chained TREE_CONNECT_ANDX not parsed: %s", e)
+            return None
+        return request, uid
+
+    def chain_tree_connect(self, r, smbh, chained):
+        """
+        The reply of a SESSION_SETUP_ANDX (r) with the reply of the TREE_CONNECT_ANDX chained to it, as Windows
+        gives it: one message, the session setup response points at the tree connect response (AndXOffset), the
+        header has the new TID, and the status of the tree connect if it failed.
+        """
+        request, uid = chained
+        r.AndXCommand = SMB_COM_TREE_CONNECT_ANDX
+        offset = len((SMB_Header(Flags2=smbh.Flags2) / r).build())
+        r.AndXOffset = offset
+        tree, status, tid = self.tree_connect(request, smbh, uid, offset)
+        if tid is not None:
+            smbh.TID = tid
+        if status:
+            smbh.Status = status
+        return r / tree
+
+    def open_upload(self, response, filename, share=None):
+        """
+        The client opened a file: collect what it writes, offer it as a download.
+
+        :param share: Share of the tree of the request, None if the TID is not known
+        """
+        if is_pipe_name(filename):
+            # a service, the writes are DCERPC
+            self.fids[response.FID] = None
+            return
+        try:
+            upload = UploadFile("smb-", max_size=getattr(self.config, "max_upload_size", DEFAULT_MAX_UPLOAD_SIZE))
+        except OSError as e:
+            smblog.error("unable to create a file for an upload: %s", e)
+            self.fids[response.FID] = None
+            return
+        upload.client_name = filename
+        upload.share = share
+        self.fids[response.FID] = upload
+
+        url = upload_url("smb", self.remote.host, filename, share)
+        i = incident("dionaea.download.offer")
+        i.con = self
+        i.url = url
+        i.report()
+        smblog.info("OPEN FILE! %s" % url)
+
+    def write_upload(self, fid, data, offset):
+        """
+        Write data of a client into its open file.
+
+        :return: Number of bytes written and the status of the response
+        """
+        upload = self.fids[fid]
+        try:
+            return upload.write(data, offset), 0
+        except UploadTooLarge as e:
+            # a file this large is not what the service is for: drop it, the client gets the errors
+            smblog.warning("upload dropped: %s", e)
+            upload.discard()
+            return 0, STATUS_DISK_FULL
+        except UploadError as e:
+            smblog.warning("upload failed: %s", e)
+            upload.discard()
+            return 0, STATUS_UNSUCCESSFUL
+
     def handle_disconnect(self):
-        for i in self.fids:
-            if self.fids[i] is not None:
-                self.fids[i].close()
-                os.unlink(self.fids[i].name)
-                del self.fids[i]
+        # files that were not closed by the client are dropped
+        for upload in self.fids.values():
+            if upload is not None:
+                upload.discard()
+        self.fids.clear()
         return 0
 
 class epmapper(smbd):
@@ -833,7 +1075,7 @@ class epmapper(smbd):
             return len(data)
 
         if len(data) < p.FragLen:
-            smblog.warning("epmapper - not enough data")
+            smblog.debug("epmapper - not enough data")
             return 0
 
         smblog.debug("packet: %s" % p.summary())
@@ -853,7 +1095,7 @@ class epmapper(smbd):
         self.send(r.build())
 
         if p.haslayer(Raw):
-            smblog.warning("p.haslayer(Raw): %s" % p.getlayer(Raw).build())
+            smblog.debug("p.haslayer(Raw): %s" % p.getlayer(Raw).build())
             p.show()
 
         return len(data)

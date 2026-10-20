@@ -7,19 +7,22 @@
 
 from dionaea import ServiceLoader
 from dionaea.core import connection, g_dionaea, incident
+from dionaea.upload import incoming_file
 from dionaea.util import detect_shellshock
 from dionaea.exception import ServiceConfigError
+from dionaea.logtext import log_text
 from collections import OrderedDict
 import logging
 import os
 import sys
 import io
-import cgi
+import email.message
+import email.parser
+import email.policy
 import html
 import mimetypes
 import urllib.parse
 import re
-import tempfile
 from datetime import datetime
 from typing import Optional
 
@@ -33,10 +36,136 @@ logger = logging.getLogger('http')
 logger.setLevel(logging.DEBUG)
 
 STATE_HEADER, STATE_SENDFILE, STATE_POST, STATE_PUT = range(0, 4)
+# the request was refused (413): what the client still sends is dropped (handle_io_in
+# takes it all, see _check_max_request_size_reached)
+STATE_DISCARD = 4
+
+
+# multipart parts inside a part (multipart/mixed: several files of one field, RFC 2388,
+# RFC 7578 4.3) are followed this deep below the body, deeper ones are ignored
+MULTIPART_MAX_DEPTH = 3
+# transport padding (spaces, tabs) after a boundary
+MULTIPART_MAX_PADDING = 1024
+
+
+def _multipart_chain(first, rest):
+    yield first
+    yield from rest
+
+
+def _multipart_delimiters(body: bytes, start: int, end: int, boundary: bytes, budget):
+    """
+    The delimiter lines of body[start:end], up to the closing one, and the line break.
+
+    A delimiter is ``--boundary`` as a whole line: at the start of the body or
+    after a line break, followed by ``--`` (the closing delimiter), padding and a
+    line break or the end. The line break is that of the first delimiter, CRLF
+    (as RFC 2046 says) or a bare LF; the other kind inside the data is data. The
+    work is bound by budget before a part is parsed.
+
+    :param budget: [parts left] of all levels, None for no limit
+    :return: (list of match objects, line break)
+    """
+    name = re.escape(boundary)
+    padding = rb"[ \t]{0,%d}" % MULTIPART_MAX_PADDING
+    line = re.compile(rb"--" + name + rb"(?:--)?" + padding + rb"(\r?\n|$)")
+    m = line.match(body, start, end)
+    if m is None:
+        m = re.compile(rb"\n" + line.pattern).search(body, start, end)
+    eol = b"\n" if m is not None and m.group(1) == b"\n" else b"\r\n"
+
+    tail = rb"(?:(?P<closing>--)" + padding + rb"(?:" + re.escape(eol) + rb"|$)|" + padding + rb"(?:" \
+        + re.escape(eol) + rb"|$))"
+    opening = re.compile(rb"--" + name + tail)
+    delimiter = re.compile(re.escape(eol) + rb"--" + name + tail)
+    first_marker = opening.match(body, start, end)
+    if first_marker is None:
+        found = delimiter.finditer(body, start, end)
+    else:
+        found = _multipart_chain(first_marker, delimiter.finditer(body, first_marker.end(), end))
+    markers = []
+    for marker in found:
+        markers.append(marker)
+        if marker.group("closing"):
+            break
+        if budget is not None:
+            budget[0] -= 1
+            if budget[0] < 0:
+                raise ValueError("Max number of fields exceeded")
+    return markers, eol
+
+
+def _multipart_files(body: bytes, start: int, end: int, boundary: str, budget, depth: int, field=None):
+    """The files of the multipart body body[start:end], see iter_uploaded_files."""
+    markers, eol = _multipart_delimiters(body, start, end, boundary.encode("utf-8", "replace"), budget)
+    parser = email.parser.BytesParser(policy=email.policy.HTTP)
+    separator = eol + eol
+    for index, marker in enumerate(markers):
+        if marker.group("closing"):
+            break
+        part_start = marker.end()
+        part_end = markers[index + 1].start() if index + 1 < len(markers) else end
+        if body.startswith(eol, part_start, part_end):
+            # no headers
+            continue
+        pos = body.find(separator, part_start, part_end)
+        if pos < 0:
+            continue
+        part_headers = parser.parsebytes(body[part_start:pos + len(eol)], headersonly=True)
+        content_start = pos + len(separator)
+        if index == len(markers) - 1 and body.endswith(eol, content_start, part_end):
+            # no closing boundary (the HTTP service cuts it off): the line
+            # break in front of it is not part of the content
+            part_end -= len(eol)
+        name = field
+        if name is None:
+            name = part_headers.get_param("name", header="content-disposition")
+        filename = part_headers.get_filename()
+        if filename is None:
+            inner = part_headers.get_boundary() if part_headers.get_content_maintype() == "multipart" else None
+            if inner and depth < MULTIPART_MAX_DEPTH:
+                yield from _multipart_files(body, content_start, part_end, inner, budget, depth + 1, name)
+            continue
+        yield name, filename, body[content_start:part_end]
+
+
+def iter_uploaded_files(fp, content_type: str, max_num_fields: Optional[int] = None):
+    """
+    Get the uploaded files of a multipart/form-data request body.
+
+    The cgi module was removed in Python 3.13. The body is split at complete
+    boundary lines (CRLF or bare LF); the work is bound by max_num_fields before
+    any part is parsed (the parser of the email package parses the whole body at
+    once and is slow on bodies with many tiny parts). The content of a part is
+    returned as it was sent, a Content-Transfer-Encoding is not decoded (as with
+    cgi). Parts that are not files are ignored; the files of nested multipart
+    parts (multipart/mixed) are returned with the field name of the part that
+    holds them, up to MULTIPART_MAX_DEPTH levels deep. Nothing is copied but the
+    content of the files.
+
+    :param fp: File object with the request body
+    :param content_type: Value of the Content-Type header of the request
+    :param max_num_fields: Raise a ValueError if the body has more parts, those of
+        nested parts included
+    :return: Generator of tuples (field name, file name, content as bytes)
+    """
+    if not content_type.lower().startswith("multipart/"):
+        return
+
+    header = email.message.Message()
+    header["Content-Type"] = content_type
+    boundary = header.get_boundary()
+    if not boundary:
+        return
+
+    body = fp.read()
+    budget = None if max_num_fields is None else [max_num_fields]
+    yield from _multipart_files(body, 0, len(body), boundary, budget, 0)
 
 
 class DionaeaHTTPError(Exception):
     def __init__(self, code: int):
+        super().__init__(code)
         self.code = code
 
 
@@ -148,7 +277,7 @@ class httpreq:
                 header_line = header_line[:len(header_line)-1]
             header_name, _, header_value = header_line.partition(b":")
             if header_value is None:
-                logger.warning("Header without value '%s'", header_name)
+                logger.warning("Header without value '%s'", log_text(header_name))
                 continue
             self.headers[header_name.lower()] = header_value.strip()
 
@@ -237,6 +366,8 @@ class httpd(connection):
         self._out.speed.limit = 16*1024
         self.env = None
         self.boundary = None
+        self.boundary_start = None
+        self.boundary_end = None
         self.fp_tmp = None
         self.cur_length = 0
         self.content_length: Optional[int] = None
@@ -267,8 +398,6 @@ class httpd(connection):
 
         # Use own class so we can add additional files later
         self._mimetypes = mimetypes.MimeTypes()
-
-        self.request_form: Optional[cgi.FieldStorage] = None
 
     @property
     def request_fields(self):
@@ -319,8 +448,28 @@ class httpd(connection):
             self.template_values = {}
         return True
 
+    def _discard_post(self):
+        """Close and remove the temporary file of a request body (taken, refused or left by the client)."""
+        if self.fp_tmp is None:
+            return
+        name = self.fp_tmp.name
+        try:
+            self.fp_tmp.close()
+        except OSError:
+            pass
+        self.fp_tmp = None
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+
     def _check_max_request_size_reached(self) -> bool:
         if self.cur_length > self.max_request_size:
+            # nothing of the request is stored, nothing more of it is read: handle_io_in has
+            # no branch for STATE_DISCARD, it ends in its last "return len(data)", so all
+            # the client still sends is taken from the buffer and dropped
+            self._discard_post()
+            self.state = STATE_DISCARD
             # Close connection if request is to large.
             # RFC2616: "The server MAY close the connection to prevent the client from continuing the request."
             # http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.4.14
@@ -553,34 +702,25 @@ class httpd(connection):
 
                 self.state = STATE_POST
 
-                m = re.compile(
-                    r"multipart/form-data;\s*boundary=(?P<boundary>.*)",
-                    re.IGNORECASE
-                ).match(self.content_type)
-
-                if m:
-                    # More on boundaries see:
-                    # http://www.apps.ietf.org/rfc/rfc2046.html#sec-5.1.1
-                    self.boundary = bytes("--" + m.group("boundary") + "--\r\n", "utf-8")
+                if self.content_type.lower().startswith("multipart/form-data"):
+                    # the boundary as the parser reads it (quoted or not, other parameters behind it).
+                    # More on boundaries see: https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
+                    header = email.message.Message()
+                    header["Content-Type"] = self.content_type
+                    boundary = header.get_boundary()
+                    if boundary:
+                        self.boundary = b"--" + boundary.encode("utf-8", "replace") + b"--"
+                        name = re.escape(self.boundary)
+                        self.boundary_end = re.compile(rb"\n" + name + rb"\r?\n")
+                        self.boundary_start = re.compile(name + rb"\r?\n")
 
                 # dump post content to file
-                self.fp_tmp = tempfile.NamedTemporaryFile(
-                    delete=False,
-                    dir=self.download_dir,
-                    prefix="http-",
-                    suffix=self.download_suffix
-                )
+                self.fp_tmp = incoming_file("http-", suffix=self.download_suffix, download_dir=self.download_dir)
 
                 self.cur_length = start_of_content
 
                 if self.boundary:
-                    pos = data.find(self.boundary)
-                    # ending boundary not found
-                    if pos < 0:
-                        return start_of_content
-                    self.fp_tmp.write(data[:pos])
-                    self.handle_POST()
-                    return start_of_content + pos
+                    return start_of_content + self._post_multipart(data)
 
                 if len(data) < self.content_length:
                     return start_of_content
@@ -604,24 +744,7 @@ class httpd(connection):
         elif self.state == STATE_POST:
             data_length = len(data)
             if self.boundary:
-                pos = data.find(self.boundary)
-
-                if pos < 0:
-                    # boundary not found
-                    length_processed = data_length - len(self.boundary)
-                    if length_processed < 0:
-                        length_processed = 0
-                    self.cur_length = self.cur_length + length_processed
-
-                    if self._check_max_request_size_reached():
-                        return data_length
-                    self.fp_tmp.write(data[:length_processed])
-                    return length_processed
-
-                # boundary found
-                self.fp_tmp.write(data[:pos+len(self.boundary)])
-                self.handle_POST()
-                return pos + len(self.boundary)
+                return self._post_multipart(data)
 
             self.cur_length += data_length
             if self._check_max_request_size_reached():
@@ -644,6 +767,40 @@ class httpd(connection):
             return 0
 
         return len(data)
+
+    def _post_multipart(self, data):
+        """
+        Write the data of a multipart body into the temporary file, up to its end.
+
+        The body ends after its closing delimiter, a line of its own
+        (``--boundary--``, CRLF or a bare LF), or at the Content-Length, whichever
+        comes first. What could be the start of the closing delimiter stays in the
+        buffer until more data comes.
+
+        :return: Number of bytes of data used
+        """
+        written = self.fp_tmp.tell()
+        end = None
+        m = self.boundary_start.match(data) if written == 0 else None
+        if m is None:
+            m = self.boundary_end.search(data)
+        if m is not None:
+            end = m.end()
+        if self.content_length and self.content_length > 0 and written + (len(data) if end is None else end) \
+                >= self.content_length:
+            end = self.content_length - written
+        if end is None:
+            # \n--boundary--\r\n can start in the last bytes
+            take = max(0, len(data) - len(self.boundary) - 3)
+        else:
+            take = end
+        self.cur_length += take
+        if self._check_max_request_size_reached():
+            return len(data)
+        self.fp_tmp.write(data[:take])
+        if end is not None:
+            self.handle_POST()
+        return take
 
     def handle_GET(self):
         """Handle the GET method. Send the header and the file."""
@@ -682,47 +839,26 @@ class httpd(connection):
         """
         if self.fp_tmp is not None:
             self.fp_tmp.seek(0)
-            # at least this information are needed for
-            # cgi.FieldStorage() to parse the content
-            tmp_environ = {
-                'REQUEST_METHOD': 'POST',
-                'CONTENT_LENGTH': self.content_length,
-                'CONTENT_TYPE': self.content_type
-            }
-            if sys.version_info[1] >= 8:
-                self.request_form = cgi.FieldStorage(
-                    fp=self.fp_tmp,
-                    environ=tmp_environ,
+            try:
+                uploads = list(iter_uploaded_files(
+                    self.fp_tmp,
+                    self.content_type,
                     max_num_fields=self.get_max_num_fields
-                )
-            else:
-                logger.warning("max_num_fields is only supported with Python >= 3.8")
-                self.request_form = cgi.FieldStorage(
-                    fp=self.fp_tmp,
-                    environ=tmp_environ
-                )
-            for field_name in self.request_form.keys():
-                # dump only files
-                if self.request_form[field_name].filename is None:
-                    continue
+                ))
+            except ValueError as e:
+                logger.warning("Ignoring the POST data: %s", log_text(e))
+                uploads = []
+            except Exception:
+                logger.warning("Unable to parse the POST data", exc_info=True)
+                uploads = []
 
-                fp_post = self.request_form[field_name].file
-
-                data = fp_post.read(4096)
-
+            for _field_name, _filename, data in uploads:
                 # don't handle empty files
                 if len(data) == 0:
                     continue
 
-                fp_tmp = tempfile.NamedTemporaryFile(
-                    delete=False,
-                    dir=self.download_dir,
-                    prefix='http-',
-                    suffix=self.download_suffix
-                )
-                while data != b'':
-                    fp_tmp.write(data)
-                    data = fp_post.read(4096)
+                fp_tmp = incoming_file("http-", suffix=self.download_suffix, download_dir=self.download_dir)
+                fp_tmp.write(data)
 
                 icd = incident("dionaea.download.complete")
                 icd.path = fp_tmp.name
@@ -733,7 +869,7 @@ class httpd(connection):
                 icd.report()
                 os.unlink(fp_tmp.name)
 
-            os.unlink(self.fp_tmp.name)
+            self._discard_post()
 
         x = self.send_head()
         if x:
@@ -1008,6 +1144,8 @@ class httpd(connection):
         self.send("\r\n")
 
     def handle_disconnect(self):
+        # the body of a request that never got complete
+        self._discard_post()
         return False
 
     def handle_timeout_idle(self):
@@ -1035,8 +1173,8 @@ class httpd(connection):
         304: ('Not Modified',
               'Document has not changed since given time'),
         305: ('Use Proxy',
-              'You must use proxy specified in Location to access this '
-              'resource.'),
+              ('You must use proxy specified in Location to access this '
+               'resource.')),
         307: ('Temporary Redirect',
               'Object moved temporarily -- see URI list'),
 
@@ -1052,8 +1190,9 @@ class httpd(connection):
         405: ('Method Not Allowed',
               'Specified method is invalid for this server.'),
         406: ('Not Acceptable', 'URI not available in preferred format.'),
-        407: ('Proxy Authentication Required', 'You must authenticate with '
-              'this proxy before proceeding.'),
+        407: ('Proxy Authentication Required',
+              ('You must authenticate with '
+               'this proxy before proceeding.')),
         408: ('Request Timeout', 'Request timed out; try again later.'),
         409: ('Conflict', 'Request conflict.'),
         410: ('Gone',

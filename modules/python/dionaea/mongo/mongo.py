@@ -7,12 +7,14 @@
 import logging
 import os
 import re
+import struct
 import tempfile
 from datetime import datetime
 from decimal import Decimal
 
 try:
     import bson
+    import bson.errors
 except ImportError:
     bson = None
 
@@ -22,6 +24,18 @@ from dionaea.smb.include.packet import Raw
 
 
 logger = logging.getLogger('mongo')
+
+# a message is its header (16 bytes) and its body; the first messages of a client (isMaster,
+# buildInfo, a query) are a few hundred bytes, a larger one is not waited for (MAX_MESSAGE_SIZE)
+HEADER_SIZE = 16
+MAX_MESSAGE_SIZE = 64 * 1024
+# what the parsers raise for a message that is not what its header says
+MALFORMED = (AttributeError, IndexError, KeyError, TypeError, ValueError, struct.error) + (
+    (bson.errors.BSONError,) if bson is not None else ())
+
+
+class MalformedMessage(Exception):
+    """A message of the client the parser or BSON can not read (not an error of the service)."""
 
 
 class mongod(connection):
@@ -157,62 +171,62 @@ class mongod(connection):
 
     def handle_io_in(self, data):
         offset = 0
-        while len(data) - offset >= 16:
-            h = packets.MsgHeader(data[offset:offset+16])
-            # print(h.messageLength)
-            # print(h.opCode)
+        while len(data) - offset >= HEADER_SIZE:
+            h = packets.MsgHeader(data[offset:offset + HEADER_SIZE])
+            if not HEADER_SIZE <= h.messageLength <= MAX_MESSAGE_SIZE:
+                # shorter than its own header or above the limit
+                logger.info("MongoDB message of %d bytes from %s:%s, closing the connection",
+                            h.messageLength, self.remote.host, self.remote.port)
+                self.close()
+                return len(data)
             if len(data) - offset < h.messageLength:
                 break
-            if h.opCode == 2004:
-                msg = packets.MsgQuery(data[offset+16:offset+h.messageLength])
-                # print(h.show())
-                # print(msg.show())
-                query = None
-                field_selectors = []
-                if bson:
-                    for doc in bson.decode_all(msg.payload.load):
-                        if query is None:
-                            query = doc
-                        else:
-                            field_selectors.append(doc)
-                res = self._handle_query(fullCollectionName=msg.fullCollectionName, query=query, field_selectors=field_selectors)
-
-                # print(msg)
-                # print(msg.payload)
-                # print(msg.payload.load)
-                payload = b""
-                for doc in res:
-                    payload += bson.BSON.encode(doc)
-
-                pkg = packets.MsgHeader(
-                    responseTo=h.requestID,
-                    opCode=1
-                ) / packets.MsgReply(
-                    numberReturned=len(res)
-                ) / Raw(payload)
-                pkg.show()
-                self.send(pkg.build())
-            elif h.opCode == 2010:
-                msg = packets.MsgCommand(data[offset + 16:offset + h.messageLength])
-
-                docs = bson.decode_all(msg.payload.load)
-                res = self._handle_command(msg.database, msg.commandName, docs[0], docs[1], docs[1:])
-
-                payload = b""
-                for doc in res:
-                    payload += bson.BSON.encode(doc)
-
-                pkg = packets.MsgHeader(
-                    responseTo=h.requestID,
-                    opCode=2011
-                ) / packets.MsgCommandReply(
-                ) / Raw(payload)
-                pkg.show()
-                self.send(pkg.build())
-
-            # print(h.payload)
-
-            # ToDo: check length
+            try:
+                self._handle_message(h, data[offset:offset + h.messageLength])
+            except MalformedMessage as e:
+                logger.info("malformed MongoDB message (opCode %d) from %s:%s, closing the connection: %s",
+                            h.opCode, self.remote.host, self.remote.port, e)
+                self.close()
+                return len(data)
             offset = offset + h.messageLength
 
         return offset
+
+    @staticmethod
+    def _parse(h, body):
+        """(message, its documents) of OP_QUERY / OP_COMMAND; MalformedMessage if they can not be read"""
+        try:
+            if h.opCode == 2004:
+                msg = packets.MsgQuery(body)
+                docs = bson.decode_all(msg.payload.load) if bson else []
+            else:
+                msg = packets.MsgCommand(body)
+                docs = bson.decode_all(msg.payload.load)
+        except MALFORMED as e:
+            raise MalformedMessage(e.__class__.__name__) from e
+        if h.opCode == 2010 and len(docs) < 2:
+            # the metadata and the arguments of the command
+            raise MalformedMessage("%d documents" % len(docs))
+        return msg, docs
+
+    def _handle_message(self, h, data):
+        """One whole message (header and body) of the client: OP_QUERY and OP_COMMAND are answered."""
+        if h.opCode not in (2004, 2010):
+            return
+        msg, docs = self._parse(h, data[HEADER_SIZE:])
+        if h.opCode == 2004:
+            query = docs[0] if docs else None
+            res = self._handle_query(fullCollectionName=msg.fullCollectionName, query=query, field_selectors=docs[1:])
+            reply = packets.MsgReply(numberReturned=len(res))
+            opcode = 1
+        else:
+            res = self._handle_command(msg.database, msg.commandName, docs[0], docs[1], docs[1:])
+            reply = packets.MsgCommandReply()
+            opcode = 2011
+
+        payload = b""
+        for doc in res:
+            payload += bson.BSON.encode(doc)
+        pkg = packets.MsgHeader(responseTo=h.requestID, opCode=opcode) / reply / Raw(payload)
+        pkg.show()
+        self.send(pkg.build())

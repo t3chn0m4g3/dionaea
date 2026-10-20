@@ -11,6 +11,8 @@
 
 import logging
 
+from dionaea.logtext import log_text
+
 from .asn1.asn1 import *
 from .asn1.ber import *
 #from volatile import *
@@ -244,7 +246,7 @@ class ASN1F_SEQUENCE(ASN1F_field):
                 s = obj.dissect(pkt,s)
             if s:
                 # XXX not reversible!
-                logger.warning("Too many bytes to decode sequence: [%r]", s)
+                logger.warning("Too many bytes to decode sequence: [%s]", log_text(s))
             return remain
         except ASN1_Error as e:
             raise ASN1F_badsequence(e)

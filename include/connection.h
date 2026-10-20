@@ -47,6 +47,7 @@ typedef void (*event_fn)(struct connection *con);
 #define CONOFF_RECONNECT_TIMEOUT(x) 		((struct connection *)(((void *)x) - offsetof (struct connection, events.reconnect_timeout)))
 #define CONOFF_THROTTLE_IO_IN_TIMEOUT(x) 	((struct connection *)(((void *)x) - offsetof (struct connection, events.throttle_io_in_timeout)))
 #define CONOFF_THROTTLE_IO_OUT_TIMEOUT(x) 	((struct connection *)(((void *)x) - offsetof (struct connection, events.throttle_io_out_timeout)))
+#define CONOFF_ACCEPT_RETRY_TIMEOUT(x) 	((struct connection *)(((void *)x) - offsetof (struct connection, events.accept_retry_timeout)))
 #define CONOFF_FREE(x)						((struct connection *)(((void *)x) - offsetof (struct connection, events.free)))
 
 struct ev_loop;
@@ -217,6 +218,10 @@ struct connection
 
 
 	int socket;
+	bool download_guard;
+	/* a download connection: the filter refused an address, an address passed it */
+	bool download_refused;
+	bool download_attempted;
 
 	struct
 	{
@@ -234,6 +239,7 @@ struct connection
 		struct ev_timer throttle_io_in_timeout;
 		struct ev_timer throttle_io_out_timeout;
 		struct ev_timer free;
+		struct ev_timer accept_retry_timeout; // tcp&tls listen: accept() failed, listen again later
 	}events;
 
 	/**
@@ -335,6 +341,15 @@ void connection_reconnect_timeout_cb(struct ev_loop *loop, struct ev_timer *w, i
 
 void connection_disconnect(struct connection *con);
 
+/* seconds the listen watcher stays stopped after accept() failed */
+#define CONNECTION_ACCEPT_RETRY_INTERVAL 1.0
+/* transient accept() errors in a row before the callback goes back to the
+ * event loop (the watcher stays active, the next turn accepts again) */
+#define CONNECTION_ACCEPT_TRANSIENT_MAX 16
+bool connection_accept_error_is_transient(int error);
+void connection_accept_backoff(struct connection *con, int error);
+void connection_accept_retry_timeout_cb(struct ev_loop *loop, struct ev_timer *w, int revents);
+
 void connection_tcp_accept_cb (struct ev_loop *loop, struct ev_io *w, int revents);
 void connection_tcp_connecting_cb(struct ev_loop *loop, struct ev_io *w, int revents);
 void connection_tcp_io_in_cb(struct ev_loop *loop, struct ev_io *w, int revents);
@@ -396,6 +411,7 @@ void *connection_protocol_ctx_get(struct connection *con);
 void connection_protocol_ctx_set(struct connection *con, void *data);
 bool bind_local(struct connection *con);
 
+bool download_destination_allowed(const char *address);
 int connection_ref(struct connection *con);
 int connection_unref(struct connection *con);
 #endif

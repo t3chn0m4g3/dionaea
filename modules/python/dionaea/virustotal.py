@@ -139,12 +139,12 @@ class virustotalhandler(ihandler):
         vtr = self.cookies[cookie]
 
         if j['response_code'] == -2:
-            logger.warn("api throttle")
+            logger.warning("api throttle")
             self.cursor.execute(
                 """UPDATE backlogfiles SET status = ? WHERE backlogfile = ?""", (vtr.status, vtr.backlogfile))
             self.dbh.commit()
         elif j['response_code'] == -1:
-            logger.warn("something is wrong with your virustotal api key")
+            logger.warning("something is wrong with your virustotal api key")
         elif j['response_code'] == 0: # file unknown
             # mark for submit
             if vtr.status == 'new':
@@ -167,7 +167,7 @@ class virustotalhandler(ihandler):
             i.path = icd.path
             i.report()
         else:
-            logger.warn("virustotal reported {}".format(j))
+            logger.warning("virustotal reported {}".format(j))
         del self.cookies[cookie]
 
     def scan_file(self, backlogfile, md5_hash, path, status):
@@ -191,12 +191,12 @@ class virustotalhandler(ihandler):
         vtr = self.cookies[cookie]
 
         if j['response_code'] == -2:
-            logger.warn("api throttle")
+            logger.warning("api throttle")
             self.cursor.execute(
                 """UPDATE backlogfiles SET status = ? WHERE backlogfile = ?""", (vtr.status, vtr.backlogfile))
             self.dbh.commit()
         elif j['response_code'] == -1:
-            logger.warn("something is wrong with your virustotal api key")
+            logger.warning("something is wrong with your virustotal api key")
         elif j['response_code'] == 1:
             scan_id = j['scan_id']
             # recycle this entry for the query
@@ -225,12 +225,12 @@ class virustotalhandler(ihandler):
         try:
             j = json.load(f)
             if j['response_code'] == -2:
-                logger.warn("api throttle")
+                logger.warning("api throttle")
                 self.cursor.execute(
                     """UPDATE backlogfiles SET status = ? WHERE backlogfile = ?""", (vtr.status, vtr.backlogfile))
                 self.dbh.commit()
             elif j['response_code'] == -1:
-                logger.warn("something is wrong with your virustotal api key")
+                logger.warning("something is wrong with your virustotal api key")
             elif j['response_code'] == 1:
                 self.cursor.execute(
                     """UPDATE backlogfiles SET status = 'query' WHERE backlogfile = ? """, (vtr.backlogfile, ))

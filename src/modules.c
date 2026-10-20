@@ -201,6 +201,17 @@ void modules_new(void)
 	}
 }
 
+void modules_flush(void)
+{
+	GList *it;
+	for( it = g_list_first(g_dionaea->modules->modules); it != NULL; it = g_list_next(it) )
+	{
+		struct module *m = it->data;
+		if( m->api.flush != NULL )
+			m->api.flush();
+	}
+}
+
 void modules_free(void)
 {
 	GList *it;

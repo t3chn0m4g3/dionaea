@@ -15,6 +15,14 @@ import time
 logger = logging.getLogger('log_sqlite')
 logger.setLevel(logging.DEBUG)
 
+#: Seconds between two commits. Every incident used to be committed at once, about
+#: 130 transactions a second under load. Each transaction costs sqlite file
+#: operations of its journal (created and deleted, or the hot journal check) and
+#: fsyncs, all in the event loop: on the bind mount of the data folder a quarter of
+#: the time of the loop and single calls up to 0.7 s. The rows of a second now go
+#: in one transaction; a reader sees them at most this much later.
+COMMIT_INTERVAL = 1.0
+
 
 class LogSQLHandlerLoader(IHandlerLoader):
     name = "log_sqlite"
@@ -40,6 +48,8 @@ class logsqlhandler(ihandler):
 #       self.dbh = sqlite3.connect(user = g_dionaea.config()['modules']['python']['logsql']['file'])
         self.dbh = sqlite3.connect(self.filename)
         self.cursor = self.dbh.cursor()
+        self._dirty = False
+        self._commit_timer = None
         update = False
 
         self.cursor.execute("""CREATE TABLE IF NOT EXISTS
@@ -565,6 +575,7 @@ class logsqlhandler(ihandler):
 
 
         self.dbh.commit()
+        self._start_commit_timer()
 
 
         # updates, database schema corrections for old versions
@@ -589,11 +600,54 @@ class logsqlhandler(ihandler):
             logger.debug("... not required")
 
     def __del__(self):
+        # Not the place of the final commit: while the commit timer runs, the loop holds
+        # the timer's callback, which holds self.flush and so the handler; __del__ can
+        # only run after stop(), which ends the timer and commits (dionaea calls the
+        # ihandlers' stop on SIGINT). Before that, when the event loop ended and before
+        # dionaea waits for its threadpool, flush() commits (module api flush, a stop
+        # timeout during the wait loses nothing). A hard kill loses at most the last second.
         logger.info("Closing sqlite handle")
+        if getattr(self, "dbh", None) is None:
+            return
+        self.stop()
         self.cursor.close()
         self.cursor = None
         self.dbh.close()
         self.dbh = None
+
+    def _start_commit_timer(self):
+        try:
+            from dionaea.core import timer
+        except ImportError:   # a binding without timers: commit every statement as before
+            return
+        self._commit_timer = timer(self.flush, COMMIT_INTERVAL, COMMIT_INTERVAL)
+
+    def _commit(self):
+        """The statements of an incident are done: commit them with the next flush."""
+        if self._commit_timer is None:
+            self.dbh.commit()
+        else:
+            self._dirty = True
+
+    def flush(self):
+        """Commit what the incidents since the last flush wrote (the timer calls it every COMMIT_INTERVAL)."""
+        if not self._dirty or self.dbh is None:
+            return
+        try:
+            self.dbh.commit()
+        except sqlite3.Error as e:
+            # e.g. a reader held its lock longer than the busy timeout: the transaction stays, the next flush tries again
+            logger.warning("Unable to commit to %s, trying again: %s", self.filename, e)
+            return
+        self._dirty = False
+
+    def stop(self):
+        """dionaea stops: no more timer, everything written is committed."""
+        if getattr(self, "_commit_timer", None) is not None:
+            self._commit_timer.stop()
+            self._commit_timer = None
+        if getattr(self, "dbh", None) is not None:
+            self.flush()
 
     def _handle_credentials(self, icd):
         """
@@ -608,7 +662,7 @@ class logsqlhandler(ihandler):
                 "INSERT INTO logins (connection, login_username, login_password) VALUES (?,?,?)",
                 (attack_id, icd.username, icd.password)
             )
-            self.dbh.commit()
+            self._commit()
 
     def handle_incident(self, icd):
         #        print("unknown")
@@ -620,7 +674,7 @@ class logsqlhandler(ihandler):
                                 (time.time(), connection_type, con.transport, con.protocol, con.local.host, con.local.port, con.remote.host, con.remote.hostname, con.remote.port) )
         attackid = self.cursor.lastrowid
         self.attacks[con] = (attackid, attackid)
-        self.dbh.commit()
+        self._commit()
 
         # maybe this was a early connection?
         if con in self.pending:
@@ -634,7 +688,7 @@ class logsqlhandler(ihandler):
                                     (attackid, attackid, i ) )
                 self.cursor.execute("UPDATE connections SET connection_root = ? WHERE connection_root = ?",
                                     (attackid, i ) )
-            self.dbh.commit()
+            self._commit()
 
         return attackid
 
@@ -720,7 +774,7 @@ class logsqlhandler(ihandler):
                         (childid, parentid, parentroot) )
             r = self.cursor.execute("UPDATE connections SET connection_root = ?, connection_parent = ? WHERE connection = ?",
                                     (parentroot, parentid, childid) )
-            self.dbh.commit()
+            self._commit()
 
         if icd.child in self.pending:
             # if the new accepted connection was pending
@@ -734,7 +788,7 @@ class logsqlhandler(ihandler):
 
             self.cursor.execute("UPDATE connections SET connection_root = ? WHERE connection_root = ?",
                                 (parentroot, childid) )
-            self.dbh.commit()
+            self._commit()
 
     def handle_incident_dionaea_connection_free(self, icd):
         con=icd.con
@@ -743,7 +797,7 @@ class logsqlhandler(ihandler):
             del self.attacks[con]
             logger.info("attackid %i is done" % attackid)
         else:
-            logger.warn("no attackid for %s:%s" %
+            logger.debug("no attackid for %s:%s" %
                         (con.local.host, con.local.port) )
         if con in self.pending:
             del self.pending[con]
@@ -757,7 +811,7 @@ class logsqlhandler(ihandler):
         logger.info("emu profile for attackid %i" % attackid)
         self.cursor.execute("INSERT INTO emu_profiles (connection, emu_profile_json) VALUES (?,?)",
                             (attackid, icd.profile) )
-        self.dbh.commit()
+        self._commit()
 
 
     def handle_incident_dionaea_download_offer(self, icd):
@@ -768,7 +822,7 @@ class logsqlhandler(ihandler):
         logger.info("offer for attackid %i" % attackid)
         self.cursor.execute("INSERT INTO offers (connection, offer_url) VALUES (?,?)",
                             (attackid, icd.url) )
-        self.dbh.commit()
+        self._commit()
 
     def handle_incident_dionaea_download_complete_hash(self, icd):
         con=icd.con
@@ -778,7 +832,7 @@ class logsqlhandler(ihandler):
         logger.info("complete for attackid %i" % attackid)
         self.cursor.execute("INSERT INTO downloads (connection, download_url, download_md5_hash) VALUES (?,?,?)",
                             (attackid, icd.url, icd.md5hash) )
-        self.dbh.commit()
+        self._commit()
 
 
     def handle_incident_dionaea_service_shell_listen(self, icd):
@@ -789,7 +843,7 @@ class logsqlhandler(ihandler):
         logger.info("listen shell for attackid %i" % attackid)
         self.cursor.execute("INSERT INTO emu_services (connection, emu_service_url) VALUES (?,?)",
                             (attackid, "bindshell://"+str(icd.port)) )
-        self.dbh.commit()
+        self._commit()
 
     def handle_incident_dionaea_service_shell_connect(self, icd):
         con=icd.con
@@ -799,7 +853,7 @@ class logsqlhandler(ihandler):
         logger.info("connect shell for attackid %i" % attackid)
         self.cursor.execute("INSERT INTO emu_services (connection, emu_service_url) VALUES (?,?)",
                             (attackid, "connectbackshell://"+str(icd.host)+":"+str(icd.port)) )
-        self.dbh.commit()
+        self._commit()
 
     def handle_incident_dionaea_modules_python_p0f(self, icd):
         con=icd.con
@@ -807,7 +861,10 @@ class logsqlhandler(ihandler):
             attackid = self.attacks[con][1]
             self.cursor.execute("INSERT INTO p0fs (connection, p0f_genre, p0f_link, p0f_detail, p0f_uptime, p0f_tos, p0f_dist, p0f_nat, p0f_fw) VALUES (?,?,?,?,?,?,?,?,?)",
                                 ( attackid, icd.genre, icd.link, icd.detail, icd.uptime, icd.tos, icd.dist, icd.nat, icd.fw))
-            self.dbh.commit()
+            self._commit()
+
+    def handle_incident_dionaea_modules_python_smb_login(self, icd):
+        self._handle_credentials(icd)
 
     def handle_incident_dionaea_modules_python_ftp_login(self, icd):
         self._handle_credentials(icd)
@@ -818,7 +875,7 @@ class logsqlhandler(ihandler):
             attackid = self.attacks[con][1]
             self.cursor.execute("INSERT INTO dcerpcrequests (connection, dcerpcrequest_uuid, dcerpcrequest_opnum) VALUES (?,?,?)",
                                 (attackid, icd.uuid, icd.opnum))
-            self.dbh.commit()
+            self._commit()
 
     def handle_incident_dionaea_modules_python_smb_dcerpc_bind(self, icd):
         con=icd.con
@@ -826,7 +883,7 @@ class logsqlhandler(ihandler):
             attackid = self.attacks[con][1]
             self.cursor.execute("INSERT INTO dcerpcbinds (connection, dcerpcbind_uuid, dcerpcbind_transfersyntax) VALUES (?,?,?)",
                                 (attackid, icd.uuid, icd.transfersyntax))
-            self.dbh.commit()
+            self._commit()
 
     def handle_incident_dionaea_modules_python_mssql_login(self, icd):
         con = icd.con
@@ -836,7 +893,7 @@ class logsqlhandler(ihandler):
                                 (attackid, icd.username, icd.password))
             self.cursor.execute("INSERT INTO mssql_fingerprints (connection, mssql_fingerprint_hostname, mssql_fingerprint_appname, mssql_fingerprint_cltintname) VALUES (?,?,?,?)",
                                 (attackid, icd.hostname, icd.appname, icd.cltintname))
-            self.dbh.commit()
+            self._commit()
 
     def handle_incident_dionaea_modules_python_mssql_cmd(self, icd):
         con = icd.con
@@ -844,7 +901,7 @@ class logsqlhandler(ihandler):
             attackid = self.attacks[con][1]
             self.cursor.execute("INSERT INTO mssql_commands (connection, mssql_command_status, mssql_command_cmd) VALUES (?,?,?)",
                                 (attackid, icd.status, icd.cmd))
-            self.dbh.commit()
+            self._commit()
 
     def handle_incident_dionaea_modules_python_virustotal_report(self, icd):
         md5 = icd.md5hash
@@ -856,7 +913,7 @@ class logsqlhandler(ihandler):
             date = j['scan_date']
             self.cursor.execute("INSERT INTO virustotals (virustotal_md5_hash, virustotal_permalink, virustotal_timestamp) VALUES (?,?,strftime('%s',?))",
                                 (md5, permalink, date))
-            self.dbh.commit()
+            self._commit()
 
             virustotal = self.cursor.lastrowid
 
@@ -870,7 +927,7 @@ class logsqlhandler(ihandler):
                 self.cursor.execute("""INSERT INTO virustotalscans (virustotal, virustotalscan_scanner, virustotalscan_result) VALUES (?,?,?)""",
                                     (virustotal, av, res))
 #                logger.debug("scanner {} result {}".format(av,scans[av]))
-            self.dbh.commit()
+            self._commit()
 
     def handle_incident_dionaea_modules_python_mysql_login(self, icd):
         con = icd.con
@@ -878,7 +935,7 @@ class logsqlhandler(ihandler):
             attackid = self.attacks[con][1]
             self.cursor.execute("INSERT INTO logins (connection, login_username, login_password) VALUES (?,?,?)",
                                 (attackid, icd.username, icd.password))
-            self.dbh.commit()
+            self._commit()
 
 
     def handle_incident_dionaea_modules_python_mysql_command(self, icd):
@@ -895,7 +952,7 @@ class logsqlhandler(ihandler):
                     arg = args[i]
                     self.cursor.execute("INSERT INTO mysql_command_args (mysql_command, mysql_command_arg_index, mysql_command_arg_data) VALUES (?,?,?)",
                                         (cmdid, i, arg))
-            self.dbh.commit()
+            self._commit()
 
     def handle_incident_dionaea_modules_python_sip_command(self, icd):
         con = icd.con
@@ -1011,7 +1068,7 @@ class logsqlhandler(ihandler):
         if hasattr(icd,'sdp') and icd.sdp is not None:
             add_sdp(cmdid,icd.sdp)
 
-        self.dbh.commit()
+        self._commit()
 
     def handle_incident_dionaea_modules_python_mqtt_connect(self, icd):
         con = icd.con
@@ -1021,7 +1078,7 @@ class logsqlhandler(ihandler):
             #    (attackid, icd.username, icd.password))
             self.cursor.execute("INSERT INTO mqtt_fingerprints (connection, mqtt_fingerprint_clientid, mqtt_fingerprint_willtopic, mqtt_fingerprint_willmessage,mqtt_fingerprint_username,mqtt_fingerprint_password) VALUES (?,?,?,?,?,?)",
                 (attackid, icd.clientid, icd.willtopic, icd.willmessage, icd.username, icd.password))
-            self.dbh.commit()
+            self._commit()
 
     def handle_incident_dionaea_modules_python_mqtt_publish(self, icd):
         con = icd.con
@@ -1029,7 +1086,7 @@ class logsqlhandler(ihandler):
             attackid = self.attacks[con][1]
             self.cursor.execute("INSERT INTO mqtt_publish_commands (connection, mqtt_publish_command_topic, mqtt_publish_command_message) VALUES (?,?,?)",
                 (attackid, icd.publishtopic, icd.publishmessage))
-            self.dbh.commit()
+            self._commit()
 
     def handle_incident_dionaea_modules_python_mqtt_subscribe(self, icd):
         con = icd.con
@@ -1037,4 +1094,4 @@ class logsqlhandler(ihandler):
             attackid = self.attacks[con][1]
             self.cursor.execute("INSERT INTO mqtt_subscribe_commands (connection, mqtt_subscribe_command_messageid, mqtt_subscribe_command_topic) VALUES (?,?,?)",
                 (attackid, icd.subscribemessageid, icd.subscribetopic))
-            self.dbh.commit()
+            self._commit()

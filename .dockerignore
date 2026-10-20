@@ -3,13 +3,19 @@
 
 Dockerfile
 .dockerignore
-.git
-.cache
-.mypy_cache
-.tox
-.idea
-.github
-.drone.yml
+# dot files and folders: git, caches, CI and editor settings
+.*
 venv/
 doc/venv/
 *.pyc
+tests/functional
+
+build/
+**/build/
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+*.o
+*.so
+__pycache__/
+*.egg-info/

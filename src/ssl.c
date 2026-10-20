@@ -279,8 +279,8 @@ bool mkcert(SSL_CTX *ctx)
 	BIGNUM *bne = NULL;
 	unsigned long e = RSA_F4;
 
-	X509 *x;
-	EVP_PKEY *pk;
+	X509 *x = NULL;
+	EVP_PKEY *pk = NULL;
 	RSA *rsa  = NULL;
 	X509_NAME *name=NULL;
 
@@ -379,6 +379,10 @@ bool mkcert(SSL_CTX *ctx)
 
 	res = true;
 free_all:
+	/* the context holds references of its own to the key and the certificate */
+	X509_free(x);
+	EVP_PKEY_free(pk);
+	RSA_free(rsa);
 	BN_free(bne);
 
 	return res;

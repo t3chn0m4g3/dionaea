@@ -134,7 +134,13 @@ bool connection_node_set_remote(struct connection *con)
 	socklen_t sizeof_sa = sizeof(struct sockaddr_storage);
 	if( getpeername(con->socket, (struct sockaddr *)&con->remote.addr, &sizeof_sa) != 0 )
 	{
-		g_warning("getpeername failed (%s)", strerror(errno));
+		int error = errno;
+		/* ENOTCONN: the client is gone already (a port scan that resets at once), no error of dionaea */
+		if( error == ENOTCONN )
+			g_debug("getpeername failed (%s)", strerror(error));
+		else
+			g_warning("getpeername failed (%s)", strerror(error));
+		errno = error;
 		return false;
 	}
 	return node_info_set(&con->remote, &con->remote.addr);
@@ -377,8 +383,11 @@ bool connection_listen(struct connection *con, int len)
 
 		if( listen(con->socket, len) != 0 )
 		{
+			int listen_errno = errno;
+			/* forgotten as well: a later listen or free must not close the number again */
 			close(con->socket);
-			g_warning("Could not listen %s:%i (%s)", con->local.hostname, ntohs(con->local.port), strerror(errno));
+			con->socket = -1;
+			g_warning("Could not listen %s:%i (%s)", con->local.hostname, ntohs(con->local.port), strerror(listen_errno));
 			return false;
 		}
 		connection_set_nonblocking(con);
@@ -403,8 +412,11 @@ bool connection_listen(struct connection *con, int len)
 
 		if( listen(con->socket, len) != 0 )
 		{
+			int listen_errno = errno;
+			/* forgotten as well: a later listen or free must not close the number again */
 			close(con->socket);
-			g_warning("Could not listen %s:%i (%s)", con->local.hostname, ntohs(con->local.port), strerror(errno));
+			con->socket = -1;
+			g_warning("Could not listen %s:%i (%s)", con->local.hostname, ntohs(con->local.port), strerror(listen_errno));
 			return false;
 		}
 		connection_set_nonblocking(con);
@@ -633,6 +645,8 @@ void connection_close_timeout_cb(EV_P_ struct ev_timer *w, int revents)
 void connection_free(struct connection *con)
 {
 	g_debug("%s con %p",__PRETTY_FUNCTION__, con);
+	/* its stream data is given back now, not once the last reference is gone */
+	processors_stop(con);
 	ev_timer_stop(CL, &con->events.free);
 	if( con->events.free.repeat > 0. )
 	{
@@ -771,6 +785,24 @@ void connection_set_blocking(struct connection *con)
  *
  * @param con    The connection
  */
+/* a connect that fails: info for a download connection (its client logs the failure of
+ * the download, download_log.h), a warning for any other */
+#define CONNECT_FAILED_LEVEL(con) ((con)->download_guard ? G_LOG_LEVEL_INFO : G_LOG_LEVEL_WARNING)
+
+/* Validate the resolved address immediately before opening a download socket.
+ * Without a policy handler the decision remains denied. */
+bool download_destination_allowed(const char *address)
+{
+    struct incident *i = incident_new("dionaea.download.resolve");
+    long int allowed = 0;
+    incident_value_string_set(i, "address", g_string_new(address));
+    incident_value_int_set(i, "allow", 0);
+    incident_report(i);
+    incident_value_int_get(i, "allow", &allowed);
+    incident_free(i);
+    return allowed == 1;
+}
+
 void connection_connect_next_addr(struct connection *con)
 {
 	g_debug("%s con %p", __PRETTY_FUNCTION__, con);
@@ -788,6 +820,17 @@ void connection_connect_next_addr(struct connection *con)
 		{
 			g_debug("could not parse addr");
 			continue;
+		}
+		if (con->download_guard)
+		{
+			if (!download_destination_allowed(addr))
+			{
+				/* the client of the download logs it (ECONFILTERED, download_log.h) */
+				g_debug("download target %s refused by the filter", addr);
+				con->download_refused = true;
+				continue;
+			}
+			con->download_attempted = true;
 		}
 		con->remote.domain = socket_domain;
 		strncpy(con->remote.ip_string, addr, INET_STRLEN);
@@ -850,7 +893,7 @@ void connection_connect_next_addr(struct connection *con)
 					return;
 				} else
 				{
-					g_warning("Could not connect %s:%i (%s)", con->remote.hostname, ntohs(con->remote.port), strerror(errno));
+					g_log(G_LOG_DOMAIN, CONNECT_FAILED_LEVEL(con), "Could not connect %s:%i (%s)", con->remote.hostname, ntohs(con->remote.port), strerror(errno));
 					close(con->socket);
 					con->socket = -1;
 					continue;
@@ -899,7 +942,7 @@ void connection_connect_next_addr(struct connection *con)
 					return;
 				} else
 				{
-					g_warning("Could not connect %s:%i (%s)", con->remote.hostname, ntohs(con->remote.port), strerror(errno));
+					g_log(G_LOG_DOMAIN, CONNECT_FAILED_LEVEL(con), "Could not connect %s:%i (%s)", con->remote.hostname, ntohs(con->remote.port), strerror(errno));
 					close(con->socket);
 					con->socket = -1;
 					continue;
@@ -934,7 +977,7 @@ void connection_connect_next_addr(struct connection *con)
 			{
 				ret = connect(con->socket, (struct sockaddr *)&sa, sizeof_sa);
 				if( ret != 0 )
-					g_warning("Could not connect %s:%i (%s)", con->remote.hostname, ntohs(con->remote.port), strerror(errno));
+					g_log(G_LOG_DOMAIN, CONNECT_FAILED_LEVEL(con), "Could not connect %s:%i (%s)", con->remote.hostname, ntohs(con->remote.port), strerror(errno));
 			}
 			connection_node_set_local(con);
 //			connection_node_set_remote(con);
@@ -983,7 +1026,10 @@ void connection_connect_next_addr(struct connection *con)
 
 	if( addr == NULL )
 	{
-		if( con->protocol.error(con, ECONUNREACH) == false )
+		enum connection_error error = ECONUNREACH;
+		if( con->download_guard && con->download_refused && !con->download_attempted )
+			error = ECONFILTERED;
+		if( con->protocol.error(con, error) == false )
 			connection_close(con);
 		else
 			connection_reconnect(con);
@@ -1185,6 +1231,72 @@ void connection_stop(struct connection *con)
 
 	if( ev_is_active(&con->events.reconnect_timeout) )
 		ev_timer_stop(CL,  &con->events.reconnect_timeout);
+
+	if( ev_is_active(&con->events.accept_retry_timeout) )
+		ev_timer_stop(CL,  &con->events.accept_retry_timeout);
+}
+
+/**
+ * accept() errors that concern only the one pending connection: the
+ * connection is gone from the backlog, so accept() can be called again
+ * right away (see accept(2), "Error handling"). EOPNOTSUPP is not one of
+ * them: accept(2) also returns it for a socket that cannot accept at all.
+ * The callers retry at most CONNECTION_ACCEPT_TRANSIENT_MAX times in a row.
+ */
+bool connection_accept_error_is_transient(int error)
+{
+	switch( error )
+	{
+	case EINTR:
+	case ECONNABORTED:
+	case EPROTO:
+	case ENETDOWN:
+	case ENOPROTOOPT:
+	case EHOSTDOWN:
+#ifdef ENONET
+	case ENONET:
+#endif
+	case EHOSTUNREACH:
+	case ENETUNREACH:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/**
+ * accept() failed for a reason that does not go away by itself (EMFILE,
+ * ENFILE, ENOBUFS, ENOMEM, ...). The connection stays in the backlog and
+ * the listening socket stays readable, so accepting again at once would
+ * spin. Stop the listen watcher and start it again after
+ * CONNECTION_ACCEPT_RETRY_INTERVAL seconds.
+ */
+void connection_accept_backoff(struct connection *con, int error)
+{
+	// the listening connection was closed (and is freed soon), no retry
+	if( con->socket == -1 )
+		return;
+
+	g_warning("accept() failed on %s (%s), listening again in %.0fs",
+			  con->local.node_string, strerror(error), CONNECTION_ACCEPT_RETRY_INTERVAL);
+
+	if( ev_is_active(&con->events.io_in) )
+		ev_io_stop(CL, &con->events.io_in);
+
+	if( !ev_is_active(&con->events.accept_retry_timeout) )
+	{
+		ev_timer_init(&con->events.accept_retry_timeout, connection_accept_retry_timeout_cb, CONNECTION_ACCEPT_RETRY_INTERVAL, 0.);
+		ev_timer_start(CL, &con->events.accept_retry_timeout);
+	}
+}
+
+void connection_accept_retry_timeout_cb(EV_P_ struct ev_timer *w, int revents)
+{
+	struct connection *con = CONOFF_ACCEPT_RETRY_TIMEOUT(w);
+	g_debug("%s con %p", __PRETTY_FUNCTION__, con);
+
+	if( con->socket != -1 && !ev_is_active(&con->events.io_in) )
+		ev_io_start(EV_A_ &con->events.io_in);
 }
 
 /**
@@ -2212,12 +2324,14 @@ const char *connection_strerror(enum connection_error error)
 {
 	static const char *myerrormsgs[] =
 	{
-		"timeout resolving the domain" , /* ECONDNSTIMEOUT   */
-		"could not connect host(s)" ,/* ECONUNREACH       */
-		"could not resolve domain" , /* ECONNOSUCHDOMAIN */
-		"too many connections" , /* ECONMANY */
+		[ECONDNSTIMEOUT]   = "timeout resolving the domain",
+		[ECONUNREACH]      = "could not connect host(s)",
+		[ECONNOSUCHDOMAIN] = "could not resolve domain",
+		[ECONMANY]         = "too many connections",
+		[ECONFILTERED]     = "download target refused by the filter",
 	};
-	if( error >= ECONMANY )
+	/* the last value of enum connection_error */
+	if( (int)error < 0 || error > ECONFILTERED )
 		return NULL;
 
 	return myerrormsgs[error];

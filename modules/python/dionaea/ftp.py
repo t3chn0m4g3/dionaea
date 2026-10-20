@@ -65,13 +65,23 @@
 from dionaea import ServiceLoader
 from dionaea.core import connection, ihandler, g_dionaea, incident
 from dionaea.exception import ServiceConfigError
+from dionaea.logtext import log_text
+import errno
+import inspect
 import logging
 import os
 from os import stat
 from stat import *
 import time
-import io
 
+from dionaea.upload import (
+    DEFAULT_MAX_UPLOAD_SIZE,
+    UploadError,
+    UploadFile,
+    UploadTooLarge,
+    parse_max_upload_size,
+    upload_url,
+)
 
 logger = logging.getLogger('ftp')
 logger.setLevel(logging.DEBUG)
@@ -119,11 +129,14 @@ RESPONSE = {
     # -- 400's --
     "cant_open_data_cnx":                 "425 Can't open data connection.",
     "cnx_closed_txfr_aborted":            '426 Transfer aborted.  Data connection closed.',
+    "local_error":                        '451 Requested action aborted. Local error in processing.',
+    "insufficient_storage":               '452 Requested action not taken. Insufficient storage space in system.',
 
     # -- 500's --
     "syntax_error_pass_requires_arg":     "500 Syntax error: PASS requires an argument",
     "syntax_error_user_requires_arg":     "500 Syntax error: USER requires an argument",
     "syntax_err_in_args":                 '501 syntax error in argument(s) {command}.',
+    "illegal_port_cmd":                   "500 Illegal PORT command.",
     "cmd_not_implmntd":                   "502 Command '{command}' not implemented",
     "bad_cmd_seq_pass_after_user":        "503 Incorrect sequence of commands: PASS required after USER",
     "cmd_not_implmntd_for_param":         "504 Not implemented for parameter '{param}'.",
@@ -131,7 +144,19 @@ RESPONSE = {
     "auth_failure":                       '530 Sorry, Authentication failed.',
     "file_not_found":                     '550 {filename}: No such file or directory.',
     "permission_denied":                  '550 {path}: Permission denied.',
+    "exceeded_storage_allocation":        '552 Exceeded storage allocation (file too large).',
 }
+
+
+# errors of the sockets of PASV / PORT (no fds, no ports, no buffers), not of the filesystem:
+# the safety net of processcmd answers them with 425 instead of 550
+SOCKET_ERRNOS = frozenset((
+    errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM, errno.EADDRINUSE, errno.EADDRNOTAVAIL,
+))
+
+
+# a full disk (or quota): 452, not 425 (STOR) or 550 (the safety net)
+STORAGE_ERRNOS = frozenset((errno.ENOSPC, errno.EDQUOT))
 
 
 class FTPService(ServiceLoader):
@@ -159,6 +184,7 @@ class FTPd(connection):
     protocol_name = "ftpd"
     shared_config_values = (
         "basedir",
+        "max_upload_size",
         "response_msgs"
     )
 
@@ -172,6 +198,7 @@ class FTPd(connection):
         self.dtp = None
         self.dtf = None
         self.limits = {}  # { '_out' : 8192 }
+        self.max_upload_size = DEFAULT_MAX_UPLOAD_SIZE
         # Copy default response messages
         self.response_msgs = dict(RESPONSE.items())
 
@@ -183,6 +210,8 @@ class FTPd(connection):
             raise ServiceConfigError("The basedir '%s' is not a directory", self.basedir)
         if not os.access(self.basedir, os.R_OK):
             raise ServiceConfigError("Unable to read files in the '%s' directory", self.basedir)
+
+        self.max_upload_size = parse_max_upload_size(config.get("max_upload_size"))
 
         self.response_msgs.update(config.get("response_messages", {}))
 
@@ -199,6 +228,7 @@ class FTPd(connection):
     def handle_origin(self, parent):
         logger.debug("setting basedir to %s" % parent.basedir)
         self.basedir = parent.basedir
+        self.max_upload_size = parent.max_upload_size
 
     def handle_established(self):
         self.processors()
@@ -208,7 +238,7 @@ class FTPd(connection):
         # try:
         #     data = data.decode()
         # except UnicodeDecodeError:
-        #     logger.warn("error decoding")
+        #     logger.warning("error decoding")
         #     logger.debug("io_in" + data)
 
         logger.debug(data)
@@ -232,13 +262,21 @@ class FTPd(connection):
             else:
                 cmd = line
                 args = ()
-            logger.warn("cmd '%s'" % cmd)
             self.processcmd(cmd, args)
         return lastsep
 
+    def _call(self, cmd, method, args):
+        """Call the handler of a command, answer 501 if the arguments do not fit it."""
+        try:
+            inspect.signature(method).bind(*args)
+        except TypeError:
+            self.reply("syntax_err_in_args", command=cmd.decode(errors="replace"))
+            return None
+        return method(*args)
+
     def processcmd(self, cmd, args):
         logger.debug("cmd '%s'" % cmd)
-        l = [i.decode() for i in args]
+        l = [i.decode(errors="replace") for i in args]
 
         i = incident("dionaea.modules.python.ftp.command")
         i.con = self
@@ -251,21 +289,38 @@ class FTPd(connection):
             if cmd != b'USER':
                 self.reply("not_logged_in")
                 return
-            self.ftp_USER(*l)
+            self._call(cmd, self.ftp_USER, l)
         elif self.state == self.INAUTH:
             if cmd != b'PASS':
                 self.reply("bad_cmd_seq_pass_after_user")
                 return
-            self.ftp_PASS(*l)
+            self._call(cmd, self.ftp_PASS, l)
         else:
-            method = getattr(self, "ftp_" + cmd.decode(), None)
+            method = getattr(self, "ftp_" + cmd.decode(errors="replace"), None)
             if method is not None:
-                msg = method(*l)
+                try:
+                    msg = self._call(cmd, method, l)
+                except OSError as e:
+                    if e.errno in STORAGE_ERRNOS:
+                        # a full disk or quota: a warning, so it is in dionaea-errors.log
+                        logger.warning("%s %s failed: %s", cmd.decode(errors="replace"),
+                                       log_text(" ".join(str(a) for a in l)), log_text(e))
+                        self.reply("insufficient_storage")
+                        return
+                    if e.errno in SOCKET_ERRNOS:
+                        # no socket for the data connection (EMFILE in the bind of PASV, ...): unexpected
+                        logger.warning("%s failed: %s", cmd.decode(errors="replace"), e, exc_info=True)
+                        self.reply("cant_open_data_cnx")
+                        return
+                    # e.g. a root that is read-only (T-Pot mounts it :ro): answer, do not drop the session
+                    logger.info("%s %s failed: %s", cmd.decode(errors="replace"), l, e)
+                    self.reply("permission_denied", path=l[0] if l else "")
+                    return
                 if isinstance(msg, str):
                     self.error("Returning messages is deprecated please report so we can fix it")
                     self.sendline(msg)
             else:
-                self.reply("cmd_not_implmntd", command=cmd.decode())
+                self.reply("cmd_not_implmntd", command=cmd.decode(errors="replace"))
 
     def ftp_USER(self, username):
         if not username:
@@ -312,14 +367,27 @@ class FTPd(connection):
         if self.dtp:
             self.dtp.close()
             self.dtp = None
-        addr = list(map(int, address.split(',')))
+        try:
+            addr = list(map(int, address.split(',')))
+            if len(addr) != 6 or any(not 0 <= n <= 255 for n in addr):
+                raise ValueError("PORT needs h1,h2,h3,h4,p1,p2")
+        except ValueError:
+            self.reply("syntax_err_in_args", command="PORT")
+            return None
         ip = '%d.%d.%d.%d' % tuple(addr[:4])
         port = addr[4] << 8 | addr[5]
         logger.debug("PORT cmd for port %i" % port)
-        if self.remote.host != ip and "::ffff:" + self.remote.host != ip:
-            logger.warn("Potential FTP Bounce Scan detected")
+        # a dual-stack socket sees an IPv4 client as ::ffff:a.b.c.d
+        if self.remote.host != ip and self.remote.host != "::ffff:" + ip:
+            # the client chooses it (and a client over IPv6 always hits it): info, not a warning
+            logger.info("Potential FTP Bounce Scan detected")
+            # a server answers it (the client would wait), the session goes on
+            self.reply("illegal_port_cmd")
             return None
-        self.dtp = FTPDataConnect(ip, port, self)
+        dtp = FTPDataConnect(ip, port, self)
+        # an error inside connect (no socket) has answered 425, the core frees it
+        if not dtp.error_replied:
+            self.dtp = dtp
         return None
 
     def ftp_PASV(self):
@@ -329,7 +397,18 @@ class FTPd(connection):
         if self.dtp:
             self.dtp.close()
             self.dtp = None
-        self.dtf = FTPDataListen(host=self.local.host, port=0, ctrl=self)
+        dtf = FTPDataListen(host=self.local.host, port=0, ctrl=self)
+        if not dtf.bound:
+            # no socket (socket() failed: the core called handle_error, which answered 425, and
+            # frees the connection) or bind / listen failed without an error callback
+            if not dtf.error_replied:
+                self.reply("cant_open_data_cnx")
+                try:
+                    dtf.close()
+                except ReferenceError:
+                    pass
+            return
+        self.dtf = dtf
         host = self.dtf.local.host
         port = self.dtf.local.port
         self.reply("entering_pasv_mode", host=encodeHostPort(host, port))
@@ -366,7 +445,7 @@ class FTPd(connection):
                     self.reply("file_status_ok_open_data_cnx")
                     self.dtp.send_file(name)
                 else:
-                    logger.warn(
+                    logger.info(
                         "dtp state %s %s:%i <-> %s:%i!",
                         self.dtp.status,
                         self.dtp.remote.host,
@@ -375,13 +454,14 @@ class FTPd(connection):
                         self.dtp.local.port
                     )
             else:
-                logger.warn(
+                logger.info(
                     "no dtp on %s:%i <-> %s:%i!",
-                    self.dtp.remote.host,
-                    self.dtp.remote.port,
-                    self.dtp.local.host,
-                    self.dtp.local.port
+                    self.remote.host,
+                    self.remote.port,
+                    self.local.host,
+                    self.local.port
                 )
+                self.reply("cant_open_data_cnx")
         else:
             self.reply("file_not_found", filename=p)
 
@@ -402,9 +482,11 @@ class FTPd(connection):
         if self.dtp:
             if self.dtp.status == 'established':
                 self.reply("file_status_ok_open_data_cnx")
-                self.dtp.recv_file(file)
+                # The data is kept as a download, not in the root of the service; the name the
+                # client used goes into the url of the upload.
+                self.dtp.recv_file(p, self.max_upload_size)
             else:
-                logger.warn(
+                logger.info(
                     "dtp state %s %s:%i <-> %s:%i!",
                     self.dtp.status,
                     self.dtp.remote.host,
@@ -413,13 +495,14 @@ class FTPd(connection):
                     self.dtp.local.port
                 )
         else:
-            logger.warn(
+            logger.info(
                 "no dtp on %s:%i <-> %s:%i!",
-                self.dtp.remote.host,
-                self.dtp.remote.port,
-                self.dtp.local.host,
-                self.dtp.local.port
+                self.remote.host,
+                self.remote.port,
+                self.local.host,
+                self.local.port
             )
+            self.reply("cant_open_data_cnx")
 
     def ftp_TYPE(self, t):
         if t == 'I':
@@ -442,7 +525,7 @@ class FTPd(connection):
                     self.reply("file_status_ok_open_data_cnx")
                     self.dtp.send_list(name, len(name)+1)
                 else:
-                    logger.warn(
+                    logger.info(
                         "dtp state %s %s:%i <-> %s:%i!",
                         self.dtp.status,
                         self.dtp.remote.host,
@@ -451,13 +534,14 @@ class FTPd(connection):
                         self.dtp.local.port
                     )
             else:
-                logger.warn(
+                logger.info(
                     "no dtp on %s:%i <-> %s:%i!",
-                    self.dtp.remote.host,
-                    self.dtp.remote.port,
-                    self.dtp.local.host,
-                    self.dtp.local.port
+                    self.remote.host,
+                    self.remote.port,
+                    self.local.host,
+                    self.local.port
                 )
+                self.reply("cant_open_data_cnx")
         else:
             self.reply("permission_denied", path=p)
 
@@ -534,7 +618,12 @@ class FTPd(connection):
             return
 
         if os.path.exists(dir) and os.path.isdir(dir):
-            os.rmdir(dir)
+            try:
+                os.rmdir(dir)
+            except OSError as e:
+                logger.info("RMD %s failed: %s", p, e)
+                self.reply("permission_denied", path=p)
+                return
             self.reply("req_file_actn_completed_ok")
             return
 
@@ -554,7 +643,12 @@ class FTPd(connection):
             self.reply("permission_denied", path=p)
             return
 
-        os.mkdir(dir)
+        try:
+            os.mkdir(dir)
+        except OSError as e:
+            logger.info("MKD %s failed: %s", p, e)
+            self.reply("permission_denied", path=p)
+            return
         self.reply("req_file_actn_completed_ok")
 
     def handle_error(self, err):
@@ -581,10 +675,22 @@ class FTPDataCon(connection):
         self.ctrl = ctrl
         self.mode = None
         self.file = None
+        self.upload = None
+        self.upload_name = ""
+        # handle_error answered the control connection (425)
+        self.error_replied = False
 
     def handle_error(self, err):
-        if self.ctrl:
-            self.ctrl.reply("cant_open_data_cnx")
+        self.error_replied = True
+
+        def failed(ctrl):
+            # the core frees this connection: the session must not use it any more
+            if ctrl.dtp is self:
+                ctrl.dtp = None
+            if ctrl.dtf is self:
+                ctrl.dtf = None
+            ctrl.reply("cant_open_data_cnx")
+        self._ctrl_call(failed)
 
     def send_list(self, p, rm):
         def ls(f, r):
@@ -632,11 +738,16 @@ class FTPDataCon(connection):
                 'name': name
             }
 
+        self._drop_upload()
         self.mode = 'list'
-        if os.path.isdir(p):
-            self.data = [ls(os.path.join(p,f), rm) for f in os.listdir(p)]
-        elif os.path.isfile(p):
-            self.data = [ls(p)]
+        try:
+            if os.path.isdir(p):
+                self.data = [ls(os.path.join(p,f), rm) for f in os.listdir(p)]
+            elif os.path.isfile(p):
+                self.data = [ls(p)]
+        except OSError as e:
+            self._transfer_failed("LIST", p, e)
+            return
 
         logger.debug("p %s len %i" % (p, len(self.data)) )
         if len(self.data) > 0:
@@ -645,24 +756,99 @@ class FTPDataCon(connection):
             self.send(self.data[self.off-1] + '\r\n')
         else:
             self.close()
-            if self.ctrl:
-                self.ctrl.dtp = None
-                self.ctrl.reply("txfr_complete_ok")
+            self._ctrl_call(self._transfer_done)
 
-    def recv_file(self, p):
-        logger.debug(p)
+    def recv_file(self, name, max_size=DEFAULT_MAX_UPLOAD_SIZE):
+        """
+        Take the data of the connection as an upload.
+
+        :param name: File name as the client sent it, goes into the url of the upload
+        :param max_size: Maximum size of the file, a larger upload is dropped
+        """
+        logger.debug("upload %s", name)
+        # a second STOR on this connection: what the first one got is not kept
+        self._drop_upload()
+        self.upload_name = name
+        try:
+            self.upload = UploadFile("ftp-", max_size=max_size)
+        except OSError as e:
+            logger.error("unable to create a file for the upload: %s", e)
+            self.mode = None
+            answer = "insufficient_storage" if e.errno in STORAGE_ERRNOS else "cant_open_data_cnx"
+            self._ctrl_call(lambda ctrl: ctrl.reply(answer))
+            self.close()
+            return
         self.mode = 'recv_file'
-        self.file = io.open(p, 'wb+')
-        print(self.file)
 
     def send_file(self, p):
+        self._drop_upload()
         self.mode = "file"
-        self.file = open(p, "rb")
+        try:
+            self.file = open(p, "rb")
+        except OSError as e:
+            self._transfer_failed("RETR", p, e)
+            return
         self.handle_io_out()
+
+    def _transfer_failed(self, command, path, error):
+        """The file or folder of a transfer can not be read: 550 on the control connection, close the data connection."""
+        logger.info("%s %s failed: %s", command, path, error)
+        self.mode = None
+        self.data = []
+        self.close()
+
+        def answer(ctrl):
+            ctrl.dtp = None
+            base = ctrl.basedir
+            shown = path[len(base):] if path.startswith(base) else path
+            ctrl.reply("permission_denied", path=shown or "/")
+        self._ctrl_call(answer)
+
+    def _read_failed(self, error):
+        """The file of a RETR can not be read on: close the data connection, 451 on the control connection."""
+        logger.info("RETR read failed: %s", error)
+        self.mode = None
+        fileobj, self.file = self.file, None
+        if fileobj is not None:
+            try:
+                fileobj.close()
+            except OSError:
+                pass
+        self.close()
+
+        def answer(ctrl):
+            ctrl.dtp = None
+            ctrl.reply("local_error")
+        self._ctrl_call(answer)
+
+    @staticmethod
+    def _transfer_done(ctrl):
+        ctrl.dtp = None
+        ctrl.reply("txfr_complete_ok")
 
     def handle_io_in(self, data):
         if self.mode == "recv_file":
-            self.file.write(data)
+            try:
+                self.upload.write(data)
+            except UploadError as e:
+                # too large or not writable: drop the upload and the connection
+                logger.warning("upload dropped: %s", e)
+                self.upload.discard()
+                self.upload = None
+                self.mode = None
+                if isinstance(e, UploadTooLarge):
+                    answer = "exceeded_storage_allocation"
+                elif e.errno in STORAGE_ERRNOS:
+                    answer = "insufficient_storage"
+                else:
+                    answer = "cant_open_data_cnx"
+
+                def drop(ctrl):
+                    ctrl.dtp = None
+                    ctrl.reply(answer)
+                # the control connection can be gone already
+                self._ctrl_call(drop)
+                self.close()
             return len(data)
 
     def handle_io_out(self):
@@ -673,33 +859,73 @@ class FTPDataCon(connection):
                 self.send(self.data[self.off - 1] + '\r\n')
             else:
                 self.close()
-                if self.ctrl:
-                    self.ctrl.dtp = None
-                    self.ctrl.reply("txfr_complete_ok")
+                self._ctrl_call(self._transfer_done)
 
         elif self.mode == "file":
-            w = self.file.read(1024)
+            try:
+                w = self.file.read(1024)
+            except OSError as e:
+                # e.g. EIO: no Traceback in the event loop, the client gets an answer
+                self._read_failed(e)
+                return
             self.send(w)
             if len(w) < 1024 and self.mode is not None:
                 self.mode = None
                 self.close()
                 self.file.close()
-                if self.ctrl:
-                    self.ctrl.dtp = None
-                    self.ctrl.reply("txfr_complete_ok")
+                self._ctrl_call(self._transfer_done)
+
+    def _drop_upload(self):
+        """Remove the file of an upload that is not finished (a new command came, the connection is gone)."""
+        upload, self.upload = self.upload, None
+        if upload is not None:
+            upload.discard()
 
     def handle_disconnect(self):
-        if self.ctrl:
-            if self.ctrl.dtf:
-                self.ctrl.dtf = None
-            if self.ctrl.dtp:
-                self.ctrl.dtp = None
-            if self.mode == 'file' and self.file:
-                self.file.close()
-            if self.mode == 'recv_file' and self.file:
-                self.file.close()
-                self.ctrl.reply("txfr_complete_ok")
+        upload, self.upload = self.upload, None
+        try:
+            if self.mode == 'recv_file' and upload:
+                # the client closed the data connection: the upload is complete
+                self.mode = None
+                con, host = self._upload_target()
+                upload.complete(con, upload_url("ftp", host, self.upload_name))
+                upload = None
+                self._ctrl_call(lambda ctrl: ctrl.reply("txfr_complete_ok"))
+        except Exception:
+            logger.exception("unable to record an upload")
+        finally:
+            # whatever happened (other mode, no control connection, an error): no file is left behind
+            if upload is not None:
+                upload.discard()
+        if self.mode == 'file' and self.file:
+            self.file.close()
+
+        def forget(ctrl):
+            if ctrl.dtf:
+                ctrl.dtf = None
+            if ctrl.dtp:
+                ctrl.dtp = None
+        self._ctrl_call(forget)
         return 0
+
+    def _ctrl_call(self, func):
+        """Call func(control connection) if there is one; the control connection can be freed already."""
+        if not self.ctrl:
+            return
+        try:
+            func(self.ctrl)
+        except ReferenceError:
+            logger.debug("control connection is gone")
+
+    def _upload_target(self):
+        """Connection an upload is logged for (the control connection: login, commands; else this one) and the address of the client."""
+        try:
+            ctrl = self.ctrl
+            if ctrl:
+                return ctrl, ctrl.remote.host
+        except ReferenceError:
+            pass
+        return self, self.remote.host
 
     def handle_origin(self, parent):
         pass
@@ -710,13 +936,13 @@ class FTPDataCon(connection):
 class FTPDataConnect(FTPDataCon):
     protocol_name = "ftpdataconnect"
 
-    def __init__(self, host, port, ctrl):
+    def __init__(self, host=None, port=None, ctrl=None):
         FTPDataCon.__init__(self, ctrl)
         self.connect(host, port)
 
     def handle_established(self):
         logger.debug("DATA connection established")
-        self.ctrl.reply("entering_port_mode")
+        self._ctrl_call(lambda ctrl: ctrl.reply("entering_port_mode"))
 
 
 class FTPDataListen(FTPDataCon):
@@ -724,9 +950,14 @@ class FTPDataListen(FTPDataCon):
 
     def __init__(self, host=None, port=None, ctrl=None):
         FTPDataCon.__init__(self, ctrl)
+        # False: no listening socket. For TCP bind only takes the address, listen makes the socket:
+        # when socket() fails (EMFILE, ...) the core calls handle_error and frees the connection,
+        # when listen() fails the socket is closed without an error callback
+        self.bound = False
         if host is not None:
-            self.bind(host, port)
-            self.listen(1)
+            self.bound = bool(self.bind(host, port)) and bool(self.listen(1))
+            if not self.bound:
+                return
             if ctrl.limits:
                 self._out.throttle = ctrl.limits['_out']
 

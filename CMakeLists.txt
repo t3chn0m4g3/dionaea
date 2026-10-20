@@ -20,11 +20,11 @@ if(${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_BINARY_DIR})
     endif()
 endif()
 
-cmake_minimum_required(VERSION 3.4 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.13...3.31 FATAL_ERROR)
 
 project(
     dionaea
-    VERSION 0.11.0
+    VERSION 0.12.0
     LANGUAGES C
 )
 
@@ -58,6 +58,8 @@ endif()
 option(VERBOSE "Enable verbose output?" OFF)
 option(WITH_MODULE_CURL "Build the curl module" ON)
 option(WITH_MODULE_EMU "Build the emu module" ON)
+option(DIONAEA_BUNDLED_LIBEMU "Build the libemu in third_party/libemu and link it into the emu module (OFF: use the system libemu found by pkg-config)" ON)
+option(DIONAEA_BUILD_TESTS "Build the unit tests (run them with ctest)" OFF)
 #option(WITH_MODULE_NC "Build the nc module" OFF)
 option(WITH_MODULE_NFQ "Build the nfq module" ON)
 option(WITH_MODULE_NL "Build the nl module" OFF)
@@ -81,10 +83,14 @@ message(STATUS "After GNUInstallDirs: CMAKE_INSTALL_FULL_LOCALSTATEDIR = ${CMAKE
 # for example the default when prefix is set to /opt/dionaea, the configuration
 # is expected in /opt/dionaea/etc and not in /etc/opt/dionaea, same for the state dirs
 # expected to be in /opt/dionaea/var/lib and not in /var/opt/dionaea/lib
+# Newer CMake versions set the CMAKE_INSTALL_FULL_* variables as normal
+# variables in GNUInstallDirs, which hide cache entries of the same name. So
+# set normal variables here. Packagers can still change the locations with the
+# DIONAEA_* cache variables below.
 if(CMAKE_INSTALL_PREFIX STREQUAL "/opt/dionaea")
-    set(CMAKE_INSTALL_FULL_SYSCONFDIR "${CMAKE_INSTALL_PREFIX}/etc" CACHE PATH "Configuration")
-    set(CMAKE_INSTALL_FULL_LOCALSTATEDIR "${CMAKE_INSTALL_PREFIX}/var" CACHE PATH "Modifiable single-machine data (var)" FORCE)
-    set(CMAKE_INSTALL_FULL_RUNSTATEDIR "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/run" CACHE PATH "Run-time variable data (LOCALSTATEDIR/run)")
+    set(CMAKE_INSTALL_FULL_SYSCONFDIR "${CMAKE_INSTALL_PREFIX}/etc")
+    set(CMAKE_INSTALL_FULL_LOCALSTATEDIR "${CMAKE_INSTALL_PREFIX}/var")
+    set(CMAKE_INSTALL_FULL_RUNSTATEDIR "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/run")
 endif()
 
 include(InstallConfig)
@@ -95,13 +101,17 @@ set(DIONAEA_VERSION ${PROJECT_VERSION})
 if(NOT RELEASE_BUILD AND EXISTS ${PROJECT_SOURCE_DIR}/.git)
     find_package(Git)
     if(GIT_FOUND)
-        exec_program(
-            ${GIT_EXECUTABLE}
-            ${PROJECT_SOURCE_DIR}
-            ARGS "describe --tag --dirty=-dev"
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} describe --tag --dirty=-dev
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
             OUTPUT_VARIABLE DIONAEA_VERSION
-            RETURN_VALUE TAG_RESULT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE TAG_RESULT
         )
+        if(NOT TAG_RESULT EQUAL 0)
+            message(STATUS "Git revision could not be determined")
+            set(DIONAEA_VERSION ${PROJECT_VERSION})
+        endif()
     else()
         message(STATUS "Git revision could not be determined")
         set(DIONAEA_REVISION "${PROJECT_VERSION}-dev-build")
@@ -123,14 +133,22 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(GLIB2 REQUIRED glib-2.0>=2.30)
 pkg_check_modules(GMODULE2 REQUIRED gmodule-2.0>=2.30)
 
-pkg_check_modules(LIBEMU libemu)
+if(WITH_MODULE_EMU)
+    if(DIONAEA_BUNDLED_LIBEMU)
+        # Static library with -fPIC, linked into the emu module: the image
+        # needs no libemu package. The include directory comes with the target.
+        add_subdirectory(third_party/libemu EXCLUDE_FROM_ALL)
+        set(LIBEMU_FOUND TRUE)
+        set(LIBEMU_LIBRARIES emu)
+    else()
+        pkg_check_modules(LIBEMU libemu)
+    endif()
+endif()
 pkg_check_modules(NFQUEUE libnetfilter_queue)
 pkg_check_modules(LIBNL3 libnl-3.0)
 pkg_check_modules(LIBNL3_ROUTE libnl-route-3.0)
 
-set(Python_ADDITIONAL_VERSIONS 3.4 3.5 3.6 3.7 3.8)
-find_package(PythonInterp REQUIRED)
-find_package(PythonLibs ${PYTHON_VERSION_STRING} REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Embed)
 find_package(OpenSSL REQUIRED)
 
 find_package(UDNS REQUIRED)
@@ -151,6 +169,14 @@ include_directories(${CMAKE_BINARY_DIR})
 
 add_subdirectory(modules)
 add_subdirectory(src)
+
+if(DIONAEA_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests/processor)
+    if(WITH_MODULE_EMU AND DIONAEA_BUNDLED_LIBEMU)
+        add_subdirectory(tests/libemu)
+    endif()
+endif()
 
 ########### install files ###############
 

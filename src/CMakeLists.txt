@@ -17,6 +17,8 @@ target_sources(
     connection_tls.c
     connection_udp.c
     dns.c
+    download_log.c
+    log_text.c
     incident.c
     log.c
     modules.c
@@ -25,6 +27,7 @@ target_sources(
     processor.c
     refcount.c
     signals.c
+    streamcap.c
     ssl.c
     threads.c
     util.c

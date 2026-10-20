@@ -159,6 +159,28 @@ bool connection_tls_mkcert(struct connection *con)
 	return mkcert(con->transport.tls.ctx);
 }
 
+/*
+ * Stop the watcher w while the connection is throttled and start it again
+ * with park_timer when the throttle timer that connection_throttle() armed
+ * (throttle_timer) would run out.
+ */
+static void connection_tls_throttle_park(struct connection *con, struct ev_io *w,
+		struct ev_timer *throttle_timer, struct ev_timer *park_timer,
+		void (*park_cb)(struct ev_loop *, struct ev_timer *, int))
+{
+	if( ev_is_active(w) )
+		ev_io_stop(CL, w);
+
+	if( ev_is_active(park_timer) )
+		return;
+
+	ev_tstamp after = 0.2;
+	if( ev_is_active(throttle_timer) )
+		after = ev_timer_remaining(CL, throttle_timer);
+	ev_timer_init(park_timer, park_cb, after, 0.);
+	ev_timer_start(CL, park_timer);
+}
+
 void connection_tls_io_out_cb(EV_P_ struct ev_io *w, int revents)
 {
 	struct connection *con = NULL;
@@ -184,7 +206,17 @@ void connection_tls_io_out_cb(EV_P_ struct ev_io *w, int revents)
 		con->transport.tls.io_out_again_size = MIN((int)con->transport.tls.io_out_again->len, send_throttle);
 
 	if( con->transport.tls.io_out_again_size <= 0 )
+	{
+		/*
+		 * Throttled: connection_throttle() stopped io_out and restarts it
+		 * later. After SSL_ERROR_WANT_READ this callback runs on the io_in
+		 * watcher, which would stay active on a readable socket and spin:
+		 * park it until the throttle is over as well.
+		 */
+		if( send_throttle == 0 && w == &con->events.io_in )
+			connection_tls_throttle_park(con, w, &con->events.throttle_io_out_timeout, &con->events.throttle_io_in_timeout, connection_throttle_io_in_timeout_cb);
 		return;
+	}
 
 	g_debug("send_throttle %i con->transport.tcp.io_out_again->len %i con->transport.ssl.io_out_again_size %i todo %i",
 			send_throttle, (int)con->transport.tls.io_out_again->len, con->transport.tls.io_out_again_size,
@@ -240,13 +272,24 @@ void connection_tls_io_out_cb(EV_P_ struct ev_io *w, int revents)
 			break;
 
 		case SSL_ERROR_SYSCALL:
-			g_debug("SSL_ERROR_SYSCALL %s:%i", __FILE__,  __LINE__);
-			connection_tls_disconnect(con);
-			break;
-
 		case SSL_ERROR_SSL:
-			g_debug("SSL_ERROR_SSL %s:%i", __FILE__,  __LINE__);
-			connection_tls_disconnect(con);
+			g_debug("%s %s:%i", action == SSL_ERROR_SSL ? "SSL_ERROR_SSL" : "SSL_ERROR_SYSCALL", __FILE__,  __LINE__);
+			if( revents != 0 )
+				connection_tls_disconnect(con);
+			else
+			{
+				/*
+				 * Called by connection_send() (revents 0), i.e. from inside a
+				 * callback of the protocol, which goes on using the connection
+				 * after the send, so it is not closed here: the watcher reports
+				 * the error from the event loop, as the TCP transport does.
+				 */
+				if( !ev_is_active(&con->events.io_out) )
+				{
+					ev_io_init(&con->events.io_out, connection_tls_io_out_cb, con->socket, EV_WRITE);
+					ev_io_start(CL, &con->events.io_out);
+				}
+			}
 			break;
 
 		case SSL_ERROR_NONE:
@@ -479,6 +522,14 @@ void connection_tls_io_in_cb(EV_P_ struct ev_io *w, int revents)
 	if( recv_throttle == 0 )
 	{
 		g_debug("recv throttle %i", recv_throttle);
+		/*
+		 * connection_throttle() stopped io_in and restarts it later. After
+		 * SSL_ERROR_WANT_WRITE this callback runs on the io_out watcher,
+		 * which would stay active on a writable socket and spin: park it
+		 * until the throttle is over as well.
+		 */
+		if( w == &con->events.io_out )
+			connection_tls_throttle_park(con, w, &con->events.throttle_io_in_timeout, &con->events.throttle_io_out_timeout, connection_throttle_io_out_timeout_cb);
 		return;
 	}
 
@@ -599,6 +650,7 @@ void connection_tls_accept_cb (EV_P_ struct ev_io *w, int revents)
 	struct connection *con = CONOFF_IO_IN(w);
 	struct incident *i;
 	g_debug("%s con %p",__PRETTY_FUNCTION__, con);
+	int transient_errors = 0;
 
 	while( 1 )
 	{
@@ -610,8 +662,28 @@ void connection_tls_accept_cb (EV_P_ struct ev_io *w, int revents)
 
 		int accepted_socket = accept(con->socket, (struct sockaddr *)&sa, &sizeof_sa);
 
-		if( accepted_socket == -1 && (errno == EAGAIN || errno == EWOULDBLOCK) )
+		if( accepted_socket == -1 )
+		{
+			int error = errno;
+			if( error == EAGAIN || error == EWOULDBLOCK )
+				break;
+
+			if( connection_accept_error_is_transient(error) )
+			{
+				// at most CONNECTION_ACCEPT_TRANSIENT_MAX in a row, then
+				// back to the event loop with the watcher still active
+				if( ++transient_errors < CONNECTION_ACCEPT_TRANSIENT_MAX )
+					continue;
+				g_warning("accept() failed %i times in a row on %s (%s)",
+						  transient_errors, con->local.node_string, strerror(error));
+				break;
+			}
+
+			// EMFILE & co: back off, the listen watcher starts again later
+			connection_accept_backoff(con, error);
 			break;
+		}
+		transient_errors = 0;
 
 
 		if( accepted_socket > g_dionaea->limits.fds * 70/100 )
@@ -686,6 +758,11 @@ void connection_tls_accept_cb (EV_P_ struct ev_io *w, int revents)
 		incident_value_con_set(i, "child", accepted);
 		incident_report(i);
 		incident_free(i);
+
+		// the protocol (origin hook, incident handlers) closed the listening
+		// connection, see connection_tcp_accept_cb()
+		if( con->socket == -1 )
+			break;
 	}
 
 	if( ev_is_active(&con->events.listen_timeout) )

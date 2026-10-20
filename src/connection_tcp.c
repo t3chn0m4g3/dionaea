@@ -60,6 +60,7 @@ void connection_tcp_accept_cb (EV_P_ struct ev_io *w, int revents)
 {
 	struct connection *con = CONOFF_IO_IN(w);
 	g_debug("%s con %p",__PRETTY_FUNCTION__, con);
+	int transient_errors = 0;
 
 	while( 1 )
 	{
@@ -71,12 +72,25 @@ void connection_tcp_accept_cb (EV_P_ struct ev_io *w, int revents)
 
 		if( accepted_socket == -1 )
 		{
-			if( errno != EAGAIN && errno != EWOULDBLOCK )
+			int error = errno;
+			if( error == EAGAIN || error == EWOULDBLOCK )
+				break;
+
+			if( connection_accept_error_is_transient(error) )
 			{
-				g_warning("accept() failed errno=%i (%s)",  errno, strerror(errno));
+				// at most CONNECTION_ACCEPT_TRANSIENT_MAX in a row, then
+				// back to the event loop with the watcher still active
+				if( ++transient_errors < CONNECTION_ACCEPT_TRANSIENT_MAX )
+					continue;
+				g_warning("accept() failed %i times in a row on %s (%s)",
+						  transient_errors, con->local.node_string, strerror(error));
+				break;
 			}
+
+			connection_accept_backoff(con, error);
 			break;
 		}
+		transient_errors = 0;
 
 		if( accepted_socket > g_dionaea->limits.fds * 70/100 )
 		{
@@ -94,7 +108,10 @@ void connection_tcp_accept_cb (EV_P_ struct ev_io *w, int revents)
 
 		if( connection_node_set_local(accepted) == false || connection_node_set_remote(accepted) == false )
 		{
-			g_warning("accepting connection failed, closing connection");
+			if( errno == ENOTCONN )
+				g_debug("accepting connection failed, the client is gone, closing connection");
+			else
+				g_warning("accepting connection failed, closing connection");
 			close(accepted->socket);
 			accepted->socket = -1;
 			// Free connection information but don't report
@@ -139,6 +156,11 @@ void connection_tcp_accept_cb (EV_P_ struct ev_io *w, int revents)
 		incident_value_con_set(i, "child", accepted);
 		incident_report(i);
 		incident_free(i);
+
+		// the protocol (origin hook, incident handlers) closed the listening
+		// connection, e.g. FTP passive mode after the one data connection
+		if( con->socket == -1 )
+			break;
 	}
 
 	if( ev_is_active(&con->events.listen_timeout) )
@@ -210,12 +232,17 @@ void connection_tcp_io_in_cb(EV_P_ struct ev_io *w, int revents)
 
 	g_debug("io_in: throttle can %i want %i", buf_size, recv_size);
 
-	if( recv_size == 0 )
+	if( recv_size <= 0 )
 		return;
 
-	unsigned char buf[buf_size];
+	/*
+	 * recv() never takes more than recv_size bytes, so the buffers need no
+	 * more, however much is queued (SIOCINQ can report many megabytes: the
+	 * receive buffer grows up to net.ipv4.tcp_rmem); the buffer is on the heap.
+	 */
+	unsigned char *buf = g_malloc(recv_size);
 
-	GString *new_in = g_string_sized_new(buf_size);
+	GString *new_in = g_string_sized_new(recv_size);
 
 	while( (size = recv(con->socket, buf, recv_size, 0)) > 0 )
 	{
@@ -225,6 +252,7 @@ void connection_tcp_io_in_cb(EV_P_ struct ev_io *w, int revents)
 			break;
 	}
 	int lerrno = errno;
+	g_free(buf);
 
 	if( con->processor_data != NULL && new_in->len > 0 )
 	{
@@ -268,7 +296,13 @@ void connection_tcp_io_in_cb(EV_P_ struct ev_io *w, int revents)
 
 	} else
 	{
-		g_warning("recv failed size %i recv_size %i (%s)", size, recv_size, strerror(lerrno));
+		/* a client that resets or goes away is no error of dionaea; the line names the connection */
+		if( lerrno == ECONNRESET || lerrno == EPIPE )
+			g_info("recv failed size %i recv_size %i (%s), connection %s", size, recv_size, strerror(lerrno),
+				   con->remote.node_string);
+		else
+			g_warning("recv failed size %i recv_size %i (%s), connection %s", size, recv_size, strerror(lerrno),
+					  con->remote.node_string);
 		connection_tcp_disconnect(con);
 	}
 	g_string_free(new_in, TRUE);
@@ -285,10 +319,21 @@ void connection_tcp_io_out_cb(EV_P_ struct ev_io *w, int revents)
 	struct connection *con = CONOFF_IO_OUT(w);
 	g_debug("%s con %p",__PRETTY_FUNCTION__, con);
 
+	/*
+	 * Nothing to send: an active io_out watcher would fire on every turn
+	 * of the loop (e.g. started again by the throttle timer).
+	 */
+	if( con->transport.tcp.io_out->len == 0 )
+	{
+		if( ev_is_active(&con->events.io_out) )
+			ev_io_stop(EV_A_ &con->events.io_out);
+		return;
+	}
+
 	int send_throttle = connection_throttle(con, &con->stats.io_out.throttle);
 	int send_size = MIN(con->transport.tcp.io_out->len, send_throttle);
 
-
+	// throttled: connection_throttle() stopped io_out and restarts it later
 	if( send_size == 0 )
 		return;
 

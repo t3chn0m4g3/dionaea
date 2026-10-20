@@ -4,7 +4,7 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -133,7 +133,7 @@ class LogJsonHandler(ihandler):
                     raw_id = "%r_%d_%r" % (
                         tmp_data,
                         id(v),
-                        datetime.utcnow()
+                        datetime.now(timezone.utc).replace(tzinfo=None)
                     )
 
                     conn_id = hashlib.sha256(raw_id.encode("ASCII")).hexdigest()
@@ -144,7 +144,7 @@ class LogJsonHandler(ihandler):
                 logger.warning("Incident '%s' with unknown data type '%s' for key '%s'", icd.origin, type(v), k)
 
         data = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             "name": "dionaea",
             "origin": icd.origin,
             "data": idata

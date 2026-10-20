@@ -57,9 +57,7 @@ extend-exclude =
     modules/python/dionaea/smb/include/asn1fields.py
     modules/python/dionaea/smb/include/asn1packet.py
     modules/python/dionaea/smb/include/fieldtypes.py
-    modules/python/dionaea/smb/include/gssapifields.py
     modules/python/dionaea/smb/include/helpers.py
-    modules/python/dionaea/smb/include/ntlmfields.py
     modules/python/dionaea/smb/include/packet.py
     modules/python/dionaea/smb/include/smbfields.py
     modules/python/dionaea/smb/rpcservices.py

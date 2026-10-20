@@ -6,6 +6,10 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+
 struct connection;
 struct processor_data;
 struct emu;
@@ -14,7 +18,7 @@ struct emu_env;
 struct emu_ctx
 {
 	struct emu_config *config;
-	int offset;
+	uint64_t offset;	/* absolute stream offset: the data before it was scanned */
 };
 
 struct emu_config
@@ -42,7 +46,33 @@ int run(struct emu *e, struct emu_env *env);
 void profile(struct emu_config *conf, struct connection *con, void *data, unsigned int size, unsigned int offset);
 
 
+/* trim.c: the free memory of the arenas back to the system after a scan that built libemu's
+ * instruction graph, at most once per EMU_TRIM_INTERVAL_US in the process (glibc only); a trim the
+ * limit skipped is made once the interval is over, by the next scan that ends or, when the emu is
+ * idle, by a thread of trim.c */
+#define EMU_TRIM_INTERVAL_US (5 * (int64_t)1000000)
+/* true when emu_shellcode_test() on e built the graph (the window had a GetPC candidate) */
+bool emu_scan_built_graph(struct emu *e);
+/* true for the one caller that may trim at the monotonic time now (microseconds) */
+bool emu_trim_claim(int64_t now);
+/* around a scan of a window; graph: emu_scan_built_graph() of it, its memory is freed */
+void emu_trim_scan_begin(void);
+void emu_trim_scan_end(bool graph);
+/* stops the thread of the trailing trim (module free) */
+void emu_trim_stop(void);
+/* nothing pending, the thread stopped, the next claim succeeds at once, a failed thread warned about again (tests) */
+void emu_trim_reset(void);
+/* the trims made (deferred: by the trailing trim) and their time, for a probe (tests/load) */
+struct emu_trim_stats
+{
+	_Atomic uint64_t count;
+	_Atomic uint64_t total_us;
+	_Atomic uint64_t max_us;
+	_Atomic uint64_t deferred;
+};
+extern struct emu_trim_stats emu_trim_stats;
 
+void emulate_ctx_free(void *ctx);
 void emulate_thread(gpointer data, gpointer user_data);
 void emulate(struct emu_config *conf, struct connection *con, void *data, unsigned int size, unsigned int offset);
 

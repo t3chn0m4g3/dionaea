@@ -98,6 +98,18 @@ class MQTT_ConnectACK(Packet):
 		XShortField("ConnectionACK",0x00)
 	]
 
+# MQTT 5.0 3.2.2.3: the CONNACK has a property length (a variable byte integer, 0: none) after
+# the reason code
+class MQTT5_ConnectACK(Packet):
+	name="MQTT 5 Connect ACK"
+	controlmessage_type = MQTT_CONTROLMESSAGE_TYPE_CONNECTACK
+	fields_desc =[
+		ByteField("HeaderFlags",0x20),
+		ByteField("MessageLength",0x03),
+		XShortField("ConnectionACK",0x00),
+		ByteField("PropertyLength",0x00)
+	]
+
 class MQTT_Publish(Packet):
 	name="MQTT Publish"
 	controlmessage_type = MQTT_CONTROLMESSAGE_TYPE_PUBLISH

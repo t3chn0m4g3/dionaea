@@ -9,13 +9,15 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import logging
-import tempfile
+import os
 
 from uuid import UUID
 from time import time, localtime, altzone
 
 from dionaea import ndrlib
 from dionaea.core import g_dionaea, incident
+from dionaea.logtext import log_text
+from dionaea.upload import incoming_file
 from .include.smbfields import DCERPC_Header, DCERPC_Response
 
 rpclog = logging.getLogger('rpcservices')
@@ -71,7 +73,7 @@ class RPCService(object):
                     rpclog.debug("DCERPCValueError %s" % e)
                     return None
                 except EOFError as e:
-                    rpclog.warn("EOFError data %s" % format(p.StubData))
+                    rpclog.warning("EOFError data %s", log_text(p.StubData))
                     return None
 
                 if data is None:
@@ -2869,12 +2871,7 @@ class spoolss(RPCService):
             dionaea_config = g_dionaea.config().get("dionaea")
             download_dir = dionaea_config.get("download.dir")
             download_suffix = dionaea_config.get("download.suffix", ".tmp")
-            x = tempfile.NamedTemporaryFile(
-                delete=False,
-                prefix="spoolss-",
-                suffix=download_suffix,
-                dir=download_dir
-            )
+            x = incoming_file("spoolss-", suffix=download_suffix, download_dir=download_dir)
             x.write(Buf)
             x.close()
 
@@ -2882,7 +2879,15 @@ class spoolss(RPCService):
             i.path = x.name
             i.url = "spoolss://" + con.remote.host
             i.con = con
-            i.report()
+            try:
+                i.report()
+            finally:
+                # store.py links the file as <md5>, the temporary name has to go
+                # (a sample that is over the cap would stay in download.dir)
+                try:
+                    os.unlink(x.name)
+                except OSError:
+                    pass
 
             r = ndrlib.Packer()
             r.pack_long(len(Buf))
@@ -3278,7 +3283,7 @@ class SRVSVC(RPCService):
                 #				self.MaxCount = len(self.Data)
                 #				self.__packer.pack_long(self.MaxCount)
 
-                rpclog.warn("%s" % self.Data)
+                rpclog.warning("%s", log_text(self.Data))
 #				raise Exception()
 
                 for i in self.Data:
@@ -3583,7 +3588,7 @@ class SRVSVC(RPCService):
                 data = __shares__[NetName]
                 s.Data = {NetName:data}
             else:
-                rpclog.warn(
+                rpclog.warning(
                     "FIXME: this code has to be written, lame workaround for now")
                 data = __shares__['C$']
                 s.Data = {NetName:data}

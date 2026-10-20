@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 class DionaeaError(Exception):
-    def __init__(self, msg, *args):
+    def __init__(self, msg, *args):  # noqa: B042 - preserve the formatted exception API
         self.msg = msg
         self.args = args
 
@@ -22,7 +22,7 @@ class ServiceConfigError(DionaeaError):
 
 
 class ConnectionError(DionaeaError):
-    def __init__(self, connection=None, error_id=None):
+    def __init__(self, connection=None, error_id=None):  # noqa: B042 - legacy connection error API
         self.connection = connection
         self.error_id = error_id
 
@@ -56,6 +56,13 @@ class ConnectionNoSuchDomain(ConnectionError):
 class ConnectionTooMany(ConnectionError):
     def __str__(self):
         return "Too many connections"
+
+
+class ConnectionRefusedByFilter(ConnectionError):
+    """A download connection: the download target filter refused every address of the target."""
+
+    def __str__(self):
+        return "download target refused by the filter"
 
 
 class ConnectionUnknownError(ConnectionError):

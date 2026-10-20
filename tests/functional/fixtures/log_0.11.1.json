@@ -1,0 +1,500 @@
+{
+  "events": {
+    "epmapper/accept": {
+      "connection": [
+        "dict"
+      ],
+      "connection.protocol": [
+        "str"
+      ],
+      "connection.transport": [
+        "str"
+      ],
+      "connection.type": [
+        "str"
+      ],
+      "dst_ip": [
+        "str"
+      ],
+      "dst_port": [
+        "int"
+      ],
+      "src_hostname": [
+        "str"
+      ],
+      "src_ip": [
+        "str"
+      ],
+      "src_port": [
+        "int"
+      ],
+      "timestamp": [
+        "str"
+      ]
+    },
+    "ftpd/accept": {
+      "connection": [
+        "dict"
+      ],
+      "connection.protocol": [
+        "str"
+      ],
+      "connection.transport": [
+        "str"
+      ],
+      "connection.type": [
+        "str"
+      ],
+      "credentials": [
+        "dict"
+      ],
+      "credentials.password": [
+        "list"
+      ],
+      "credentials.password[]": [
+        "str"
+      ],
+      "credentials.username": [
+        "list"
+      ],
+      "credentials.username[]": [
+        "str"
+      ],
+      "dst_ip": [
+        "str"
+      ],
+      "dst_port": [
+        "int"
+      ],
+      "ftp": [
+        "dict"
+      ],
+      "ftp.commands": [
+        "dict"
+      ],
+      "ftp.commands.arguments": [
+        "list"
+      ],
+      "ftp.commands.arguments[]": [
+        "str"
+      ],
+      "ftp.commands.command": [
+        "list"
+      ],
+      "ftp.commands.command[]": [
+        "str"
+      ],
+      "src_hostname": [
+        "str"
+      ],
+      "src_ip": [
+        "str"
+      ],
+      "src_port": [
+        "int"
+      ],
+      "timestamp": [
+        "str"
+      ]
+    },
+    "httpd/accept": {
+      "connection": [
+        "dict"
+      ],
+      "connection.protocol": [
+        "str"
+      ],
+      "connection.transport": [
+        "str"
+      ],
+      "connection.type": [
+        "str"
+      ],
+      "dst_ip": [
+        "str"
+      ],
+      "dst_port": [
+        "int"
+      ],
+      "src_hostname": [
+        "str"
+      ],
+      "src_ip": [
+        "str"
+      ],
+      "src_port": [
+        "int"
+      ],
+      "timestamp": [
+        "str"
+      ]
+    },
+    "mqttd/accept": {
+      "connection": [
+        "dict"
+      ],
+      "connection.protocol": [
+        "str"
+      ],
+      "connection.transport": [
+        "str"
+      ],
+      "connection.type": [
+        "str"
+      ],
+      "dst_ip": [
+        "str"
+      ],
+      "dst_port": [
+        "int"
+      ],
+      "src_hostname": [
+        "str"
+      ],
+      "src_ip": [
+        "str"
+      ],
+      "src_port": [
+        "int"
+      ],
+      "timestamp": [
+        "str"
+      ]
+    },
+    "mssqld/accept": {
+      "connection": [
+        "dict"
+      ],
+      "connection.protocol": [
+        "str"
+      ],
+      "connection.transport": [
+        "str"
+      ],
+      "connection.type": [
+        "str"
+      ],
+      "credentials": [
+        "dict"
+      ],
+      "credentials.password": [
+        "list"
+      ],
+      "credentials.password[]": [
+        "str"
+      ],
+      "credentials.username": [
+        "list"
+      ],
+      "credentials.username[]": [
+        "str"
+      ],
+      "dst_ip": [
+        "str"
+      ],
+      "dst_port": [
+        "int"
+      ],
+      "src_hostname": [
+        "str"
+      ],
+      "src_ip": [
+        "str"
+      ],
+      "src_port": [
+        "int"
+      ],
+      "timestamp": [
+        "str"
+      ]
+    },
+    "mysqld/accept": {
+      "connection": [
+        "dict"
+      ],
+      "connection.protocol": [
+        "str"
+      ],
+      "connection.transport": [
+        "str"
+      ],
+      "connection.type": [
+        "str"
+      ],
+      "credentials": [
+        "dict"
+      ],
+      "credentials.password": [
+        "list"
+      ],
+      "credentials.password[]": [
+        "str"
+      ],
+      "credentials.username": [
+        "list"
+      ],
+      "credentials.username[]": [
+        "str"
+      ],
+      "dst_ip": [
+        "str"
+      ],
+      "dst_port": [
+        "int"
+      ],
+      "src_hostname": [
+        "str"
+      ],
+      "src_ip": [
+        "str"
+      ],
+      "src_port": [
+        "int"
+      ],
+      "timestamp": [
+        "str"
+      ]
+    },
+    "smbd/accept": {
+      "connection": [
+        "dict"
+      ],
+      "connection.protocol": [
+        "str"
+      ],
+      "connection.transport": [
+        "str"
+      ],
+      "connection.type": [
+        "str"
+      ],
+      "dst_ip": [
+        "str"
+      ],
+      "dst_port": [
+        "int"
+      ],
+      "src_hostname": [
+        "str"
+      ],
+      "src_ip": [
+        "str"
+      ],
+      "src_port": [
+        "int"
+      ],
+      "timestamp": [
+        "str"
+      ]
+    }
+  },
+  "fixture_version": 1,
+  "recorded_with": {
+    "image": "ghcr.io/telekom-security/dionaea:24.04.1",
+    "image_id": "sha256:f9342d16fea9679ee69c48ae0c4f2373feb3aa9d0176d2a596305282e00599c7"
+  },
+  "sqlite": {
+    "connections": {
+      "connection": "INTEGER",
+      "connection_parent": "INTEGER",
+      "connection_protocol": "TEXT",
+      "connection_root": "INTEGER",
+      "connection_timestamp": "INTEGER",
+      "connection_transport": "TEXT",
+      "connection_type": "TEXT",
+      "local_host": "TEXT",
+      "local_port": "INTEGER",
+      "remote_host": "TEXT",
+      "remote_hostname": "TEXT",
+      "remote_port": "INTEGER"
+    },
+    "dcerpcbinds": {
+      "connection": "INTEGER",
+      "dcerpcbind": "INTEGER",
+      "dcerpcbind_transfersyntax": "TEXT",
+      "dcerpcbind_uuid": "TEXT"
+    },
+    "dcerpcrequests": {
+      "connection": "INTEGER",
+      "dcerpcrequest": "INTEGER",
+      "dcerpcrequest_opnum": "INTEGER",
+      "dcerpcrequest_uuid": "TEXT"
+    },
+    "dcerpcserviceops": {
+      "dcerpcservice": "INTEGER",
+      "dcerpcserviceop": "INTEGER",
+      "dcerpcserviceop_name": "TEXT",
+      "dcerpcserviceop_opnum": "INTEGER",
+      "dcerpcserviceop_vuln": "TEXT"
+    },
+    "dcerpcservices": {
+      "dcerpcservice": "INTEGER",
+      "dcerpcservice_name": "TEXT",
+      "dcerpcservice_uuid": "TEXT"
+    },
+    "downloads": {
+      "connection": "INTEGER",
+      "download": "INTEGER",
+      "download_md5_hash": "TEXT",
+      "download_url": "TEXT"
+    },
+    "emu_profiles": {
+      "connection": "INTEGER",
+      "emu_profile": "INTEGER",
+      "emu_profile_json": "TEXT"
+    },
+    "emu_services": {
+      "connection": "INTEGER",
+      "emu_serivce": "INTEGER",
+      "emu_service_url": "TEXT"
+    },
+    "logins": {
+      "connection": "INTEGER",
+      "login": "INTEGER",
+      "login_password": "TEXT",
+      "login_username": "TEXT"
+    },
+    "mqtt_fingerprints": {
+      "connection": "INTEGER",
+      "mqtt_fingerprint": "INTEGER",
+      "mqtt_fingerprint_clientid": "TEXT",
+      "mqtt_fingerprint_password": "TEXT",
+      "mqtt_fingerprint_username": "TEXT",
+      "mqtt_fingerprint_willmessage": "TEXT",
+      "mqtt_fingerprint_willtopic": "TEXT"
+    },
+    "mqtt_publish_commands": {
+      "connection": "INTEGER",
+      "mqtt_publish_command": "INTEGER",
+      "mqtt_publish_command_message": "TEXT",
+      "mqtt_publish_command_topic": "TEXT"
+    },
+    "mqtt_subscribe_commands": {
+      "connection": "INTEGER",
+      "mqtt_subscribe_command": "INTEGER",
+      "mqtt_subscribe_command_messageid": "TEXT",
+      "mqtt_subscribe_command_topic": "TEXT"
+    },
+    "mssql_commands": {
+      "connection": "INTEGER",
+      "mssql_command": "INTEGER",
+      "mssql_command_cmd": "TEXT",
+      "mssql_command_status": "TEXT"
+    },
+    "mssql_fingerprints": {
+      "connection": "INTEGER",
+      "mssql_fingerprint": "INTEGER",
+      "mssql_fingerprint_appname": "TEXT",
+      "mssql_fingerprint_cltintname": "TEXT",
+      "mssql_fingerprint_hostname": "TEXT"
+    },
+    "mysql_command_args": {
+      "mysql_command": "INTEGER",
+      "mysql_command_arg": "INTEGER",
+      "mysql_command_arg_data": "TEXT",
+      "mysql_command_arg_index": "NUMBER"
+    },
+    "mysql_command_ops": {
+      "mysql_command_cmd": "INTEGER",
+      "mysql_command_op": "INTEGER",
+      "mysql_command_op_name": "TEXT"
+    },
+    "mysql_commands": {
+      "connection": "INTEGER",
+      "mysql_command": "INTEGER",
+      "mysql_command_cmd": "NUMBER"
+    },
+    "offers": {
+      "connection": "INTEGER",
+      "offer": "INTEGER",
+      "offer_url": "TEXT"
+    },
+    "p0fs": {
+      "connection": "INTEGER",
+      "p0f": "INTEGER",
+      "p0f_detail": "TEXT",
+      "p0f_dist": "INTEGER",
+      "p0f_fw": "INTEGER",
+      "p0f_genre": "TEXT",
+      "p0f_link": "TEXT",
+      "p0f_nat": "INTEGER",
+      "p0f_tos": "TEXT",
+      "p0f_uptime": "INTEGER"
+    },
+    "resolves": {
+      "connection": "INTEGER",
+      "resolve": "INTEGER",
+      "resolve_hostname": "TEXT",
+      "resolve_result": "TEXT",
+      "resolve_type": "TEXT"
+    },
+    "sip_addrs": {
+      "sip_addr": "INTEGER",
+      "sip_addr_display_name": "",
+      "sip_addr_type": "",
+      "sip_addr_uri_host": "",
+      "sip_addr_uri_password": "",
+      "sip_addr_uri_port": "",
+      "sip_addr_uri_scheme": "",
+      "sip_addr_uri_user": "",
+      "sip_command": "INTEGER"
+    },
+    "sip_commands": {
+      "connection": "INTEGER",
+      "sip_command": "INTEGER",
+      "sip_command_allow": "INTEGER",
+      "sip_command_call_id": "",
+      "sip_command_method": "",
+      "sip_command_user_agent": ""
+    },
+    "sip_sdp_connectiondatas": {
+      "sip_command": "INTEGER",
+      "sip_sdp_connectiondata": "INTEGER",
+      "sip_sdp_connectiondata_addrtype": "",
+      "sip_sdp_connectiondata_connection_address": "",
+      "sip_sdp_connectiondata_nettype": "",
+      "sip_sdp_connectiondata_number_of_addresses": "",
+      "sip_sdp_connectiondata_ttl": ""
+    },
+    "sip_sdp_medias": {
+      "sip_command": "INTEGER",
+      "sip_sdp_media": "INTEGER",
+      "sip_sdp_media_media": "",
+      "sip_sdp_media_number_of_ports": "",
+      "sip_sdp_media_port": "",
+      "sip_sdp_media_proto": ""
+    },
+    "sip_sdp_origins": {
+      "sip_command": "INTEGER",
+      "sip_sdp_origin": "INTEGER",
+      "sip_sdp_origin_addrtype": "",
+      "sip_sdp_origin_nettype": "",
+      "sip_sdp_origin_sess_id": "",
+      "sip_sdp_origin_sess_version": "",
+      "sip_sdp_origin_unicast_address": "",
+      "sip_sdp_origin_username": ""
+    },
+    "sip_vias": {
+      "sip_command": "INTEGER",
+      "sip_via": "INTEGER",
+      "sip_via_address": "",
+      "sip_via_port": "",
+      "sip_via_protocol": ""
+    },
+    "virustotals": {
+      "virustotal": "INTEGER",
+      "virustotal_md5_hash": "TEXT",
+      "virustotal_permalink": "TEXT",
+      "virustotal_timestamp": "INTEGER"
+    },
+    "virustotalscans": {
+      "virustotal": "INTEGER",
+      "virustotalscan": "INTEGER",
+      "virustotalscan_result": "TEXT",
+      "virustotalscan_scanner": "TEXT"
+    }
+  },
+  "timestamp_patterns": [
+    "dddd-dd-ddTdd:dd:dd.dddddd"
+  ]
+}

@@ -12,6 +12,8 @@
 from dionaea import ServiceLoader
 from dionaea.core import connection, g_dionaea, incident
 from dionaea.exception import ServiceConfigError
+from dionaea.logtext import log_text
+from dionaea.upload import DEFAULT_MAX_UPLOAD_SIZE, UploadError, UploadFile, upload_url
 import logging
 import os
 import re
@@ -19,6 +21,10 @@ import time
 
 logger = logging.getLogger("printer")
 logger.setLevel(logging.DEBUG)
+
+
+#: Largest print job that is kept (bytes), the rest of the data is read and dropped
+MAX_PCL_SIZE = DEFAULT_MAX_UPLOAD_SIZE
 
 
 class PrinterService(ServiceLoader):
@@ -304,7 +310,9 @@ class Printerd(connection):
 
         self.state = self.STATE_INIT
         self.pjl_program_delimiter = None
-        self.pcl_file_handle = None
+        self.pcl_upload = None
+        self.pcl_name = None
+        self.pcl_too_large = False
 
     def reply(self, msg):
         """Sends the given message back to the client.
@@ -357,8 +365,10 @@ class Printerd(connection):
         self.processors()
 
     def handle_disconnect(self):
-        if self.pcl_file_handle is not None:
-            self.pcl_file_handle.close()
+        if self.pcl_upload is not None:
+            # store.py takes the job from here: name, mode 0440, size cap
+            upload, self.pcl_upload = self.pcl_upload, None
+            upload.complete(self, upload_url("printer", self.remote.host, self.pcl_name))
 
     def handle_io_in(self, data):
         logger.debug("received %s", str(data))
@@ -457,7 +467,7 @@ class Printerd(connection):
             self.pjl_FSQUERY(arguments)
             return
 
-        logger.warning("unable to find command for '%s'", str(line))
+        logger.warning("unable to find command for '%s'", log_text(line))
         self.reply("?")
 
     def pjl_ECHO(self, command):
@@ -552,21 +562,29 @@ class Printerd(connection):
         self.listdir(path)
 
     def process_pcl(self, data):
-        """Starts "printing" the given PCL to a new file.
+        """Starts "printing" the given PCL to a new temporary file.
 
-        The file name will be created using the current time, e.g. "print-1547056738.pcl".
+        The job is not written to download.dir by this service: it is a temporary file
+        (mode 0600, at most MAX_PCL_SIZE bytes, the rest is dropped) that is reported as
+        ``dionaea.download.complete`` when the connection ends, like every other captured
+        file, so store.py names it by its md5, makes it read-only and counts it for ``max_size``.
+        The url is e.g. "printer://198.51.100.9/print-1547056738.pcl".
         Additionally, an incident "dionaea.modules.python.printer.print" will be created.
         """
-        if self.pcl_file_handle is None:
-            filename = "print-%d.pcl" % time.time()
-            path = os.path.join(self.download_dir, filename)
-            logger.info("printing to '%s'", path)
-            self.pcl_file_handle = open(path, "wb")
+        if self.pcl_upload is None:
+            self.pcl_name = "print-%d.pcl" % time.time()
+            self.pcl_upload = UploadFile("print-", max_size=MAX_PCL_SIZE, download_dir=self.download_dir)
+            logger.info("printing to '%s' (%s)", self.pcl_upload.name, self.pcl_name)
 
             icd = incident("dionaea.modules.python.printer.print")
             icd.con = self
-            icd.path = path
+            icd.path = self.pcl_upload.name
             icd.report()
 
-        self.pcl_file_handle.write(data)
+        try:
+            self.pcl_upload.write(data)
+        except UploadError as e:
+            if not self.pcl_too_large:
+                self.pcl_too_large = True
+                logger.warning("print job from %s is cut: %s", self.remote.host, e)
         return len(data)

@@ -6,14 +6,16 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 # ftp client
+import os
 import re
 import random
 import urllib.parse
-import tempfile
 import logging
 
 from dionaea import IHandlerLoader
-from dionaea.core import connection, ihandler, g_dionaea, incident
+from dionaea.core import connection, ihandler, g_dionaea, incident, download_failed, download_refused
+from dionaea.exception import ConnectionRefusedByFilter
+from dionaea.upload import incoming_file
 
 logger = logging.getLogger("ftp_download")
 logger.setLevel(logging.DEBUG)
@@ -30,7 +32,7 @@ class FTPIhandlerLoader(IHandlerLoader):
 
 
 class FTPCtrl(connection):
-    def __init__(self, ftp, config=None):
+    def __init__(self, ftp=None, config=None):
         connection.__init__(self, "tcp")
         self.ftp = ftp
         self.state = "NONE"
@@ -76,7 +78,7 @@ class FTPCtrl(connection):
                     self.cmd("RETR " + self.ftp.file)
                     self.state = "RETR"
                 else:
-                    logger.warn("PORT command failed")
+                    logger.info("PORT command failed")
             elif self.state == "RETR":
                 if (c > 200 and c < 300)  and s != b"-":
                     self.cmd("QUIT")
@@ -86,16 +88,20 @@ class FTPCtrl(connection):
         return dlen
 
     def cmd(self, cmd):
-        logger.debug("FTP CMD: '%s'", + cmd)
+        logger.debug("FTP CMD: '%s'", cmd)
         self.send(cmd + "\r\n")
 
     def handle_error(self, err):
-        self.ftp.fail()
+        # the connect of the download failed; the core closes the connection afterwards
+        if isinstance(err, ConnectionRefusedByFilter):
+            self.ftp.refused()
+        else:
+            self.ftp.fail(str(err))
         return False
 
     def handle_disconnect(self):
         if self.state != "QUIT":
-            self.ftp.fail()
+            self.ftp.fail("the server closed the control connection (state %s)" % self.state)
         return False
 
     def handle_timeout_idle(self):
@@ -115,12 +121,7 @@ class FTPData(connection):
     def handle_established(self):
         logger.debug("FTP DATA established")
         self.timeouts.idle = 30
-        self.fileobj = tempfile.NamedTemporaryFile(
-            delete=False,
-            prefix="ftp-",
-            dir=self.ftp.download_dir,
-            suffix=self.ftp.download_suffix
-        )
+        self.fileobj = incoming_file("ftp-", suffix=self.ftp.download_suffix, download_dir=self.ftp.download_dir)
 
     def handle_origin(self, parent):
         self.ftp = parent.ftp
@@ -133,9 +134,10 @@ class FTPData(connection):
         return len(data)
 
     def handle_timeout_idle(self):
-        self.fileobj.unlink(self.fileobj.name)
+        self.fileobj.close()
+        os.unlink(self.fileobj.name)
         self.fileobj = None
-        self.ftp.fail()
+        self.ftp.fail("no data from the server for %d s" % self.timeouts.idle)
         return False
 
     def handle_disconnect(self):
@@ -149,13 +151,13 @@ class FTPData(connection):
             icd.con = self.ftp.con
             icd.url = self.ftp.url
             icd.report()
-            self.fileobj.unlink(self.fileobj.name)
+            os.unlink(self.fileobj.name)
             self.ftp.dataconn = None
             self.ftp.datadone()
         return False
 
     def handle_timeout_listen(self):
-        self.ftp.fail()
+        self.ftp.fail("no data connection from the server within %d s" % self.timeouts.listen)
         return False
 
 
@@ -164,7 +166,12 @@ class FTPClient:
         self.ctrl = FTPCtrl(self)
         self.download_dir = download_dir
         self.download_suffix = download_suffix
-        self.host = host
+        # active_host of the config: the address announced with PORT (NAT)
+        self.active_host = host
+        self.host = None
+        self.url = None
+        # the end of the download is logged once (download_failed / download_refused)
+        self.reported = False
         self.port_min = port_min
         self.port_max = port_max
 
@@ -183,9 +190,11 @@ class FTPClient:
             self.ctrl.bind(self.local, 0)
             self.con.ref()
 
-        self.ctrl.connect(host, port)
         self.dataconn = None
         self.datalistener = None
+        self.ctrl.connect(host, port, download=True)
+        if self.ctrl is None:
+            return
 
         if con:
             i = incident("dionaea.connection.link")
@@ -198,8 +207,8 @@ class FTPClient:
 
         try:
             # for NAT setups
-            host = self.host
-            if host == "0.0.0.0":
+            host = self.active_host
+            if host is None or host == "0.0.0.0":
                 host = self.ctrl.local.host
                 logger.info("datalisten host %s", host)
             else:
@@ -249,7 +258,18 @@ class FTPClient:
             self.ctrl = None
             self.finish()
 
-    def fail(self):
+    def refused(self):
+        """The download target filter refused the server: once, at info."""
+        if not self.reported:
+            self.reported = True
+            download_refused(self.url)
+        self.finish()
+
+    def fail(self, reason):
+        """The download failed: once, at info, with the summary of download_log.c."""
+        if not self.reported:
+            self.reported = True
+            download_failed(self.url, reason)
         self.finish()
 
     def finish(self):
@@ -290,7 +310,13 @@ class FTPDownloadHandler(ihandler):
 
     def handle_incident(self, icd):
         url = icd.url
-        p = urllib.parse.urlsplit(url)
+        try:
+            p = urllib.parse.urlsplit(url)
+            port = p.port or 21
+            if not p.hostname:
+                return
+        except (ValueError, TypeError):
+            return
         logger.debug("Parsed url: %s", repr(p))
         if p.scheme == "ftp":
             logger.info("do download")
@@ -311,4 +337,7 @@ class FTPDownloadHandler(ihandler):
                 port_min=self.port_min,
                 port_max=self.port_max
             )
-            f.download(con, p.username, p.password, p.hostname, p.port, p.path, ftpmode, url)
+            # ftp://host/file has no user: anonymous login
+            username = p.username if p.username is not None else "anonymous"
+            password = p.password if p.password is not None else "anonymous@"
+            f.download(con, username, password, p.hostname, port, p.path, ftpmode, url)

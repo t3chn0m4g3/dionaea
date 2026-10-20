@@ -59,6 +59,13 @@ next=streamdumper
 [processor.streamdumper]
 name=streamdumper
 config.path=@DIONAEA_STATEDIR@/bistreams/%Y-%m-%d/
+# limits of all dumps below bistreams/, 0 or absent: no limit; a dump stops
+# at max_size, the connection goes on. Reference streamdumper only once in the
+# processor tree: each reference applies the limits on its own. The environment
+# variables DIONAEA_STREAMDUMPER_MAX_SIZE (MiB) and DIONAEA_STREAMDUMPER_MAX_FILES
+# replace them when set.
+# config.max_size=2048
+# config.max_files=200000
 
 [processor.emu]
 name=emu

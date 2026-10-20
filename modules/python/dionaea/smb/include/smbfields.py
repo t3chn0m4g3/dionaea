@@ -560,6 +560,13 @@ SMB_WriteMode = {
     SMB_WM_MSGSTART       :"MSGSTART",
 }
 
+def smb_flags2(pkt):
+    """Flags2 of the SMB header above pkt (also through the requests of an AndX chain), 0 if there is none."""
+    while pkt is not None and not isinstance(pkt, SMB_Header):
+        pkt = pkt.underlayer
+    return pkt.Flags2 if pkt is not None else 0
+
+
 class SMBNullField(StrField):
     def __init__(self, name, default, fmt="H", remain=0, utf16=True):
         if utf16:
@@ -932,8 +939,9 @@ class SMB_Treeconnect_AndX_Request(Packet):
         FieldLenField("PasswordLength", None, fmt='<H', length_of="Password"),
         LEShortField("ByteCount",18),
         StrLenField("Password", "Pass", length_from=lambda x:x.PasswordLength),
+        # the header is not the underlayer when the request is chained behind a SESSION_SETUP_ANDX
         ConditionalField(StrFixedLenField("Padding", b'\0', 1), lambda x:
-                         x.underlayer.Flags2 & SMB_FLAGS2_UNICODE and len(x.Password)%2 == 0),
+                         smb_flags2(x) & SMB_FLAGS2_UNICODE and len(x.Password)%2 == 0),
         SMBNullField("Path","\\\\WIN2K\\IPC$",
                      utf16=lambda x:x.underlayer.Flags2 & SMB_FLAGS2_UNICODE),
         StrNullField("Service","IPC"),
@@ -974,9 +982,12 @@ class SMB_Treeconnect_AndX_Response(Packet):
         XLEShortField("OptSupport",1),
         #        LEShortField("ByteCount",5),
         MultiFieldLenField(
-            "ByteCount", None, fmt='<H', length_of=("Service","NativeFileSystem")),
+            "ByteCount", None, fmt='<H', length_of=("Service","Padding","NativeFileSystem")),
         StrNullField("Service","IPC"),
-        StrNullField("NativeFileSystem",""),
+        # the pad that word-aligns a unicode NativeFileSystem (set by smb.py, it depends on
+        # where the response is in the message)
+        StrField("Padding", b""),
+        SMBNullField("NativeFileSystem", ""),
     ]
 
 #[MS-SMB].pdf
@@ -997,9 +1008,9 @@ class SMB_Treeconnect_AndX_Response_Extended(Packet):
         MultiFieldLenField("ByteCount", None, fmt='<H', length_of=(
             "Service","Padding","NativeFileSystem")),
         StrNullField("Service","IPC"),
-        ConditionalField(StrFixedLenField(
-            "Padding", b'\0', 2), lambda x:x.underlayer.Flags2 & SMB_FLAGS2_UNICODE),
-        StrNullField("NativeFileSystem",""),
+        # see SMB_Treeconnect_AndX_Response
+        StrField("Padding", b""),
+        SMBNullField("NativeFileSystem", ""),
     ]
 
 # Used when the error's return is needed
@@ -1100,15 +1111,45 @@ class SMB_Write_AndX_Request(Packet):
         LEShortField("DataLenHigh",0), #multiply with 64k
         LEShortField("DataLenLow",0),
         LEShortField("DataOffset",0),
-        ConditionalField(IntField("HighOffset",0), lambda x:x.WordCount==14),
+        ConditionalField(LEIntField("HighOffset",0), lambda x:x.WordCount==14),
         LEShortField("ByteCount",  0),
         ConditionalField(LEShortField("PipeWriteLen", 0), lambda x:
                          x.WriteMode & SMB_WM_MSGSTART and x.WriteMode & SMB_WM_WRITERAW),
-        StrLenField("Padding", None, length_from=lambda x:
-                    x.ByteCount-((x.DataLenHigh<<16)|x.DataLenLow)),
-        StrLenField("Data", b"", length_from=lambda x:(
-            (x.DataLenHigh<<16)|x.DataLenLow)),
+
+        # DataOffset contains the position of the data from the beginning of the SMB header.
+        # underlayer.size() gives the size of the SMB header
+        StrLenField("Padding", None, length_from=lambda x: x.lengthof_Padding()),
+
+        StrLenField("Data", b"", length_from=lambda x: x.lengthof_Data()),
     ]
+
+    def lengthto_Pad(self):
+        """Bytes from the start of the parameters to the padding, of the fields that are really there."""
+        x = 3 * 1
+        x += 8 * 2
+        x += 2 * 4
+        # a ConditionalField that is not there is None, not missing
+        if self.fields.get('HighOffset') is not None:
+            x += 4
+        if self.fields.get('PipeWriteLen') is not None:
+            x += 2
+        return x
+
+    def lengthof_Padding(self):
+        # all values come from the client: not negative, not more than the bytes left in the
+        # message (ByteCount can not be used, it wraps around for writes of 64 KiB and more)
+        start = self.underlayer.size() + self.lengthto_Pad()
+        left = self.underlayer.underlayer.LENGTH - start
+        return max(0, min(self.DataOffset - start, left))
+
+    def lengthof_Data(self):
+        # ByteCount has 16 bits and is too small for larger writes (DataLenHigh is used with
+        # CAP_LARGE_WRITEX), so the data is taken from the end of the message: the NetBIOS
+        # layer's LENGTH attribute contains the SMB layer total size. It never goes beyond
+        # what the client declared or sent.
+        declared = (self.DataLenHigh << 16) | self.DataLenLow
+        available = self.underlayer.underlayer.LENGTH - self.DataOffset
+        return max(0, min(declared, available))
 
     def lengthfrom_Pad(self):
         x = 3 * 1
@@ -1144,7 +1185,7 @@ class SMB_Write_Request(Packet):
         ByteField("WordCount",6),
         XLEShortField("FID",0),
         XLEShortField("CountOfBytesToWrite",0),
-        XIntField("WriteOffsetInBytes",0),
+        XLEIntField("WriteOffsetInBytes",0),
         XLEShortField("EstimateOfRemainingBytesToBeWritten",0),
         LEShortField("ByteCount",0),
         ByteField("BufferFormat",0x01),
@@ -1746,7 +1787,9 @@ bind_bottom_up(SMB_Header, SMB_Trans_Request,
                Command=lambda x: x==0x25, Flags=lambda x: not x&0x80)
 bind_bottom_up(SMB_Header, SMB_Trans2_Request,
                Command=lambda x: x==0x32, Flags=lambda x: not x&0x80)
-bind_bottom_up(SMB_Header, SMB_Trans2_Secondary_Request, Command=lambda x: x==0x33, Flags=lambda x: not x&0x80)
+# The request SMB_COM_TRANSACTION2_SECONDARY is not bound to SMB_Trans2_Secondary_Request: that class is a
+# fixed layout of 21 bytes before the data and raises on any shorter request. Like the other *_SECONDARY
+# commands it is read as SMB_Parameters and SMB_Data, which follow the word and byte counts.
 
 bind_bottom_up(SMB_Header, SMB_Write_AndX_Request,
                Command=lambda x: x==0x2f, Flags=lambda x: not x&0x80)

@@ -1,0 +1,32 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: dionaea
+Upstream-Contact: https://github.com/t3chn0m4g3/dionaea
+Source: https://github.com/t3chn0m4g3/dionaea
+
+# third_party/libemu is buffer/libemu bf443cb with local fixes and synthetic PE images, which does not
+# carry SPDX tags. Files with their own SPDX tags (CMakeLists.txt and config.h
+# written for dionaea) keep them.
+
+Files: third_party/libemu/*
+Copyright: 2007-2010 Paul Baecher & Markus Koetter
+           2011-2024 libemu contributors
+License: GPL-2.0-or-later
+Comment: libemu, the shellcode detection and emulation library of the emu
+ module. The file headers say: GNU General Public License, version 2 or (at
+ your option) any later version.
+
+# libdasm 1.4 (jt / nologin.org), bundled in libemu. Public domain per its
+# README (section 6, libdasm-1.4/1.5 tarballs); not the BSD-2-Clause of libdasm 1.6.
+Files: third_party/libemu/src/libdasm.c third_party/libemu/src/libdasm.h third_party/libemu/src/opcode_tables.h
+Copyright: 2004-2006 jt / nologin.org
+License: LicenseRef-PublicDomain-libdasm
+
+# Debian packaging of libemu from 2010 ("GPL version 3"). Not used by the build.
+Files: third_party/libemu/debian/*
+Copyright: 2010 Markus Koetter
+License: GPL-3.0-only
+
+# Recorded log format of the release before (JSON cannot carry a header).
+Files: tests/functional/fixtures/*.json
+Copyright: none
+License: CC0-1.0

@@ -1,0 +1,16 @@
+# This file is part of the dionaea honeypot
+#
+# SPDX-FileCopyrightText: none
+#
+# SPDX-License-Identifier: CC0-1.0
+#
+# The packages of the client image. lock.sh makes requirements.txt (and requirements-build.txt,
+# setuptools to build pyftpdlib, the one package without a wheel) from this file:
+#   uv pip compile --universal --generate-hashes --python-version 3.14 --no-header --no-annotate \
+#     --exclude-newer 2026-10-11T00:00:00Z requirements.in
+# with the header of the file in front.
+pytest==9.1.1
+impacket==0.13.1
+PyMySQL==1.2.3
+pyftpdlib==2.2.0
+paho-mqtt==2.1.0

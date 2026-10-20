@@ -4,6 +4,7 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+from dionaea.upload import DEFAULT_MAX_UPLOAD_SIZE, parse_max_upload_size
 from . import rpcservices
 from .smb import smblog
 
@@ -29,6 +30,7 @@ class SmbConfig(object):
         self.server_name = "HOMEUSER-3AF6FE"
         self.shares = {}
         self.port = 445
+        self.max_upload_size = DEFAULT_MAX_UPLOAD_SIZE
 
         default_shares = {
             "ADMIN$" : {
@@ -68,6 +70,8 @@ class SmbConfig(object):
                 continue
             smblog.debug("Set '%s' to '%s'" % (name, value))
             setattr(self, name, value)
+
+        self.max_upload_size = parse_max_upload_size(config.get("max_upload_size"))
 
         shares = config.get("shares")
         if shares is None:

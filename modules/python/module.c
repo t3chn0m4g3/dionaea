@@ -9,11 +9,14 @@
 #include "config.h"
 
 #include <Python.h>
+#include <frameobject.h> // PyFrame_GetCode, PyFrame_GetLineNumber
+#include <errcode.h> // E_EOF, not part of Python.h
 #include <glib.h>
 #include <stdio.h>
 #include <ev.h>
 #include <stdint.h>
 #include <unistd.h>
+#include <signal.h> // sigaction
 #include <dirent.h>
 #include <stddef.h>
 
@@ -79,8 +82,8 @@ static struct python_runtime
 	struct ihandler *mkshell_ihandler;
 	struct
 	{
-		PyObject *module;
-		PyObject *export_tb;
+		PyObject *linecache;
+		PyObject *getline;
 	}traceback;
 
 	struct
@@ -110,15 +113,32 @@ static bool config(void)
 	return true;
 }
 
+/*
+ * Interactive Python shell on a terminal on stdin (docker run -t -i).
+ * The event loop runs without the GIL (start() releases it), so take it.
+ * On EOF (^D) or a terminal that went away (EIO, hangup) stdin stays
+ * readable for ever: stop the watcher, else this callback would spin.
+ */
 void python_io_in_cb(EV_P_ struct ev_io *w, int revents)
 {
 	PyCompilerFlags cf;
 	cf.cf_flags = 0;
 
-	tcsetattr(0, TCSANOW, &runtime.read_termios);
-	PyRun_InteractiveOneFlags(runtime.stdIN, "<stdin>", &cf);
+	PyGILState_STATE gil_state = PyGILState_Ensure();
+	tcsetattr(STDIN_FILENO, TCSANOW, &runtime.read_termios);
+	int ret = PyRun_InteractiveOneFlags(runtime.stdIN, "<stdin>", &cf);
 	traceback();
-	tcsetattr(0, TCSANOW, &runtime.poll_termios);
+	bool closed = ret == E_EOF || feof(runtime.stdIN) || ferror(runtime.stdIN);
+	PyGILState_Release(gil_state);
+
+	if( closed )
+	{
+		g_info("stdin closed, stopping the interactive Python shell");
+		ev_io_stop(EV_A_ w);
+		clearerr(runtime.stdIN);
+		return;
+	}
+	tcsetattr(STDIN_FILENO, TCSANOW, &runtime.poll_termios);
 }
 
 static void python_mkshell_ihandler_cb(struct incident *i, void *ctx)
@@ -253,12 +273,57 @@ static bool hupy(void)
 	return true;
 }
 
+/*
+ * The event loop ended, dionaea waits for the threadpool next: the imports
+ * with a flush() (dionaea.ihandlers: the commits of log_sqlite) write what
+ * they buffer, so a stop timeout during that wait loses nothing of it.
+ * stop() in freepy() follows as before.
+ */
+static bool flushpy(void)
+{
+	g_debug("%s %s", __PRETTY_FUNCTION__, __FILE__);
+	PyGILState_STATE gil_state = PyGILState_Ensure();
+
+	GHashTableIter iter;
+	gpointer key, value;
+	g_hash_table_iter_init (&iter, runtime.imports);
+	while( g_hash_table_iter_next (&iter, &key, &value) )
+	{
+		struct import *imp = value;
+		PyObject *func = PyObject_GetAttrString(imp->module, "flush");
+		if( func != NULL )
+		{
+			g_info("flush %s", (char *)key);
+			PyObject *arglist = Py_BuildValue("()");
+			PyObject *r = PyObject_CallObject(func, arglist);
+			Py_DECREF(arglist);
+			Py_XDECREF(r);
+			Py_DECREF(func);
+		} else
+			PyErr_Clear();
+		traceback();
+	}
+
+	PyGILState_Release(gil_state);
+	return true;
+}
+
 static bool freepy(void)
 {
 	g_debug("%s %s", __PRETTY_FUNCTION__, __FILE__);
-	ev_io_stop(g_dionaea->loop, &runtime.python_cli_io_in);
-	if( isatty(STDOUT_FILENO) )
-		tcsetattr(0, TCSADRAIN, &runtime.read_termios);
+	if( runtime.stdIN != NULL )
+	{
+		ev_io_stop(g_dionaea->loop, &runtime.python_cli_io_in);
+		tcsetattr(STDIN_FILENO, TCSADRAIN, &runtime.read_termios);
+	}
+
+	/*
+	 * The event loop ran without the GIL (start() released it): take it
+	 * back before calling into Python, a Python thread of a module may
+	 * still run. Py_Finalize() wants it held and ends it, so it is not
+	 * released.
+	 */
+	PyGILState_Ensure();
 
 	GHashTableIter iter;
 	gpointer key, value;
@@ -326,22 +391,50 @@ static bool new(struct dionaea *dionaea)
 //	g_warning("PyImport_AppendInittab %i", v);
 
 	g_debug("Python Interpreter %s", PYTHON_PATH);
-	size_t pybinsize = mbstowcs(NULL, PYTHON_PATH, 0);
-	wchar_t *pybin = g_malloc0((pybinsize + 1) * sizeof(wchar_t));
-	mbstowcs(pybin, PYTHON_PATH, pybinsize + 1);
-	Py_SetProgramName(pybin);
 
-	Py_Initialize();
-	PyEval_InitThreads();
+	/*
+	 * Py_SetProgramName and PyEval_InitThreads are deprecated (removal
+	 * planned for Python 3.15); the GIL exists from the start since 3.7.
+	 * Keep what Py_Initialize() did: no C locale coercion and no UTF-8
+	 * mode, the PyConfig defaults would turn on both in the C locale of
+	 * the container (process wide LC_CTYPE=C.UTF-8).
+	 */
+	/* Python installs its own handler of SIGINT (KeyboardInterrupt); the one dionaea had
+	 * before (its event loop, installed before the modules) is put back below */
+	struct sigaction sigint_before;
+	sigaction(SIGINT, NULL, &sigint_before);
+
+	PyStatus status;
+	PyPreConfig preconfig;
+	PyPreConfig_InitPythonConfig(&preconfig);
+	preconfig.coerce_c_locale = 0;
+	preconfig.utf8_mode = 0;
+	status = Py_PreInitialize(&preconfig);
+	if( PyStatus_Exception(status) )
+		g_error("Could not pre-initialize Python: %s", status.err_msg ? status.err_msg : "unknown error");
+
+	PyConfig pyconfig;
+	PyConfig_InitPythonConfig(&pyconfig);
+	// as the compat config of Py_Initialize(): leave the C stdio streams
+	// alone, do not parse a command line
+	pyconfig.configure_c_stdio = 0;
+	pyconfig.parse_argv = 0;
+	status = PyConfig_SetBytesString(&pyconfig, &pyconfig.program_name, PYTHON_PATH);
+	if( !PyStatus_Exception(status) )
+		status = Py_InitializeFromConfig(&pyconfig);
+	PyConfig_Clear(&pyconfig);
+	if( PyStatus_Exception(status) )
+		g_error("Could not initialize Python: %s", status.err_msg ? status.err_msg : "unknown error");
 
 	PyGILState_STATE gil_state = PyGILState_Ensure();
 
 	runtime.sys_path = g_string_new(DIONAEA_PYTHON_SITELIBDIR);
 
-	PyObject *name = PyUnicode_FromString("traceback");
-	runtime.traceback.module = PyImport_Import(name);
-	Py_DECREF(name);
-	runtime.traceback.export_tb = PyObject_GetAttrString(runtime.traceback.module, "extract_tb");
+	runtime.traceback.linecache = PyImport_ImportModule("linecache");
+	if( runtime.traceback.linecache != NULL )
+		runtime.traceback.getline = PyObject_GetAttrString(runtime.traceback.linecache, "getline");
+	if( runtime.traceback.getline == NULL )
+		PyErr_Clear();
 
 	PyRun_SimpleString("import sys");
 	char relpath[1024];
@@ -400,9 +493,9 @@ static bool new(struct dionaea *dionaea)
 		//free(name);
 	}
 
-	signal(SIGINT, SIG_DFL);
+	sigaction(SIGINT, &sigint_before, NULL);
 
-	if( isatty(STDOUT_FILENO) )
+	if( isatty(STDIN_FILENO) )
 	{
 		g_debug("Interactive Python shell");
 		runtime.stdIN = fdopen(STDIN_FILENO, "r");
@@ -719,6 +812,10 @@ PyObject *pylcfgx_tree(struct lcfgx_tree_node *node)
 }
 */
 
+/*
+ * The values of g_dionaea->config as Python objects. Each returns a new
+ * reference (None for a missing key) and frees what GLib returned.
+ */
 PyObject *py_config_string(gchar *group, gchar *key)
 {
 	gchar *value;
@@ -726,8 +823,16 @@ PyObject *py_config_string(gchar *group, gchar *key)
 	PyObject *obj_value;
 
 	value = g_key_file_get_string(g_dionaea->config, group, key, &error);
+	g_clear_error(&error);
+	if (value == NULL) {
+		Py_RETURN_NONE;
+	}
 	obj_value = PyUnicode_FromString(value);
-
+	g_free(value);
+	if (obj_value == NULL) {
+		PyErr_Clear();
+		Py_RETURN_NONE;
+	}
 	return obj_value;
 }
 
@@ -741,46 +846,129 @@ PyObject *py_config_string_list(gchar *group, gchar *key)
 	values = g_key_file_get_string_list(g_dionaea->config, group, key, &num, &error);
 	g_clear_error(&error);
 	if (values == NULL) {
-		return Py_None;
+		Py_RETURN_NONE;
 	}
-	PyGILState_STATE gil_state = PyGILState_Ensure();
 	obj_values = PyList_New(0);
+	if (obj_values == NULL) {
+		g_strfreev(values);
+		PyErr_Clear();
+		Py_RETURN_NONE;
+	}
 
 	for(value = values; *value; value++) {
 		obj_value = PyUnicode_FromString(*value);
+		if (obj_value == NULL) {
+			PyErr_Clear();
+			continue;
+		}
 		PyList_Append(obj_values, obj_value);
 		Py_DECREF(obj_value);
 	}
-	PyGILState_Release(gil_state);
+	g_strfreev(values);
 	return obj_values;
 }
 
+/* dict[key] = value, and the reference of value is given up (SetItem takes its own) */
+static void py_dict_set_new(PyObject *dict, const char *key, PyObject *value)
+{
+	PyDict_SetItemString(dict, key, value);
+	Py_DECREF(value);
+}
+
+/*
+ * g_dionaea.config(): called for every upload, download and many requests.
+ * PyDict_SetItemString does not steal the reference, so each value is released here.
+ */
 PyObject *py_config(PyObject *self, PyObject *args)
 {
-	PyObject *obj, *obj2, *obj_value = NULL;
+	PyObject *obj, *obj2;
 
 	obj = PyDict_New();
 	obj2 = PyDict_New();
-	obj_value = py_config_string("dionaea", "listen.mode");
-	PyDict_SetItemString(obj2, "listen.mode", obj_value);
-	obj_value = py_config_string_list("dionaea", "listen.interfaces");
-	PyDict_SetItemString(obj2, "listen.interfaces", obj_value);
-	obj_value = py_config_string_list("dionaea", "listen.addresses");
-	PyDict_SetItemString(obj2, "listen.addresses", obj_value);
-	obj_value = py_config_string("dionaea", "download.dir");
-	PyDict_SetItemString(obj2, "download.dir", obj_value);
-
-	PyDict_SetItemString(obj, "dionaea", obj2);
+	py_dict_set_new(obj2, "listen.mode", py_config_string("dionaea", "listen.mode"));
+	py_dict_set_new(obj2, "listen.interfaces", py_config_string_list("dionaea", "listen.interfaces"));
+	py_dict_set_new(obj2, "listen.addresses", py_config_string_list("dionaea", "listen.addresses"));
+	py_dict_set_new(obj2, "download.dir", py_config_string("dionaea", "download.dir"));
+	py_dict_set_new(obj, "dionaea", obj2);
 
 	obj2 = PyDict_New();
-	obj_value = py_config_string_list("module.python", "ihandler_configs");
-	PyDict_SetItemString(obj2, "ihandler_configs", obj_value);
-	obj_value = py_config_string_list("module.python", "service_configs");
-	PyDict_SetItemString(obj2, "service_configs", obj_value);
-
-	PyDict_SetItemString(obj, "module", obj2);
+	py_dict_set_new(obj2, "ihandler_configs", py_config_string_list("module.python", "ihandler_configs"));
+	py_dict_set_new(obj2, "service_configs", py_config_string_list("module.python", "service_configs"));
+	py_dict_set_new(obj, "module", obj2);
 
 	return obj;
+}
+
+/*
+ * Timers of the event loop for Python (dionaea.core.timer).
+ *
+ * The callable runs in the thread of the loop with the GIL, so it may use what
+ * the callbacks of the connections use (sqlite handles, connections). The timer
+ * holds a reference of the callable; py_timer_free() gives it up. A timer that
+ * ran out (no repeat) gives it up itself, so its Python object can go. The
+ * callable may stop its own timer: it is freed when the callable returns.
+ */
+struct py_timer
+{
+	struct ev_timer timer;
+	PyObject *callback;
+	bool running;
+	bool freed;
+};
+
+static void py_timer_cb(struct ev_loop *loop, struct ev_timer *w, int revents)
+{
+	struct py_timer *t = (struct py_timer *)w;
+	PyGILState_STATE gil_state = PyGILState_Ensure();
+
+	t->running = true;
+	if( t->callback != NULL )
+	{
+		PyObject *r = PyObject_CallNoArgs(t->callback);
+		if( r == NULL )
+			traceback();
+		Py_XDECREF(r);
+	}
+	t->running = false;
+
+	if( t->freed )
+	{
+		Py_CLEAR(t->callback);
+		g_free(t);
+	} else
+	if( !ev_is_active(&t->timer) && t->callback != NULL )
+	{
+		/* last thing done with t: the release may free the timer */
+		PyObject *callback = t->callback;
+		t->callback = NULL;
+		Py_DECREF(callback);
+	}
+	PyGILState_Release(gil_state);
+}
+
+struct py_timer *py_timer_new(PyObject *callback, double after, double repeat)
+{
+	struct py_timer *t = g_malloc0(sizeof(struct py_timer));
+	Py_INCREF(callback);
+	t->callback = callback;
+	ev_timer_init(&t->timer, py_timer_cb, after < 0. ? 0. : after, repeat < 0. ? 0. : repeat);
+	ev_timer_start(g_dionaea->loop, &t->timer);
+	return t;
+}
+
+void py_timer_free(struct py_timer *t)
+{
+	if( t == NULL )
+		return;
+	if( g_dionaea != NULL && g_dionaea->loop != NULL )
+		ev_timer_stop(g_dionaea->loop, &t->timer);
+	if( t->running )
+	{
+		t->freed = true;
+		return;
+	}
+	Py_CLEAR(t->callback);
+	g_free(t);
 }
 
 /**
@@ -1043,38 +1231,86 @@ void traceback(void)
 
 	if( traceback == NULL )
 	{
+		Py_XDECREF(type);
+		Py_XDECREF(value);
 		PyGILState_Release(gil_state);
 		g_warning("traceback is NULL, good luck!");
 		return;
 	}
 
-	PyObject *args = PyTuple_Pack(1, traceback);
-	PyObject *res = PyObject_CallObject(runtime.traceback.export_tb, args);
-
-	if( res && PyList_Check(res) )
+	/*
+	 * Walk the traceback objects (tb_frame, tb_lineno, tb_next) and log
+	 * the innermost frame first, as before. traceback.extract_tb() returns
+	 * FrameSummary objects, not tuples, so they must not be read with
+	 * PyTuple_GET_ITEM.
+	 */
+	GPtrArray *lines = g_ptr_array_new_with_free_func(g_free);
+	PyObject *tb = traceback;
+	Py_INCREF(tb);
+	while( tb != NULL && tb != Py_None && lines->len < 2 * 256 )
 	{
-		size_t k;
-		for( k = PyList_GET_SIZE(res); k; --k )
+		PyObject *frame = PyObject_GetAttrString(tb, "tb_frame");
+		if( frame == NULL || !PyFrame_Check(frame) )
 		{
-			PyObject *tuple = PyList_GET_ITEM(res, k-1);
-			char *filename = pyobjectstring(PyTuple_GET_ITEM(tuple, 0));
-			char *line_no = pyobjectstring(PyTuple_GET_ITEM(tuple, 1));
-			char *function_name = pyobjectstring(PyTuple_GET_ITEM(tuple, 2));
-			char *text = pyobjectstring(PyTuple_GET_ITEM(tuple, 3));
-//			g_warning(" %s:%s in %s \n\t %s", filename, line_no, function_name, text);
-			g_warning("%s:%s in %s", filename, line_no, function_name);
-			g_warning("\t %s", text);
-
-			g_free(filename);
-			g_free(line_no);
-			g_free(function_name);
-			g_free(text);
-
+			Py_XDECREF(frame);
+			PyErr_Clear();
+			break;
 		}
-	}
 
-	Py_XDECREF(res);
-	Py_XDECREF(args);
+		int line_no = -1;
+		PyObject *tb_lineno = PyObject_GetAttrString(tb, "tb_lineno");
+		if( tb_lineno != NULL && PyLong_Check(tb_lineno) )
+			line_no = (int)PyLong_AsLong(tb_lineno);
+		Py_XDECREF(tb_lineno);
+		PyErr_Clear();
+		if( line_no < 0 )
+			line_no = PyFrame_GetLineNumber((PyFrameObject *)frame);
+
+		PyCodeObject *code = PyFrame_GetCode((PyFrameObject *)frame);
+		PyObject *filename = PyObject_GetAttrString((PyObject *)code, "co_filename");
+		PyObject *function_name = PyObject_GetAttrString((PyObject *)code, "co_name");
+		PyErr_Clear();
+
+		char *filename_string = pyobjectstring(filename);
+		char *function_string = pyobjectstring(function_name);
+		char *text = NULL;
+		if( runtime.traceback.getline != NULL && filename != NULL )
+		{
+			PyObject *line = PyObject_CallFunction(runtime.traceback.getline, "Oi", filename, line_no);
+			if( line != NULL && PyUnicode_Check(line) )
+			{
+				const char *utf8 = PyUnicode_AsUTF8(line);
+				if( utf8 != NULL )
+					text = g_strstrip(g_strdup(utf8));
+			}
+			Py_XDECREF(line);
+			PyErr_Clear();
+		}
+
+		g_ptr_array_add(lines, g_strdup_printf("%s:%i in %s", filename_string, line_no, function_string));
+		g_ptr_array_add(lines, g_strdup_printf("\t %s", text != NULL ? text : ""));
+
+		g_free(filename_string);
+		g_free(function_string);
+		g_free(text);
+		Py_XDECREF(filename);
+		Py_XDECREF(function_name);
+		Py_DECREF(code);
+		Py_DECREF(frame);
+
+		PyObject *next = PyObject_GetAttrString(tb, "tb_next");
+		PyErr_Clear();
+		Py_DECREF(tb);
+		tb = next;
+	}
+	Py_XDECREF(tb);
+
+	for( guint k = lines->len; k >= 2; k -= 2 )
+	{
+		g_warning("%s", (char *)g_ptr_array_index(lines, k-2));
+		g_warning("%s", (char *)g_ptr_array_index(lines, k-1));
+	}
+	g_ptr_array_free(lines, TRUE);
 
 	Py_XDECREF(type);
 	Py_XDECREF(value);
@@ -1091,7 +1327,8 @@ struct module_api *module_init(struct dionaea *dionaea)
 		.start = &start,
 		.new = &new,
 		.free = &freepy,
-		.hup = &hupy
+		.hup = &hupy,
+		.flush = &flushpy
 	};
 	return &python_api;
 }

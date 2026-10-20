@@ -31,6 +31,7 @@ List of available ihandlers
 .. toctree::
     :maxdepth: 2
 
+    download_policy
     emuprofile
     fail2ban
     ftp

@@ -15,6 +15,14 @@ please refer to the ``pjl_default_responses`` `dictionary
 <https://github.com/DinoTools/dionaea/blob/feature/printer/modules/python/dionaea/printer.py>`_
 for all available messages.
 
+Print jobs
+----------
+
+A PCL print job is stored as a sample (see :doc:`../ihandler/store`) when the
+client disconnects. A job is bound to 32 MiB: from the read that would cross it on,
+the data is read and thrown away, what came before (at most 32 MiB) is stored as a truncated sample (its md5 is not
+that of the whole job) and ``print job from <address> is cut`` is logged once.
+
 Example config
 --------------
 

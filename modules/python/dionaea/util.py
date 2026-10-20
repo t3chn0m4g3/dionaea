@@ -74,6 +74,9 @@ def detect_shellshock(connection, data, report_incidents=True):
     :return: List of urls or None
     """
     from dionaea.core import incident
+    if isinstance(data, bytes):
+        # e.g. the header values of the HTTP service
+        data = data.decode("utf-8", errors="replace")
     regex = re.compile(r"\(\)\s*\t*\{.*;\s*\}\s*;")
     if not regex.search(data):
         return None
@@ -105,6 +108,9 @@ def find_shell_download(connection, data, report_incidents=True):
     :return: List of urls or None
     """
     from dionaea.core import incident
+    if isinstance(data, bytes):
+        # e.g. the data of the SOAP tags of the HTTP service
+        data = data.decode("utf-8", errors="replace")
     urls = []
     regex = re.compile(
         r"(wget|curl).+(?P<url>(http|ftp|https)://([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])?)"

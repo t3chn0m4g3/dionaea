@@ -1,0 +1,10 @@
+libdasm 1.4 by jt / nologin.org, README.txt, section 6 (the same sentence in the
+libdasm-1.4 and libdasm-1.5 tarballs, which have no other licence file):
+
+    libdasm is public domain software. You can do whatever you like with it.
+
+The tarballs: https://web.archive.org/web/20060718012748/http://www.klake.org/~jt/misc/libdasm-1.4.tar.gz
+and https://web.archive.org/web/20120119123445/http://www.klake.org/~jt/misc/libdasm-1.5.tar.gz
+
+The 2-clause BSD licence of the later libdasm 1.6 (github.com/jtpereyda/libdasm) does not
+apply to this copy.

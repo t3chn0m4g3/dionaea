@@ -14,6 +14,7 @@
 
 #include "dionaea.h"
 #include "threads.h"
+#include "bistream.h"
 #include "log.h"
 #include "incident.h"
 #include "connection.h"
@@ -21,9 +22,63 @@
 #define D_LOG_DOMAIN "thread"
 
 
+/*
+ * Admission to the threadpool, shared by the processor jobs and the
+ * continuations of the emulation. A job counts as waiting from its submission
+ * until a worker starts it. admission_mutex is a leaf lock apart from the
+ * pool's own queue lock, taken inside it by g_thread_pool_push().
+ */
+static GMutex admission_mutex;
+static struct thread_stats admission;
+
+bool thread_submit(struct thread *t)
+{
+	GError *error = NULL;
+	bool accepted = false;
+
+	g_mutex_lock(&admission_mutex);
+	if( admission.waiting < THREADS_MAX_WAITING )
+	{
+		admission.waiting++;
+		accepted = g_thread_pool_push(g_dionaea->threads->pool, t, &error);
+		if( accepted )
+			admission.peak_waiting = MAX(admission.peak_waiting, admission.waiting);
+		else
+			admission.waiting--;
+	}
+	if( !accepted )
+		admission.refused++;
+	g_mutex_unlock(&admission_mutex);
+
+	if( error != NULL )
+	{
+		g_debug("threadpool refused a job: %s", error->message);
+		g_clear_error(&error);
+	}
+	return accepted;
+}
+
+void thread_stats_get(struct thread_stats *stats)
+{
+	g_mutex_lock(&admission_mutex);
+	*stats = admission;
+	g_mutex_unlock(&admission_mutex);
+}
+
+int threads_pool_size(long cpus)
+{
+	return (int)CLAMP(cpus, 2, THREADS_MAX_WORKERS);
+}
+
 void threadpool_wrapper(gpointer data, gpointer user_data)
 {
 	struct thread *t = data;
+
+	g_mutex_lock(&admission_mutex);
+	g_assert(admission.waiting > 0);
+	admission.waiting--;
+	g_mutex_unlock(&admission_mutex);
+
 #ifdef DEBUG
 	GTimer *timer = g_timer_new();
 #endif
@@ -48,20 +103,21 @@ void trigger_cb(struct ev_loop *loop, struct ev_async *w, int revents)
 	g_async_queue_unref(aq);
 }
 
+/*
+ * Periodic report of a busy threadpool. It only reports, it never waits:
+ * the admission limit refuses jobs instead of suspending the eventloop.
+ */
 void surveillance_cb(struct ev_loop *loop, struct ev_periodic *w, int revents)
 {
-/*	g_debug("%s %i %i",
-			__PRETTY_FUNCTION__,
-			g_thread_pool_unprocessed(g_dionaea->threads->pool),
-			g_thread_pool_get_max_threads(g_dionaea->threads->pool));
-*/
-	while( g_thread_pool_unprocessed(g_dionaea->threads->pool) >
-		   g_thread_pool_get_max_threads(g_dionaea->threads->pool) )
+	struct thread_stats jobs;
+	struct bistream_stats streams;
+	thread_stats_get(&jobs);
+	bistream_stats_get(&streams);
+
+	if( jobs.waiting > (unsigned)g_thread_pool_get_max_threads(g_dionaea->threads->pool) )
 	{
-		g_critical("Threadpool is crowded %i/%i, suspending *all* activity",
-				   g_thread_pool_unprocessed(g_dionaea->threads->pool),
-				   g_thread_pool_get_max_threads(g_dionaea->threads->pool));
-		sleep(1);
+		g_info("Threadpool is busy: %u jobs waiting (limit %u), %zu bytes of stream data in %zu chunks",
+			   jobs.waiting, THREADS_MAX_WAITING, streams.bytes, streams.chunks);
 	}
 }
 

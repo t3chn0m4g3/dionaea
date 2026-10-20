@@ -4,7 +4,7 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 from urllib.parse import urlparse
@@ -80,6 +80,8 @@ class LogJsonHandler(ihandler):
         self.db_session = None
 
         self.attacks = {}
+        # Longest list of commands, downloads or credentials for one connection
+        self.max_list_entries = 1000
         self.handlers = []
         self.flat_data = config.get("flat_data", False)
         handlers = config.get("handlers")
@@ -99,11 +101,16 @@ class LogJsonHandler(ihandler):
         #        print("unknown")
         pass
 
-    def _append_credentials(self, icd):
+    def _append_credentials(self, icd, metadata=None):
         con = icd.con
         data = self.attacks.get(con)
         if not data:
             # ToDo: warning
+            return
+
+        # Keep the first entries; repeated logins must not grow the connection
+        # record indefinitely. Check before preparing attacker supplied values.
+        if len(data.get("credentials", [])) >= self.max_list_entries:
             return
 
         credentials = {
@@ -111,6 +118,8 @@ class LogJsonHandler(ihandler):
             "username": self._prepare_value(icd.username)
         }
 
+        if metadata:
+            credentials.update(metadata)
         if "credentials" not in data:
             data["credentials"] = []
         data["credentials"].append(credentials)
@@ -119,7 +128,9 @@ class LogJsonHandler(ihandler):
         # Add more if needed
         for k in [
             "credentials",
-            "ftp.commands"
+            "downloads",
+            "ftp.commands",
+            "smb.commands",
         ]:
             d = None
             d2 = data
@@ -176,7 +187,7 @@ class LogJsonHandler(ihandler):
             "src_hostname": self._prepare_value(con.remote.hostname),
             "src_ip": con.remote.host,
             "src_port": con.remote.port,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         }
         self.attacks[con] = data
 
@@ -231,7 +242,7 @@ class LogJsonHandler(ihandler):
                     handler.submit(data)
             del self.attacks[con]
         else:
-            logger.warn("no attack data for %s:%s" % (con.local.host, con.local.port))
+            logger.debug("no attack data for %s:%s" % (con.local.host, con.local.port))
 
     def handle_incident_dionaea_modules_python_ftp_command(self, icd):
         con = icd.con
@@ -249,6 +260,33 @@ class LogJsonHandler(ihandler):
             "command": self._prepare_value(icd.command),
             "arguments": self._prepare_value(icd.arguments)
         })
+
+    def handle_incident_dionaea_modules_python_smb_command(self, icd):
+        con = icd.con
+        data = self.attacks.get(con)
+        if not data:
+            return
+
+        if "smb" not in data:
+            data["smb"] = {}
+        if "commands" not in data["smb"]:
+            data["smb"]["commands"] = []
+
+        # A client can send commands as long as it likes, the entry of the connection must not grow without limit
+        if len(data["smb"]["commands"]) >= self.max_list_entries:
+            return
+
+        data["smb"]["commands"].append({
+            "command": self._prepare_value(icd.command),
+        })
+
+    def handle_incident_dionaea_modules_python_smb_login(self, icd):
+        metadata = {name: self._prepare_value(getattr(icd, name))
+                    for name in ("domain", "workstation", "dialect", "ntlm_version")}
+        self._append_credentials(icd, metadata)
+        data = self.attacks.get(icd.con)
+        if data:
+            data.setdefault("smb", {}).update(metadata)
 
     def handle_incident_dionaea_modules_python_ftp_login(self, icd):
         self._append_credentials(icd)
@@ -273,3 +311,24 @@ class LogJsonHandler(ihandler):
                 "tos": icd.tos,
                 "uptime": icd.uptime
             }
+
+    def handle_incident_dionaea_download_complete_hash(self, icd):
+        """Add the hashes of a file that was downloaded from or uploaded by the client of the connection."""
+        con = getattr(icd, "con", None)
+        if con is None:
+            return
+        data = self.attacks.get(con)
+        if not data:
+            return
+
+        if "downloads" not in data:
+            data["downloads"] = []
+        if len(data["downloads"]) >= self.max_list_entries:
+            return
+
+        data["downloads"].append({
+            "path": self._prepare_value(icd.file),
+            "url": self._prepare_value(icd.url),
+            "md5": self._prepare_value(icd.md5hash),
+            "sha256": self._prepare_value(getattr(icd, "sha256hash", None))
+        })

@@ -343,11 +343,12 @@ class MySQL_Result_Field(Packet):
     name="MySQL Result Field"
     fields_desc = [
         LengthCodedBinaryField("Catalog",None),
-        LengthCodedBinaryField("Database",None),
-        LengthCodedBinaryField("Table",None),
-        LengthCodedBinaryField("ORGTable",None),
+        # empty strings, not NULL: a client that decodes them (PyMySQL) fails on NULL
+        LengthCodedBinaryField("Database",b""),
+        LengthCodedBinaryField("Table",b""),
+        LengthCodedBinaryField("ORGTable",b""),
         LengthCodedBinaryField("Name",None),
-        LengthCodedBinaryField("ORGName",None),
+        LengthCodedBinaryField("ORGName",b""),
         ByteField("Filler", 0xc),
         LEShortField("CharSet", 0),
         LEIntField("Length", 0),

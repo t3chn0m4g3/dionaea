@@ -60,4 +60,4 @@ class s3handler(ihandler):
             logger.info("File (MD5) uploaded to S3 bucket: {0}".format(icd.md5hash))
 
         except Exception as e:
-            logger.warn("S3 exception: {0}".format(e))
+            logger.warning("S3 exception: {0}".format(e))

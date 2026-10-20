@@ -6,3 +6,5 @@
     root: "@DIONAEA_STATEDIR@/ftp/root"
     response_messages:
       welcome_msg: 220 DiskStation FTP server ready.
+    # Largest file a client can upload in bytes, a larger upload is dropped (default: 32 MiB)
+#    max_upload_size: 33554432

@@ -42,6 +42,7 @@ static bool emu_new(struct dionaea *d)
 static bool emu_free(void)
 {
 	g_debug("%s", __PRETTY_FUNCTION__);
+	emu_trim_stop();
 	return true;
 }
 

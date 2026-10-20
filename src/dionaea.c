@@ -49,6 +49,7 @@
 #include "incident.h"
 #include "threads.h"
 #include "processor.h"
+#include "util.h"
 
 void show_version(struct version *);
 void show_help(bool defaults);
@@ -658,6 +659,39 @@ opt->stdOUT.filter);
 	// maybe a little late, but want to avoid having dups of the fd in the child
 	g_log_set_default_handler(log_multiplexer, NULL);
 
+	/* signals: before any module binds a port. dionaea is PID 1 of its container in T-Pot,
+	 * where a signal without a handler is ignored, so a stop right after the start would
+	 * wait for the stop timeout. A signal that comes before the event loop runs is handled
+	 * by its first iteration. After the fork of the privileged child, which keeps the
+	 * default handlers. */
+	g_info("Installing signal handlers");
+	// signals
+	d->signals = g_malloc0(sizeof(struct signals));
+	ev_signal_init(&d->signals->sigint,  sigint_cb, SIGINT);
+	ev_signal_start(d->loop, &d->signals->sigint);
+
+	ev_signal_init(&d->signals->sigterm,  sigterm_cb, SIGTERM);
+	ev_signal_start(d->loop, &d->signals->sigterm);
+
+	ev_signal_init(&d->signals->sighup,  sighup_cb, SIGHUP);
+	ev_signal_start(d->loop, &d->signals->sighup);
+	signal(SIGSEGV, sigsegv_backtrace_cb);
+
+	/*
+	 * SIGPIPE
+	 *
+	 * Preventing the signal is hard.
+	 * From what I know, sigpipe can be raised issued by write/send
+	 * read/write, maybe even accept?, I do not know.
+	 *
+	 * Linux provides send(MSG_NOSIGNAL),
+	 * Freebsd requires a setsockopt(SO_NOSIGPIPE)
+	 * some documentation list MSG_NOSIGNAL as flag for recv too
+	 * Therefore, to make things easy, we simply ignore SIGPIPE
+	 * Given the alternatives I consider ignoring the best option
+	 */
+	signal(SIGPIPE, SIG_IGN);
+
 	modules_new();
 
 	// processors continued, create tree
@@ -694,7 +728,7 @@ opt->stdOUT.filter);
 	if( opt->root != NULL )
 	{
 		/* change working dir to the new root directory and chroot */
-		if ( chdir(opt->root) != 0 && chroot(opt->root) != 0 )
+		if ( chdir(opt->root) != 0 || chroot(opt->root) != 0 )
 		{
 			g_error("Could not chroot(\"%s\") (%s)", opt->root, strerror(errno));
 		} else
@@ -768,36 +802,15 @@ opt->stdOUT.filter);
 
 	options_free(opt);
 
+	// the folder of the temporary files of samples (download.dir/.incoming) - after chroot & setuid, it is ours
+	{
+		gchar *download_dir = g_key_file_get_string(g_dionaea->config, "dionaea", "download.dir", NULL);
+		incoming_prepare(download_dir);
+		g_free(download_dir);
+	}
+
 	// start modules - after chroot & setuid
 	modules_start();
-
-	g_info("Installing signal handlers");
-	// signals
-	d->signals = g_malloc0(sizeof(struct signals));
-	ev_signal_init(&d->signals->sigint,  sigint_cb, SIGINT);
-	ev_signal_start(d->loop, &d->signals->sigint);
-
-	ev_signal_init(&d->signals->sigterm,  sigterm_cb, SIGTERM);
-	ev_signal_start(d->loop, &d->signals->sigterm);
-
-	ev_signal_init(&d->signals->sighup,  sighup_cb, SIGHUP);
-	ev_signal_start(d->loop, &d->signals->sighup);
-	signal(SIGSEGV, sigsegv_backtrace_cb);
-
-	/*
-	 * SIGPIPE
-	 *
-	 * Preventing the signal is hard.
-	 * From what I know, sigpipe can be raised issued by write/send
-	 * read/write, maybe even accept?, I do not know.
-	 *
-	 * Linux provides send(MSG_NOSIGNAL),
-	 * Freebsd requires a setsockopt(SO_NOSIGPIPE)
-	 * some documentation list MSG_NOSIGNAL as flag for recv too
-	 * Therefore, to make things easy, we simply ignore SIGPIPE
-	 * Given the alternatives I consider ignoring the best option
-	 */
-	signal(SIGPIPE, SIG_IGN);
 
 //	ev_signal_init(&d->signals->sigsegv,  sigsegv_cb, SIGSEGV);
 //	ev_signal_start(d->loop, &d->signals->sigsegv);
@@ -805,8 +818,7 @@ opt->stdOUT.filter);
 //	signal(SIGBUS, (sighandler_t) segv_handler);
 
 	// thread pool
-	int threads = sysconf(_SC_NPROCESSORS_ONLN);
-	threads = (threads <= 1?2:threads);
+	int threads = threads_pool_size(sysconf(_SC_NPROCESSORS_ONLN));
 	GError *thread_error = NULL;
 	g_message("Creating %i threads in pool", threads);
 	d->threads->pool = g_thread_pool_new(threadpool_wrapper, NULL, threads, TRUE, &thread_error);
@@ -825,11 +837,23 @@ opt->stdOUT.filter);
 	g_debug("looping");
 	ev_run(d->loop,0);
 
+	// what the modules buffer (the commits of log_sqlite) is written before the wait for the
+	// threadpool: a stop timeout (10 s in Docker) can kill dionaea during that wait
+	g_debug("modules flush");
+	modules_flush();
+
+	// jobs of the processors that wait for a worker are dropped, the running ones end
+	processors_jobs_drop(true);
+
 	// delete thread pool
 	g_debug("Closing thread pool (%i active threads, %i jobs in queue), be patient",
 			g_thread_pool_get_num_threads(g_dionaea->threads->pool),
 			g_thread_pool_unprocessed(g_dionaea->threads->pool));
 	g_thread_pool_free(d->threads->pool, FALSE, TRUE);
+
+	// the threads of the processors (streamdumper limits) end before the logs close
+	g_debug("processors shutdown");
+	processors_tree_shutdown(d->processors->tree);
 
 	// modules api.free
 	g_debug("modules free");

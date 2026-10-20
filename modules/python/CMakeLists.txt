@@ -4,7 +4,7 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-if (PYTHONINTERP_FOUND)
+if (Python3_Interpreter_FOUND)
     #set(SETUP_PY_IN "${CMAKE_CURRENT_SOURCE_DIR}/setup.py")
     set(SETUP_PY_IN "${CMAKE_CURRENT_SOURCE_DIR}/setup.py.in2")
     set(SETUP_PY    "${CMAKE_CURRENT_BINARY_DIR}/setup.py")
@@ -19,7 +19,7 @@ if (PYTHONINTERP_FOUND)
 
     add_custom_command(
         OUTPUT ${OUTPUT}
-        COMMAND ${PYTHON_EXECUTABLE} ${SETUP_PY} build
+        COMMAND ${Python3_EXECUTABLE} ${SETUP_PY} build
         COMMAND ${CMAKE_COMMAND} -E touch ${OUTPUT}
         DEPENDS ${DEPS}
         #WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -31,7 +31,20 @@ if (PYTHONINTERP_FOUND)
     )
 
     #install(CODE "execute_process(COMMAND ${PYTHON_EXECUTABLE} ${SETUP_PY} install --prefix=${CMAKE_INSTALL_PREFIX})")
-    install(CODE "execute_process(COMMAND ${PYTHON_EXECUTABLE} ${SETUP_PY} install --install-lib=\$ENV{DESTDIR}/${DIONAEA_PYTHON_SITELIBDIR})")
+    # setuptools deprecates "setup.py install" (SetuptoolsDeprecationWarning in the log of
+    # make install); it still works with the setuptools of Ubuntu 26.04. Its replacement is
+    # pip (pip install --no-deps --no-build-isolation --target ...), to be done before
+    # setuptools drops the command.
+    # A failed install of the python package must fail the build
+    install(CODE "
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} ${SETUP_PY} install --install-lib=\$ENV{DESTDIR}/${DIONAEA_PYTHON_SITELIBDIR}
+            RESULT_VARIABLE dionaea_python_install_result
+        )
+        if(NOT dionaea_python_install_result EQUAL 0)
+            message(FATAL_ERROR \"Installation of the dionaea python package failed (exit status: \${dionaea_python_install_result})\")
+        endif()
+    ")
 endif()
 
 add_library(
@@ -50,6 +63,14 @@ target_sources(
         module.c
 )
 
+# The embedding code must not use C API that is deprecated (Python 3.15
+# removes Py_SetProgramName, PyEval_InitThreads & co).
+set_source_files_properties(
+    module.c
+    PROPERTIES
+        COMPILE_OPTIONS "-Werror=deprecated-declarations"
+)
+
 target_include_directories(
     module_python
     PRIVATE
@@ -58,15 +79,14 @@ target_include_directories(
         ../../
         ${GLIB2_INCLUDE_DIRS}
         ${GMODULE2_INCLUDE_DIRS}
-        ${PYTHON_INCLUDE_DIR}
+        ${Python3_INCLUDE_DIRS}
         ${CMAKE_BINARY_DIR}
         #${CMAKE_CURRENT_BINARY_DIR}/../..
 )
 
 target_link_libraries(
     module_python
-    ${GLIB2_LIBRARY_DIRS}
-    ${PYTHON_LIBRARIES}
+    ${Python3_LIBRARIES}
     dionaea
 )
 
@@ -132,6 +152,7 @@ install_available_python_config(
     DESTINATION_DIR ihandlers-available
     FILES
         cmdshell.yaml
+        download_policy.yaml
         emuprofile.yaml
         emu_scripts.yaml
         fail2ban.yaml.in
@@ -156,6 +177,7 @@ install_enabled_python_config(
     SOURCE_REL_DIR ../ihandlers-available
     FILES
         cmdshell.yaml
+        download_policy.yaml
         emuprofile.yaml
         ftp.yaml
         log_sqlite.yaml

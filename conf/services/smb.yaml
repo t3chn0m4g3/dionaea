@@ -6,6 +6,9 @@
 
     ## Generic setting ##
 
+    # Largest file a client can write in bytes, a larger upload is dropped (default: 32 MiB)
+#    max_upload_size: 33554432
+
     # 1:"Windows XP Service Pack 0/1",
     # 2:"Windows XP Service Pack 2",
     # 3:"Windows XP Service Pack 3",

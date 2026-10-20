@@ -44,13 +44,26 @@
 #define RESTORE_ESP(env) emu_cpu_reg32_set(emu_cpu_get(env->emu),esp, ((struct emu_emulate_ctx *)(env)->userdata)->esp)
 
 
-#define CONTINUE_EMULATION(ctx) \
-do \
-{ \
-	GError *thread_error = NULL; \
-	struct thread *t = thread_new(NULL, (ctx), emulate_thread); \
-	g_thread_pool_push(g_dionaea->threads->pool, t, &thread_error); \
-} while (0)
+/*
+ * Queue the emulation again (from a callback of the eventloop). If the
+ * threadpool refuses the job, the emulation fails: its context is freed from
+ * the eventloop once the current callback is done with it.
+ */
+static void continue_emulation(struct emu_emulate_ctx *ctx)
+{
+	struct thread *t = thread_new(NULL, ctx, emulate_thread);
+	if( thread_submit(t) )
+		return;
+
+	g_free(t);
+	g_info("threadpool is full, the emulation is stopped");
+	ctx->state = failed;
+	GAsyncQueue *aq = g_async_queue_ref(g_dionaea->threads->cmds);
+	g_async_queue_push(aq, async_cmd_new(emulate_ctx_free, ctx));
+	g_async_queue_unref(aq);
+	ev_async_send(g_dionaea->loop, &g_dionaea->threads->trigger);
+}
+#define CONTINUE_EMULATION(ctx) continue_emulation(ctx)
 
 void dump_sockets(gpointer key, gpointer value, gpointer user_data)
 {
@@ -1154,6 +1167,13 @@ HANDLE CreateFile(
 	}
 
 	struct tempfile *tf = tempdownload_new("emu-");
+	if( tf == NULL )
+	{
+		/* no descriptor left or a full disk: INVALID_HANDLE_VALUE */
+		g_warning("Could not create a file for the emulation (CreateFile), the emulation stops");
+		ctx->state = failed;
+		return -1;
+	}
 	g_hash_table_insert(ctx->files, &tf->fd, tf);
 
 	return(uint32_t)tf->fd;
@@ -1432,6 +1452,13 @@ uint32_t user_hook__lcreat(struct emu_env *env, struct emu_env_hook *hook, ...)
 	}
 
 	struct tempfile *tf = tempdownload_new("emu-");
+	if( tf == NULL )
+	{
+		/* no descriptor left or a full disk: HFILE_ERROR */
+		g_warning("Could not create a file for the emulation (_lcreat), the emulation stops");
+		ctx->state = failed;
+		return -1;
+	}
 	g_hash_table_insert(ctx->files, &tf->fd, tf);
 
 	return(uint32_t)tf->fd;

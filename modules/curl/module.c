@@ -12,6 +12,7 @@
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 #include "config.h"
 #include "modules.h"
@@ -20,6 +21,8 @@
 
 #include "module.h"
 #include "incident.h"
+#include "download_log.h"
+#include "log_text.h"
 #include "log.h"
 #include "util.h"
 
@@ -56,6 +59,10 @@ struct session
 		{
 			struct tempfile *file;
 			struct connection *ctxcon;
+			/* the addresses of this hop (a response of a server starts a new one): the
+			 * download target filter refused one, one was attempted */
+			bool refused_seen;
+			bool allowed_seen;
 		}download;
 
 		struct
@@ -104,9 +111,9 @@ static void session_free(struct session *session)
 			tempfile_unlink(session->action.download.file);
 			tempfile_free(session->action.download.file);
 			session->action.download.file = NULL;
-			if( session->action.download.ctxcon != NULL )
-				connection_unref(session->action.download.ctxcon);
 		}
+		if( session->action.download.ctxcon != NULL )
+			connection_unref(session->action.download.ctxcon);
 		break;
 
 	case session_type_upload:
@@ -132,18 +139,73 @@ static void session_free(struct session *session)
 
 static void timer_cb(struct ev_loop *loop,  struct ev_timer *w, int revents);
 
+/*
+ * The end of a download. One that does not complete is logged by download_log.c: a
+ * target the download target filter refused (curl could not connect, and the filter
+ * refused every address of the last hop, none was attempted; curl's text "failed to
+ * open socket" is not used) as refused, any other end as a failure with its reason.
+ * This is the rule of the core for the other download clients (ECONFILTERED).
+ */
+static void download_done(struct session *session, CURLcode result, const char *eff_url)
+{
+	const char *url = eff_url != NULL ? eff_url : session->url;
+	if( result == CURLE_OK )
+	{
+		g_info("DOWNLOAD DONE: %s => (%d) %s", url, result, session->error);
+		tempfile_close(session->action.download.file);
+
+		struct incident *i = incident_new("dionaea.download.complete");
+		incident_value_string_set(i, "path", g_string_new(session->action.download.file->path));
+		incident_value_string_set(i, "url", g_string_new(session->url));
+		if( session->action.download.ctxcon )
+			incident_value_con_set(i, "con", session->action.download.ctxcon);
+
+		incident_report(i);
+		incident_free(i);
+		return;
+	}
+
+	if( result == CURLE_COULDNT_CONNECT && session->action.download.refused_seen &&
+		!session->action.download.allowed_seen )
+		download_refused(url);
+	else
+		download_failed(url, session->error[0] != '\0' ? session->error : curl_easy_strerror(result));
+	if( session->action.download.file != NULL )
+		tempfile_close(session->action.download.file);
+}
+
+/* An upload that failed: one warning, the url and curl's text as printable text (log_text.h) */
+static void upload_done(struct session *session, CURLcode result, const char *eff_url)
+{
+	char *url = log_text_new(eff_url != NULL ? eff_url : session->url, "(no url)");
+	char *error = log_text_new(session->error, "");
+	g_warning("UPLOAD FAIL: %s => (%d) %s", url, result, error);
+	g_free(error);
+	g_free(url);
+
+	if( session->action.upload.callback == NULL )
+		return;
+
+	tempfile_close(session->action.upload.file);
+	tempfile_unlink(session->action.upload.file);
+}
+
 /* Update the event timer after curl_multi library calls */
-static int multi_timer_cb(CURLM *multi, long timeout_ms)
+static int multi_timer_cb(CURLM *multi, long timeout_ms, void *userp)
 {
 	g_debug("%s %li", __PRETTY_FUNCTION__,  timeout_ms);
 	ev_timer_stop(g_dionaea->loop, &curl_runtime.timer_event);
-	if( timeout_ms > 0 )
+	/* -1: libcurl wants no timer.
+	 * 0: libcurl wants a call of curl_multi_socket_action() right away. This
+	 * callback runs inside of libcurl (e.g. from curl_multi_add_handle()), where
+	 * libcurl refuses a call of its API (CURLM_RECURSIVE_API_CALL), so it is
+	 * done by the next iteration of the event loop. */
+	if( timeout_ms >= 0 )
 	{
 		double  t = (double) timeout_ms / 1000.0;
 		ev_timer_init(&curl_runtime.timer_event, timer_cb, t, 0.);
 		ev_timer_start(g_dionaea->loop, &curl_runtime.timer_event);
-	} else
-		timer_cb(g_dionaea->loop, &curl_runtime.timer_event, 0);
+	}
 	return 0;
 }
 
@@ -174,24 +236,7 @@ static void check_run_count(void)
 				switch( session->type )
 				{
 				case session_type_download:
-					if( msg->data.result == CURLE_OK )
-					{
-						g_info("DOWNLOAD DONE: %s => (%d) %s", eff_url, msg->data.result, session->error);
-						tempfile_close(session->action.download.file);
-
-						struct incident *i = incident_new("dionaea.download.complete");
-						incident_value_string_set(i, "path", g_string_new(session->action.download.file->path));
-						incident_value_string_set(i, "url", g_string_new(session->url));
-						if( session->action.download.ctxcon )
-							incident_value_con_set(i, "con", session->action.download.ctxcon);
-
-						incident_report(i);
-						incident_free(i);
-					} else
-					{
-						g_warning("DOWNLOAD FAIL: %s => (%d) %s", eff_url, msg->data.result, session->error);
-						tempfile_close(session->action.download.file);
-					}
+					download_done(session, msg->data.result, eff_url);
 					break;
 
 				case session_type_upload:
@@ -213,13 +258,7 @@ static void check_run_count(void)
 						tempfile_unlink(session->action.upload.file);
 					} else
 					{
-						g_warning("UPLOAD FAIL: %s => (%d) %s", eff_url, msg->data.result, session->error);
-
-						if( session->action.upload.callback == NULL )
-							break;
-
-						tempfile_close(session->action.upload.file);
-						tempfile_unlink(session->action.upload.file);
+						upload_done(session, msg->data.result, eff_url);
 					}
 					break;
 				}
@@ -438,7 +477,7 @@ void session_upload_new(struct incident *i)
 			if( strcmp(name, "_callback") == 0 )
 			{ /* incident callback */
 				session->action.upload.callback = g_strdup(d->opaque.string->str);
-				session->action.upload.file = tempfile_new(curl_runtime.download_dir, "httpupload-");
+				session->action.upload.file = tempincoming_new(curl_runtime.download_dir, "httpupload-");
 			}else
 			if( strcmp(name, "_userdata") == 0 )
 			{ /* incident callback userdata */
@@ -484,6 +523,17 @@ void session_upload_new(struct incident *i)
 		}
 	}
 
+	if( session->action.upload.callback != NULL && session->action.upload.file == NULL )
+	{
+		/* the answer for the callback has no file (no descriptor left, a full disk) */
+		char *text = log_text_new(session->url, "(no url)");
+		g_warning("Could not create the file of the upload to %s, the upload is dropped", text);
+		g_free(text);
+		curl_easy_cleanup(session->easy);
+		session_free(session);
+		return;
+	}
+
 	char buf[] = "Expect:";
 	session->action.upload.headers = curl_slist_append(session->action.upload.headers, buf);
 
@@ -510,6 +560,54 @@ void session_upload_new(struct incident *i)
 	curl_multi_add_handle(curl_runtime.multi, session->easy);
 	curl_runtime.queued++;
 	check_run_count();
+}
+
+/* CURLOPT_OPENSOCKETFUNCTION of a download, context: the session */
+static curl_socket_t download_open_socket(void *context, curlsocktype purpose,
+                                         struct curl_sockaddr *address)
+{
+    struct session *session = context;
+    char text[INET6_ADDRSTRLEN];
+    const void *ip;
+    if (purpose != CURLSOCKTYPE_IPCXN)
+        return CURL_SOCKET_BAD;
+    if (address->family == AF_INET)
+        ip = &((struct sockaddr_in *)&address->addr)->sin_addr;
+    else if (address->family == AF_INET6)
+        ip = &((struct sockaddr_in6 *)&address->addr)->sin6_addr;
+    else
+    {
+        /* no address the filter can judge: attempted, not refused */
+        session->action.download.allowed_seen = true;
+        return CURL_SOCKET_BAD;
+    }
+    if (!inet_ntop(address->family, ip, text, sizeof(text)))
+    {
+        session->action.download.allowed_seen = true;
+        return CURL_SOCKET_BAD;
+    }
+    if (!download_destination_allowed(text))
+    {
+        g_debug("download target %s refused by the filter", text);
+        session->action.download.refused_seen = true;
+        return CURL_SOCKET_BAD;
+    }
+    session->action.download.allowed_seen = true;
+    return socket(address->family, address->socktype, address->protocol);
+}
+
+/* CURLOPT_HEADERFUNCTION of a download: a status line is a response of a server, the
+ * addresses of the next hop (a redirect) are judged anew */
+static size_t download_header_cb(char *buffer, size_t size, size_t nitems, void *userdata)
+{
+    struct session *session = userdata;
+    size_t len = size * nitems;
+    if (len >= 5 && strncmp(buffer, "HTTP/", 5) == 0)
+    {
+        session->action.download.refused_seen = false;
+        session->action.download.allowed_seen = false;
+    }
+    return len;
 }
 
 static void session_download_new(struct incident *i, char *url)
@@ -539,15 +637,37 @@ static void session_download_new(struct incident *i, char *url)
 	curl_easy_setopt(session->easy, CURLOPT_ERRORBUFFER, session->error);
 	curl_easy_setopt(session->easy, CURLOPT_PRIVATE, session);
 	curl_easy_setopt(session->easy, CURLOPT_NOPROGRESS, 0L);
-	curl_easy_setopt(session->easy, CURLOPT_FOLLOWLOCATION, 10);
+	curl_easy_setopt(session->easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(session->easy, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(session->easy, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(session->easy, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+    /* Apply the same resolved-address check to every redirect; no shared upload
+     * sockets and no environment proxies: every connection goes to the checked address. */
+    curl_easy_setopt(session->easy, CURLOPT_PROXY, "");
+    curl_easy_setopt(session->easy, CURLOPT_FRESH_CONNECT, 1L);
+    curl_easy_setopt(session->easy, CURLOPT_FORBID_REUSE, 1L);
+    curl_easy_setopt(session->easy, CURLOPT_OPENSOCKETFUNCTION, download_open_socket);
+    curl_easy_setopt(session->easy, CURLOPT_OPENSOCKETDATA, session);
+    curl_easy_setopt(session->easy, CURLOPT_HEADERFUNCTION, download_header_cb);
+    curl_easy_setopt(session->easy, CURLOPT_HEADERDATA, session);
 	curl_easy_setopt(session->easy, CURLOPT_PROGRESSFUNCTION, curl_progressfunction_cb);
 	curl_easy_setopt(session->easy, CURLOPT_PROGRESSDATA, session);
 	curl_easy_setopt(session->easy, CURLOPT_LOW_SPEED_TIME, 3L);
 	curl_easy_setopt(session->easy, CURLOPT_LOW_SPEED_LIMIT, 10L);
 	curl_easy_setopt(session->easy, CURLOPT_USERAGENT, "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.0)");
 
-	session->action.download.file = tempfile_new(curl_runtime.download_dir, "http-");
+	session->action.download.file = tempincoming_new(curl_runtime.download_dir, "http-");
 	session->action.download.ctxcon = con;
+	if( session->action.download.file == NULL )
+	{
+		/* no descriptor left or a full disk: no download, the connection is given back */
+		char *text = log_text_new(session->url, "(no url)");
+		g_warning("Could not create the file of the download of %s, the download is dropped", text);
+		g_free(text);
+		curl_easy_cleanup(session->easy);
+		session_free(session);
+		return;
+	}
 
 	g_debug("session %p file %i path %s", session, session->action.download.file->fd, session->action.download.file->path);
 

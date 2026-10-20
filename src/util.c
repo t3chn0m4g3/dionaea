@@ -19,6 +19,9 @@
 
 #include <unistd.h>
 #include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <glib.h>
 
@@ -222,10 +225,12 @@ bool parse_addr(char const * const addr, char const * const iface, uint16_t cons
 	return false;
 }
 
-struct tempfile *tempfile_new(char *path, char *prefix)
+/* a temporary file in path; NULL with errno set, and no warning when mkstemp() failed (*made false) */
+static struct tempfile *tempfile_open(const char *path, const char *prefix, bool *made)
 {
 	struct tempfile *tf = g_malloc0(sizeof(struct tempfile));
 
+	*made = false;
 	if( prefix )
 		tf->path = g_strdup_printf("%s/%sXXXXXX", path, prefix);
 	else
@@ -233,12 +238,111 @@ struct tempfile *tempfile_new(char *path, char *prefix)
 	tf->fd = mkstemp(tf->path);
 	if( tf->fd == -1 )
 	{
-		g_warning("could not open path %s (%s)", path, strerror(errno));
+		int error = errno;
+		g_free(tf->path);
 		g_free(tf);
+		errno = error;
 		return NULL;
 	}
 
+	*made = true;
 	tf->fh = fdopen(tf->fd, "w+");
+	if( tf->fh == NULL )
+	{
+		int error = errno;
+		g_warning("could not open path %s (%s)", tf->path, strerror(error));
+		unlink(tf->path);
+		close(tf->fd);
+		g_free(tf->path);
+		g_free(tf);
+		errno = error;
+		return NULL;
+	}
+	return tf;
+}
+
+struct tempfile *tempfile_new(char *path, char *prefix)
+{
+	bool made;
+	struct tempfile *tf = tempfile_open(path, prefix, &made);
+	if( tf == NULL && !made )
+		g_warning("could not open path %s (%s)", path, strerror(errno));
+	return tf;
+}
+
+char *incoming_path(const char *download_dir)
+{
+	return g_build_filename(download_dir, INCOMING_DIR, NULL);
+}
+
+void incoming_prepare(const char *download_dir)
+{
+	if( download_dir == NULL )
+		return;
+	char *path = incoming_path(download_dir);
+	struct stat st;
+	if( lstat(path, &st) == 0 && !S_ISDIR(st.st_mode) )
+	{
+		/* a file or a link of that name: the temporary files are never put elsewhere */
+		g_warning("%s is no folder, it is replaced by one", path);
+		if( unlink(path) != 0 )
+			g_warning("Could not remove %s (%s)", path, strerror(errno));
+	}
+	if( mkdir(path, S_IRWXU) != 0 && errno != EEXIST )
+	{
+		g_warning("Could not create %s, the temporary files of the samples are made there (%s)",
+				  path, strerror(errno));
+		g_free(path);
+		return;
+	}
+	int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	DIR *dir = NULL;
+	if( fd == -1 || (dir = fdopendir(fd)) == NULL )
+	{
+		g_warning("Could not read %s (%s)", path, strerror(errno));
+		if( fd != -1 )
+			close(fd);
+		g_free(path);
+		return;
+	}
+	if( fstat(fd, &st) == 0 && (st.st_mode & 07777) != S_IRWXU && fchmod(fd, S_IRWXU) != 0 )
+		g_warning("Could not set the mode of %s to 0700 (%s)", path, strerror(errno));
+	guint removed = 0;
+	struct dirent *entry;
+	while( (entry = readdir(dir)) != NULL )
+	{
+		if( strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 )
+			continue;
+		/* only files of an earlier run: nothing here makes folders */
+		if( fstatat(fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || S_ISDIR(st.st_mode) )
+			continue;
+		if( unlinkat(fd, entry->d_name, 0) == 0 )
+			removed++;
+		else
+			g_warning("Could not remove %s/%s (%s)", path, entry->d_name, strerror(errno));
+	}
+	closedir(dir);
+	if( removed > 0 )
+		g_info("Removed %u temporary file(s) of an earlier run from %s", removed, path);
+	g_free(path);
+}
+
+struct tempfile *tempincoming_new(const char *download_dir, char *prefix)
+{
+	if( download_dir == NULL )
+		return tempfile_new((char *)g_get_tmp_dir(), prefix);
+	char *path = incoming_path(download_dir);
+	bool made;
+	struct tempfile *tf = tempfile_open(path, prefix, &made);
+	if( tf == NULL && !made && errno == ENOENT )
+	{
+		/* made at the start of dionaea, gone meanwhile (not download.dir itself: ENOENT again) */
+		if( mkdir(path, S_IRWXU) == 0 || errno == EEXIST )
+			tf = tempfile_open(path, prefix, &made);
+	}
+	if( tf == NULL && !made )
+		g_warning("could not open path %s (%s)", path, strerror(errno));
+	g_free(path);
 	return tf;
 }
 
@@ -256,12 +360,16 @@ struct tempfile *tempdownload_new(char *prefix)
 	return tempfile_new((char *)"/tmp", prefix);
 }
 
+/*
+ * The stream owns the descriptor once fdopen() succeeded: fclose() closes it.
+ * A close() of tf->fd after that closes the number a second time, and by then
+ * another thread or connection may have opened a file under it.
+ */
 void tempfile_close(struct tempfile *tf)
 {
 	if( tf->fh != NULL )
 		fclose(tf->fh);
-
-	if( tf->fd != -1 )
+	else if( tf->fd != -1 )
 		close(tf->fd);
 
 	tf->fd = -1;

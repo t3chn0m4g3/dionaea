@@ -242,6 +242,11 @@ void connection_udp_io_in_cb(EV_P_ struct ev_io *w, int revents)
 			processors_io_in(peer, buf, ret);
 
 		peer->protocol.io_in(peer, peer->protocol.ctx, buf, ret);
+
+		/* the connection closed itself in its io_in (a TFTP session at its last ACK or after
+		 * its ERROR reply): its socket is gone, no read on it */
+		if( con->socket == -1 )
+			return;
 	}
 
 	if( ret == -1 && errno != EAGAIN && errno != EWOULDBLOCK )

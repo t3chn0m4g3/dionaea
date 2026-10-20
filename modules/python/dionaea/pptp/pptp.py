@@ -64,7 +64,7 @@ class pptpd(connection):
             p = packets.PPTP_StartControlConnection_Request(data)
             p.show()
             if p.Length == 0:
-                logger.warn("Bad PPTP Packet, Length = 0")
+                logger.warning("Bad PPTP Packet, Length = 0")
                 return len(data)
 
             i = incident("dionaea.modules.python.pptp.connect")

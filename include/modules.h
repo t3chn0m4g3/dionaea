@@ -38,6 +38,9 @@ typedef bool (*module_free_function)(void);
  * hup is meant to support SIGHUP in modules
  *
  * shutdown order
+ *  * flush: the event loop ended, before dionaea waits for the jobs of the
+ *    threadpool (a stop timeout may kill it during that wait): write what is
+ *    buffered (the python module commits log_sqlite)
  *  * free
  */
 struct module_api
@@ -48,6 +51,7 @@ struct module_api
 	module_new_function new;
 	module_free_function free;
 	module_config_function hup;
+	module_free_function flush;
 };
 
 struct module
@@ -93,6 +97,7 @@ void modules_config(void);
 void modules_prepare(void);
 void modules_new(void);
 void modules_start(void);
+void modules_flush(void);
 void modules_free(void);
 void modules_hup(void);
 

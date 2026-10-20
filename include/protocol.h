@@ -22,6 +22,8 @@ enum connection_error
 	ECONUNREACH        = 1,
 	ECONNOSUCHDOMAIN   = 2,
 	ECONMANY		   = 4,
+	/* a download connection: the download target filter refused every address */
+	ECONFILTERED       = 5,
 };
 
 typedef void (*protocol_handler_established)(struct connection *con);

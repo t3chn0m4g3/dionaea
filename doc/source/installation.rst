@@ -103,6 +103,12 @@ Now you should be able to run :code:`make` to build and run :code:`make install`
 
 The new honeypot can be found in the directory :code:`/opt/dionaea`.
 
+.. note:: :code:`make install` installs the Python package of dionaea with
+    :code:`setup.py install`. setuptools deprecates that command and prints a
+    ``SetuptoolsDeprecationWarning`` (``setup.py install is deprecated``) during the
+    install; it is a warning only, the package is installed. A failed install stops
+    :code:`make install`. The move to pip follows before setuptools drops the command.
+
 3rd-party packages
 ------------------
 

@@ -37,9 +37,22 @@ headers
     Only applied if filename_pattern, status_code and methods match.
     The first match in the list is used.
 
+get_max_num_fields
+
+    Maximum number of fields of a query string, and of the parts of a multipart
+    body (those of nested parts included). A body with more parts is not parsed,
+    no file of it is stored. Default: 100
+
 max_request_size
 
      Maximum size in kbytes of the request. 32768 = 32MB
+
+     The files of a multipart/form-data POST are stored as samples (as they were
+     sent, a Content-Transfer-Encoding is not decoded). Delimiters are found as
+     whole lines, with CRLF or bare LF line breaks; the files of nested
+     ``multipart/mixed`` parts are stored too, up to three levels deep. The body
+     ends at its closing delimiter or at the Content-Length; a request larger
+     than ``max_request_size`` is answered with 413 and nothing of it is stored.
 
 root
 

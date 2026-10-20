@@ -237,6 +237,11 @@ bool logger_file_open(struct logger *l, void *data)
 		g_critical("Could not open logfile %s (%s)", d->file, strerror(errno));
 		return false;
 	}
+	/* a file without debug and info (errors.levels=warning,error) gets few lines: written per
+	 * line, so a warning is in the file at once and not only at the stop; the others keep the
+	 * buffer of stdio */
+	if( d->filter != NULL && (d->filter->mask & (G_LOG_LEVEL_DEBUG | G_LOG_LEVEL_INFO)) == 0 )
+		setvbuf(d->f, NULL, _IOLBF, 0);
 	g_debug("LOG OPEN");
 	l->fd = fileno(d->f);
 	return true;
