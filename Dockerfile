@@ -49,13 +49,14 @@ ARG LIBEMU_TEST_CFLAGS=""
 RUN mkdir -p /src/build-test && \
     cd /src/build-test && \
     cmake -DDIONAEA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="${LIBEMU_TEST_CFLAGS}" .. && \
-    make -j"$(nproc)" test_libemu test_synthetic_pe && \
-    ctest -R '^(libemu|synthetic_pe)$' --output-on-failure
+    make -j"$(nproc)" test_libemu test_synthetic_pe test_mul test_w32_hooks && \
+    ctest -R '^(libemu|synthetic_pe|mul|w32_hooks)$' --output-on-failure
 
 
 # Unit tests of the stream processing (tests/processor: bistream limits, streamdumper, processor
-# jobs and threadpool admission, emu detection windows and file hooks, curl sessions, listen of the
-# core, the buffering of the log files, the log lines of failed downloads), not part of the image:
+# jobs and threadpool admission, emu detection windows and file hooks, the JSON of a profile, curl
+# sessions, listen of the core, the buffering of the log files, the log lines of failed downloads),
+# not part of the image:
 #   docker build --target processor-test .
 #   docker build --target processor-test \
 #     --build-arg PROCESSOR_TEST_CFLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer" .
@@ -68,9 +69,10 @@ ARG PROCESSOR_TEST_CFLAGS=""
 RUN mkdir -p /src/build-processor-test && \
     cd /src/build-processor-test && \
     cmake -DDIONAEA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="${PROCESSOR_TEST_CFLAGS}" .. && \
-    make -j"$(nproc)" test_bistream test_processor test_streamdumper test_detect test_emu_hooks test_curl_session \
-      test_connection_listen test_log test_download_log && \
-    ctest -R '^(bistream|processor|streamdumper|detect|emu_hooks|curl_session|connection_listen|log|download_log)$' --output-on-failure
+    make -j"$(nproc)" test_bistream test_processor test_streamdumper test_detect test_emu_hooks test_profile \
+      test_curl_session test_connection_listen test_log test_download_log && \
+    ctest -R '^(bistream|processor|streamdumper|detect|emu_hooks|profile|curl_session|connection_listen|log|download_log)$' \
+      --output-on-failure
 
 
 FROM ubuntu:26.04

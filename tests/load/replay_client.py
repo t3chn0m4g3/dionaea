@@ -364,7 +364,7 @@ def https_get(rnd):
     context = ssl.create_default_context()
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
-    context.minimum_version = ssl.TLSVersion.TLSv1
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     with socket.create_connection((HOST, 443), timeout=TIMEOUT) as raw:
         with context.wrap_socket(raw, server_hostname="replay") as sock:
             sock.sendall(b"GET / HTTP/1.1\r\nHost: replay\r\nConnection: close\r\n\r\n")

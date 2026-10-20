@@ -27,10 +27,11 @@
 
 #include <stdint.h>
 
+/* the signed product at the output width, which holds it in full */
 #define INSTR_CALC(inbits, outbits, cpu, a, b) \
 INTOF(inbits) operand_a = (INTOF(inbits))a; \
 INTOF(inbits) operand_b = (INTOF(inbits))b; \
-INTOF(outbits) operation_result = operand_a * operand_b; \
+INTOF(outbits) operation_result = (INTOF(outbits))operand_a * operand_b; \
 
 
 #include "emu/emu_cpu.h"
@@ -40,8 +41,10 @@ INTOF(outbits) operation_result = operand_a * operand_b; \
 
 /*Intel Architecture Software Developer's Manual Volume 2: Instruction Set Reference (24319102.PDF) page 335*/
 
-#define INSTR_SET_FLAGS(cpu, upper_result)	\
-if (upper_result == 0) \
+/* CF and OF are set when the product does not fit the destination size
+ * (inbits): the full product is not the sign extension of its lower half */
+#define INSTR_SET_FLAGS(cpu, inbits)	\
+if (operation_result == (INTOF(inbits))operation_result) \
 { \
 	CPU_FLAG_UNSET(cpu,f_cf); \
 	CPU_FLAG_UNSET(cpu,f_of); \
@@ -84,9 +87,7 @@ int32_t instr_imul_69(struct emu_cpu *c, struct emu_cpu_instruction *i)
 
 			*c->reg16[i->modrm.opc] = operation_result;
 
-			uint8_t high;
-			WORD_UPPER_TO_BYTE(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,16);
 
 		}
 		else
@@ -111,9 +112,7 @@ int32_t instr_imul_69(struct emu_cpu *c, struct emu_cpu_instruction *i)
 
 			c->reg[i->modrm.opc] = operation_result;
 
-			uint32_t high;
-			QWORD_UPPER_TO_DWORD(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,32);
 		}
 	}
 	else
@@ -142,9 +141,7 @@ int32_t instr_imul_69(struct emu_cpu *c, struct emu_cpu_instruction *i)
 					   sexd)
 			*c->reg16[i->modrm.opc] = operation_result;
 
-			uint8_t high;
-			WORD_UPPER_TO_BYTE(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,16);
 		}
 		else
 		{
@@ -164,9 +161,7 @@ int32_t instr_imul_69(struct emu_cpu *c, struct emu_cpu_instruction *i)
 					   sexd)
 			c->reg[i->modrm.opc] = operation_result;
 
-			uint32_t high;
-			QWORD_UPPER_TO_DWORD(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,32);
 
 		}
 
@@ -198,9 +193,7 @@ int32_t instr_imul_6b(struct emu_cpu *c, struct emu_cpu_instruction *i)
 
 			*c->reg16[i->modrm.opc] = operation_result;
 
-			uint8_t high;
-			WORD_UPPER_TO_BYTE(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,16);
 		}
 		else
 		{
@@ -222,9 +215,7 @@ int32_t instr_imul_6b(struct emu_cpu *c, struct emu_cpu_instruction *i)
 
 			c->reg[i->modrm.opc] = operation_result;
 
-			uint32_t high;
-			QWORD_UPPER_TO_DWORD(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,32);
 		}
 	}
 	else
@@ -247,9 +238,7 @@ int32_t instr_imul_6b(struct emu_cpu *c, struct emu_cpu_instruction *i)
 					   sexd)
 			*c->reg16[i->modrm.opc] = operation_result;
 
-			uint8_t high;
-			WORD_UPPER_TO_BYTE(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,16);
 		}
 		else
 		{
@@ -269,9 +258,7 @@ int32_t instr_imul_6b(struct emu_cpu *c, struct emu_cpu_instruction *i)
 					   sexd)
 			c->reg[i->modrm.opc] = operation_result;
 
-			uint32_t high;
-			QWORD_UPPER_TO_DWORD(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,32);
 		}
 	}
 	return 0;
@@ -299,9 +286,7 @@ int32_t instr_imul_0f_af(struct emu_cpu *c, struct emu_cpu_instruction *i)
 
 			*c->reg16[i->modrm.opc] = operation_result;
 
-			uint8_t high;
-			WORD_UPPER_TO_BYTE(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,16);
 		}
 		else
 		{
@@ -320,9 +305,7 @@ int32_t instr_imul_0f_af(struct emu_cpu *c, struct emu_cpu_instruction *i)
 
 			c->reg[i->modrm.opc] = operation_result;
 
-			uint16_t high;
-			DWORD_UPPER_TO_WORD(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,32);
 		}
 	}
 	else
@@ -341,9 +324,7 @@ int32_t instr_imul_0f_af(struct emu_cpu *c, struct emu_cpu_instruction *i)
 
 			*c->reg16[i->modrm.opc] = operation_result;
 
-			uint8_t high;
-			WORD_UPPER_TO_BYTE(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,16);
 		}
 		else
 		{
@@ -359,9 +340,7 @@ int32_t instr_imul_0f_af(struct emu_cpu *c, struct emu_cpu_instruction *i)
 
 			c->reg[i->modrm.opc] = operation_result;
 
-			uint16_t high;
-			DWORD_UPPER_TO_WORD(high,operation_result);
-			INSTR_SET_FLAGS(c,high);
+			INSTR_SET_FLAGS(c,32);
 		}
 	}
 	return 0;
@@ -386,9 +365,7 @@ int32_t instr_group_3_f6_imul(struct emu_cpu *c, struct emu_cpu_instruction *i)
 				   *c->reg8[al],
 				   m8)
 		*c->reg16[ax] = operation_result;
-		uint8_t high;
-		WORD_UPPER_TO_BYTE(high,operation_result);
-		INSTR_SET_FLAGS(c,high);
+		INSTR_SET_FLAGS(c,8);
 	}
 	else
 	{
@@ -403,9 +380,7 @@ int32_t instr_group_3_f6_imul(struct emu_cpu *c, struct emu_cpu_instruction *i)
 				   *c->reg8[i->modrm.rm])
 
 		*c->reg16[ax] = operation_result;
-		uint8_t high;
-		WORD_UPPER_TO_BYTE(high,operation_result);
-		INSTR_SET_FLAGS(c,high);
+		INSTR_SET_FLAGS(c,8);
 	}
 	return 0;
 }
@@ -431,7 +406,7 @@ int32_t instr_group_3_f7_imul(struct emu_cpu *c, struct emu_cpu_instruction *i)
 			DWORD_UPPER_TO_WORD(*c->reg16[dx],operation_result);
 			DWORD_LOWER_TO_WORD(*c->reg16[ax],operation_result);
 
-			INSTR_SET_FLAGS(c,*c->reg16[dx]);
+			INSTR_SET_FLAGS(c,16);
 		}
 		else
 		{
@@ -450,7 +425,7 @@ int32_t instr_group_3_f7_imul(struct emu_cpu *c, struct emu_cpu_instruction *i)
 			QWORD_UPPER_TO_DWORD(c->reg[edx],operation_result);
 			QWORD_LOWER_TO_DWORD(c->reg[eax],operation_result);
 
-			INSTR_SET_FLAGS(c,c->reg[edx]);
+			INSTR_SET_FLAGS(c,32);
 
 		}
 	}
@@ -470,7 +445,7 @@ int32_t instr_group_3_f7_imul(struct emu_cpu *c, struct emu_cpu_instruction *i)
 			DWORD_UPPER_TO_WORD(*c->reg16[dx],operation_result);
 			DWORD_LOWER_TO_WORD(*c->reg16[ax],operation_result);
 
-			INSTR_SET_FLAGS(c,*c->reg16[dx]);
+			INSTR_SET_FLAGS(c,16);
 
 		}
 		else
@@ -488,7 +463,7 @@ int32_t instr_group_3_f7_imul(struct emu_cpu *c, struct emu_cpu_instruction *i)
 			QWORD_UPPER_TO_DWORD(c->reg[edx],operation_result);
 			QWORD_LOWER_TO_DWORD(c->reg[eax],operation_result);
 
-			INSTR_SET_FLAGS(c,c->reg[edx]);
+			INSTR_SET_FLAGS(c,32);
 		}
 	}
 	return 0;

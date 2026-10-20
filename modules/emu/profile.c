@@ -103,26 +103,26 @@ static int json_escape_str(GString *target, char *str)
 	return 0;
 }
 
-static int json_escape_bytea(GString *target, unsigned char *str, unsigned int size)
+/* the size bytes of str, nothing for size 0: a printable byte other than '"'
+ * and '\' as it is, every other byte as \\xNN, which a JSON reader takes as
+ * the text \xNN (NN: two hex digits) */
+static int json_escape_bytea(GString *target, const unsigned char *str, size_t size)
 {
-	int pos = 0, start_offset = 0;
-	unsigned char c;
-	do
+	size_t start_offset = 0;
+	for( size_t pos = 0; pos < size; pos++ )
 	{
-		c = str[pos];
+		unsigned char c = str[pos];
 
 		if( isprint(c) && c != '"' && c != '\\')
-			pos++;
-		else
-		{
-			if( pos - start_offset > 0 )
-				g_string_append_len(target, (char *)str + start_offset, pos - start_offset);
-			g_string_append_printf(target, "\\\\x%02x", c);
-			start_offset = ++pos;
-		}
-	} while( pos < size );
-	if( pos - start_offset > 0 )
-		g_string_append_len(target, (char *)str + start_offset, pos - start_offset);
+			continue;
+
+		if( pos > start_offset )
+			g_string_append_len(target, (const char *)str + start_offset, pos - start_offset);
+		g_string_append_printf(target, "\\\\x%02x", c);
+		start_offset = pos + 1;
+	}
+	if( size > start_offset )
+		g_string_append_len(target, (const char *)str + start_offset, size - start_offset);
 
 	return 0;
 }
@@ -217,8 +217,8 @@ void json_profile_argument_debug(struct emu_profile_argument *argument, int inde
 	case render_bytea:
 		{
 			unsigned char *data = argument->value.bytea.data;
-			unsigned int size = argument->value.bytea.size;
-			GString *escaped = g_string_sized_new(size*5);
+			size_t size = argument->value.bytea.size;
+			GString *escaped = g_string_sized_new(size * 5 + 1);
 			json_escape_bytea(escaped, data, size);
 
 			if( has_name )

@@ -7,7 +7,9 @@ SPDX-License-Identifier: CC0-1.0
 
 The emulator is derived from buffer/libemu revision bf443cb. Its existing
 copyright notices and GPL-2.0-or-later licensing are retained. Local changes
-include the CMake build, memory/error fixes and synthetic Windows export models.
+include the CMake build, memory/error fixes, synthetic Windows export models,
+the full product and the CF/OF flags of MUL and IMUL, and the size limits of the
+hooks that copy a buffer of the emulated program.
 The prefix map of `emu_cpu.c` is a constant table shared by the emu workers.
 
 libdasm (src/libdasm.c, libdasm.h, opcode_tables.h) is libdasm 1.4 by jt / nologin.org with small local edits. Its README declares it public domain ('You can do whatever you like with it'). The later BSD-2-Clause licence of libdasm 1.6 does not apply to this copy. The files are combined with GPL-2.0-or-later libemu.

@@ -1114,8 +1114,10 @@ LONG _lwrite(
 	unsigned char *buffer = NULL;
 
 	if( size < 1*1024*1024 )
+		buffer = calloc(1, (size_t)size + 1);
+
+	if( buffer != NULL )
 	{
-		buffer = malloc(size);
 		emu_memory_read_block(emu_memory_get(env->emu), p_buffer, buffer, size);
 	
 		if ( hook->hook.win->userhook != NULL )
@@ -1138,10 +1140,10 @@ LONG _lwrite(
 		emu_profile_function_add(env->profile, "_lwrite");
 		emu_profile_argument_add_int(env->profile, "HFile", "hFile", file);
 		emu_profile_argument_add_ptr(env->profile, "LPCSTR", "lpBuffer", p_buffer);
-		if( size < 1*1024*1024 )
+		if( buffer != NULL )
 			emu_profile_argument_add_bytea(env->profile, "", "", buffer, size);
 		else
-			emu_profile_argument_add_bytea(env->profile, "", "", buffer, 0);
+			emu_profile_argument_add_bytea(env->profile, "", "", NULL, 0);
 		emu_profile_argument_add_int(env->profile, "UINT", "cbWrite", size);
 		emu_profile_function_returnvalue_int_set(env->profile, "LONG", returnvalue);
 	}
@@ -1639,21 +1641,34 @@ BOOL WriteFile(
 	uint32_t bytestowrite;
 	POP_DWORD(c,  &bytestowrite);
 
-	unsigned char *buffer = malloc(bytestowrite);
-	emu_memory_read_block(emu_memory_get(env->emu), p_buffer, buffer, bytestowrite);
-
-
 	uint32_t p_byteswritten;
 	POP_DWORD(c,  &p_byteswritten);
 	
 	uint32_t p_overlapped;
 	POP_DWORD(c,  &p_overlapped);
 
+	/* at most 1 MiB per call as for _lwrite: a longer write writes nothing
+	 * and returns 0 with 0 bytes written */
+	uint32_t len = bytestowrite <= 1*1024*1024 ? bytestowrite : 0;
+	unsigned char *buffer = calloc(1, (size_t)len + 1);
+	if( buffer == NULL )
+	{
+		emu_memory_write_dword(emu_memory_get(env->emu), p_byteswritten, 0);
+		emu_cpu_reg32_set(c, eax, 0);
+		emu_cpu_eip_set(c, eip_save);
+		return 0;
+	}
+	if( len > 0 )
+		emu_memory_read_block(emu_memory_get(env->emu), p_buffer, buffer, len);
 
-	emu_memory_write_dword(emu_memory_get(env->emu), p_byteswritten, bytestowrite);
+	emu_memory_write_dword(emu_memory_get(env->emu), p_byteswritten, len);
 
 
 	uint32_t returnvalue;
+	if ( bytestowrite > 1*1024*1024 )
+	{
+		returnvalue = 0;
+	}else
 	if ( hook->hook.win->userhook != NULL )
 	{
 		returnvalue = hook->hook.win->userhook(env, hook, 
@@ -1672,7 +1687,7 @@ BOOL WriteFile(
 		emu_profile_function_add(env->profile, "WriteFile");
 		emu_profile_argument_add_int(env->profile, "HANDLE", "hFile", file);
 		emu_profile_argument_add_ptr(env->profile, "LPCVOID", "lpBuffer", p_buffer);
-		emu_profile_argument_add_bytea(env->profile, "", "", buffer, bytestowrite);
+		emu_profile_argument_add_bytea(env->profile, "", "", buffer, len);
 		emu_profile_argument_add_int(env->profile, "DWORD", "nNumberOfBytesToWrite", bytestowrite);
 		emu_profile_argument_add_ptr(env->profile, "LPDWORD", "lpNumberOfBytesWritten", p_byteswritten);
 		emu_profile_argument_add_none(env->profile);

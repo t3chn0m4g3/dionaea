@@ -116,6 +116,14 @@ if(WITH_MODULE_EMU AND DIONAEA_BUNDLED_LIBEMU)
   target_link_libraries(test_emu_hooks PRIVATE emu ${GLIB2_LIBRARIES} EV::EV)
   add_test(NAME emu_hooks COMMAND test_emu_hooks)
   list(APPEND PROCESSOR_TESTS emu_hooks)
+
+  # the JSON of the byte arguments of a profile (modules/emu/profile.c); the test
+  # stubs what profile() needs of the rest of dionaea
+  add_executable(test_profile test_profile.c ../../modules/emu/profile.c ${PROCESSOR_TEST_SUPPORT})
+  target_include_directories(test_profile PRIVATE ${PROCESSOR_TEST_INCLUDES} ../../modules/emu)
+  target_link_libraries(test_profile PRIVATE emu ${GLIB2_LIBRARIES} EV::EV)
+  add_test(NAME profile COMMAND test_profile)
+  list(APPEND PROCESSOR_TESTS profile)
 endif()
 
 if(WITH_MODULE_CURL AND CURL_FOUND)

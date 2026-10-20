@@ -1,6 +1,6 @@
 # Build and run this fork
 
-The root Dockerfile builds Dionaea 0.12.0 on Ubuntu 26.04. It bundles libemu
+The root Dockerfile builds Dionaea 0.12.1 on Ubuntu 26.04. It bundles libemu
 and runs as uid/gid 2000 with `cap_net_bind_service`. Paths remain under
 `/opt/dionaea`: configuration in `etc/dionaea`, service roots and quarantine
 in `var/dionaea`, logs in `var/log`.

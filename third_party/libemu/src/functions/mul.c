@@ -29,10 +29,11 @@
 #include <errno.h>
 #include <string.h>
 
+/* the unsigned product at the output width, which holds it in full */
 #define INSTR_CALC(inbits, outbits, cpu, a, b) \
 UINTOF(inbits) operand_a = a; \
 UINTOF(inbits) operand_b = b; \
-UINTOF(outbits) operation_result = operand_a * operand_b; \
+UINTOF(outbits) operation_result = (UINTOF(outbits))operand_a * operand_b; \
 
 #include "emu/emu.h"
 #include "emu/emu_cpu.h"

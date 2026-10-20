@@ -378,10 +378,13 @@ int recv(
 
 	emu_assert(env->emu, xlen < 0 || xlen > 4096);
 
-	char *buffer = (char *)malloc(xlen);
-	memset(buffer, 0, xlen);
+	char *buffer = (char *)calloc(1, (size_t)xlen + 1);
 
 	uint32_t returnvalue;
+	if ( buffer == NULL )
+	{
+		returnvalue = -1;
+	}else
 	if ( hook->hook.win->userhook != NULL )
 	{
 		returnvalue = hook->hook.win->userhook(env, hook, 
@@ -400,8 +403,9 @@ int recv(
 
 	
 	logDebug(env->emu, "recv(%i, 0x%08x, %i) == %i \n", s, buf, xlen, (int32_t)len);
+	/* the buffer holds xlen bytes, at most 4096 */
 	if ((int32_t)returnvalue > 0)
-		emu_memory_write_block(emu_memory_get(env->emu), buf, buffer, len);
+		emu_memory_write_block(emu_memory_get(env->emu), buf, buffer, xlen);
 	free(buffer);
 
 	if (env->profile != NULL)
@@ -456,8 +460,10 @@ int send(
 	uint32_t returnvalue;
 
 	if( len <= 64*1024 )
+		buffer = (char *)calloc(1, (size_t)len + 1);
+
+	if( buffer != NULL )
 	{
-		buffer = (char *)malloc(len);
 		logDebug(env->emu, "send(%i, 0x%08x, %i,  %i)\n", s, p_buf, len, flags);
 		emu_memory_read_block(emu_memory_get(env->emu), p_buf, buffer, len);
 		if ( hook->hook.win->userhook != NULL )
@@ -482,7 +488,7 @@ int send(
 		emu_profile_function_add(env->profile, "send");
 		emu_profile_argument_add_int(env->profile, "SOCKET", "s", s);
 		emu_profile_argument_add_ptr(env->profile, "const char *", "buf", p_buf);
-		emu_profile_argument_add_bytea(env->profile, "", "", (void *)buffer, len);
+		emu_profile_argument_add_bytea(env->profile, "", "", (void *)buffer, buffer != NULL ? len : 0);
 		emu_profile_argument_add_int(env->profile, "int", "len", len);
 		emu_profile_argument_add_int(env->profile, "int", "flags", flags);
 
@@ -540,10 +546,13 @@ int sendto(
 
 	char *buffer = NULL;
 	struct sockaddr sa;
+	memset(&sa, 0, sizeof(sa));
 	uint32_t returnvalue;
 	if( len <= 64*1024 )
+		buffer = (char *)calloc(1, (size_t)len + 1);
+
+	if( buffer != NULL )
 	{
-		buffer = (char *)malloc(len);
 		emu_memory_read_block(emu_memory_get(env->emu), p_buf, buffer, len);
 		emu_memory_read_block(emu_memory_get(env->emu), p_to, &sa, sizeof(struct sockaddr));
 

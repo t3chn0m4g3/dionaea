@@ -32,6 +32,21 @@ GetProcAddress, LoadLibrary and repeated load/free cycles. Invalid metadata and
 unknown APIs are rejected. No Windows DLL byte images or ASan suppressions are
 used.
 
+`test_mul.c` runs MUL and IMUL (F6, F7 and 6B, 8, 16 and 32 bits, register
+and memory operands) as instruction bytes through `emu_cpu_parse` and
+`emu_cpu_step`, and calls the IMUL forms 0F AF and 69, which the CPU does not
+dispatch, with a decoded instruction. Each case checks EAX and EDX in full and
+CF and OF, with both flags clear and set before. mul.c and imul.c compute no
+product that overflows its C type, so the test also passes with
+`-fsanitize=signed-integer-overflow` on them.
+
+`test_w32_hooks.c` calls the hooks that copy a buffer of the emulated program
+with a profile, as dionaea's profile run does: fwrite and WriteFile (at most
+1 MiB per call), _lwrite (below 1 MiB), send and sendto (at most 64 KiB) and recv
+(at most 4096 bytes). It checks EAX, EIP, ESP, the bytes written and the byte
+argument of the profile; with `-Wl,--wrap=calloc` it makes the copy fail.
+`./test_w32_hooks <case>` runs one case.
+
 - UBSan runs without `shift` and `signed-integer-overflow`: the emulated x86
   instructions are written with C shifts and signed arithmetic (about 100
   reports in a run), which is the emulator's job and works on GCC and clang.

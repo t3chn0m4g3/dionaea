@@ -8,8 +8,39 @@
 Changelog
 =========
 
-0.12.0 - (`master`_)
+0.12.1 - (`master`_)
 --------------------
+
+**libemu**
+
+* The emulated MUL and IMUL compute the full product and set CF and OF as x86 does:
+  MUL when the upper half of the product is not 0, IMUL when the product does not fit
+  the destination size. This holds for every form of IMUL, also 0F AF and 69, which
+  the CPU does not dispatch.
+* The emulated fwrite and WriteFile write at most 1 MiB per call. A longer write writes
+  nothing and returns 0, WriteFile with 0 bytes written; fwrite computes size * count
+  in 64 bits.
+* The emulated send records an empty byte argument when it returns -1 for more than
+  64 KiB; recv writes at most the 4096 bytes it hands the emulated program.
+* fwrite, WriteFile, _lwrite, send, sendto and recv return their error value when
+  their copy of the buffer can not be allocated; the emulation goes on at the return
+  address.
+
+**emu**
+
+* Profiles of long byte arguments are written in full; an empty byte argument is an
+  empty string.
+
+**tests**
+
+* ``tests/libemu/test_mul.c`` runs MUL and IMUL on instruction bytes and checks EDX:EAX,
+  CF and OF; ``test_w32_hooks.c`` the copies of the hooks above with a profile;
+  ``tests/processor/test_profile.c`` the JSON of byte arguments.
+* The TLS clients of the tests (the early close scenario, the HTTPS request of the
+  replay) ask for TLS 1.2 at least; ``tests/load/test_tls_minimum.py`` checks it.
+
+0.12.0 - (2026-10-20)
+---------------------
 
 **build and runtime**
 

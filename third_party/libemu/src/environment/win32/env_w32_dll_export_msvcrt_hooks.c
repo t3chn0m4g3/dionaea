@@ -228,8 +228,19 @@ size_t fwrite( const void *buffer, size_t size, size_t count, FILE *stream );
 	uint32_t count;
 	MEM_DWORD_READ(c, (c->reg[esp]+8), &count);
 
-	unsigned char *buffer = malloc(size*count);
-	emu_memory_read_block(emu_memory_get(env->emu), p_buffer, buffer, size*count);
+	/* size * count in 64 bits, at most 1 MiB per call as for _lwrite: a
+	 * longer write writes nothing and returns 0 */
+	uint64_t total = (uint64_t)size * count;
+	uint32_t len = total <= 1*1024*1024 ? (uint32_t)total : 0;
+	unsigned char *buffer = calloc(1, (size_t)len + 1);
+	if( buffer == NULL )
+	{
+		emu_cpu_reg32_set(c, eax, 0);
+		emu_cpu_eip_set(c, eip_save);
+		return 0;
+	}
+	if( len > 0 )
+		emu_memory_read_block(emu_memory_get(env->emu), p_buffer, buffer, len);
 
 
 
@@ -238,6 +249,10 @@ size_t fwrite( const void *buffer, size_t size, size_t count, FILE *stream );
 	
 
 	uint32_t returnvalue;
+	if ( total > 1*1024*1024 )
+	{
+		returnvalue = 0;
+	}else
 	if ( hook->hook.win->userhook != NULL )
 	{
 		returnvalue = hook->hook.win->userhook(env, hook, 
@@ -247,7 +262,7 @@ size_t fwrite( const void *buffer, size_t size, size_t count, FILE *stream );
 											   p_stream);
 	}else
 	{
-		returnvalue	= size*count;
+		returnvalue	= len;
 	}
 
 
@@ -260,7 +275,7 @@ size_t fwrite( const void *buffer, size_t size, size_t count, FILE *stream );
 		emu_profile_function_add(env->profile, "fwrite");
 		emu_profile_function_returnvalue_int_set(env->profile, "size_t", returnvalue);
 		emu_profile_argument_add_ptr(env->profile, "const void *", "buffer", p_buffer);
-		emu_profile_argument_add_bytea(env->profile, "", "", buffer, size*count);
+		emu_profile_argument_add_bytea(env->profile, "", "", buffer, len);
 		emu_profile_argument_add_int(env->profile, "size_t", "size", size);
 		emu_profile_argument_add_int(env->profile, "count_t", "count", count);
 		emu_profile_argument_add_ptr(env->profile, "FILE *", "stream", p_stream);

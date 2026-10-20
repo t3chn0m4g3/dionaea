@@ -175,8 +175,12 @@ void emu_profile_argument_add_bytea(struct emu_profile *profile, char *argtype, 
 {
 
     struct emu_profile_argument *argument = emu_profile_argument_new(render_bytea, argtype, argname);
-	argument->value.bytea.data = malloc(size);
-	memcpy(argument->value.bytea.data, data, size);
+	/* an empty argument (data may be NULL) or one that can not be copied has 0 bytes */
+	argument->value.bytea.data = malloc(size > 0 ? size : 1);
+	if( argument->value.bytea.data == NULL || data == NULL )
+		size = 0;
+	if( size > 0 )
+		memcpy(argument->value.bytea.data, data, size);
 	argument->value.bytea.size = size;
 	emu_profile_argument_add(profile, argument);
 }
