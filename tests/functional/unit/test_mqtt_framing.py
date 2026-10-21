@@ -255,11 +255,18 @@ def test_a_packet_above_64_kib_closes_before_it_is_buffered():
 
 
 def oversized_lines(caplog):
-    return [r.getMessage() for r in caplog.records if r.name == "mqtt" and "above the limit" in r.getMessage()]
+    """The info lines of the packets above the limit (the warning is the summary of them)."""
+    return [r.getMessage() for r in caplog.records
+            if r.name == "mqtt" and r.levelno == logging.INFO and "above the limit" in r.getMessage()]
+
+
+@pytest.fixture(autouse=True)
+def oversized_clock(summaries):
+    return summaries(mqtt.OVERSIZED)
 
 
 def test_a_packet_above_64_kib_logs_its_topic_and_size_not_its_payload(caplog):
-    caplog.set_level(logging.WARNING, logger="mqtt")
+    caplog.set_level(logging.INFO, logger="mqtt")
     con = mqtt.mqttd()
     topic = b"factory/line-7/plc"
     payload = b"SECRET-PAYLOAD-" * 5000
@@ -284,7 +291,7 @@ def test_a_packet_above_64_kib_logs_its_topic_and_size_not_its_payload(caplog):
 
 
 def test_the_topic_of_a_subscribe_above_64_kib_is_logged(caplog):
-    caplog.set_level(logging.WARNING, logger="mqtt")
+    caplog.set_level(logging.INFO, logger="mqtt")
     con = mqtt.mqttd()
     remaining = 70000
     encoded, n = bytearray(), remaining
@@ -301,7 +308,7 @@ def test_the_topic_of_a_subscribe_above_64_kib_is_logged(caplog):
 
 
 def test_an_oversized_packet_without_its_topic_yet_is_logged_with_its_size(caplog):
-    caplog.set_level(logging.WARNING, logger="mqtt")
+    caplog.set_level(logging.INFO, logger="mqtt")
     con = mqtt.mqttd()
     data = publish_of_length(64 * 1024 + 1)
     # only the fixed header and one byte of the topic length
@@ -312,7 +319,7 @@ def test_an_oversized_packet_without_its_topic_yet_is_logged_with_its_size(caplo
 
 
 def test_a_topic_of_control_bytes_is_logged_escaped(caplog):
-    caplog.set_level(logging.WARNING, logger="mqtt")
+    caplog.set_level(logging.INFO, logger="mqtt")
     con = mqtt.mqttd()
     topic = b"x\n\x1b[31mtwo lines"
     remaining = 100000
@@ -384,6 +391,23 @@ def test_a_long_subscribe_has_its_topic_and_id():
     assert subscriptions() == [(0x1234, topic)]
 
 
+def test_the_packets_above_the_limit_of_many_connections_are_one_warning_a_minute(caplog, oversized_clock):
+    caplog.set_level(logging.INFO, logger="mqtt")
+    for _ in range(5):
+        con = mqtt.mqttd()
+        assert con.handle_io_in(publish_of_length(64 * 1024 + 1)[:5]) == 5
+        assert con.closed
+        oversized_clock.advance(1)
+    assert len(oversized_lines(caplog)) == 5
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == ["MQTT packets above the limit, connections closed: 1 connection(s) in the last minute, "
+                        "the last: %d bytes (type 3) from 198.51.100.9:%s" % (64 * 1024 + 1, con.remote.port)]
+    oversized_clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings[1:] == ["MQTT packets above the limit, connections closed: 4 connection(s) in the last minute, "
+                            "the last: %d bytes (type 3) from 198.51.100.9:%s" % (64 * 1024 + 1, con.remote.port)]
+
+
 def test_packet_topic_skips_the_properties_of_level_5():
     data = subscribe5(b"a/b", 1, b"\x0b\x07")
     assert mqtt.packet_topic(data, 5) == b"a/b"
@@ -392,7 +416,7 @@ def test_packet_topic_skips_the_properties_of_level_5():
 
 
 def test_an_oversized_mqtt5_subscribe_logs_its_topic(caplog):
-    caplog.set_level(logging.WARNING, logger="mqtt")
+    caplog.set_level(logging.INFO, logger="mqtt")
     con = mqtt.mqttd()
     feed(con, [connect5()])
     body = struct.pack("!H", 7) + b"\x02\x0b\x07" + struct.pack("!H", 5) + b"a/b/c" + b"\x01" * 70000

@@ -11,7 +11,10 @@
 #include "util.h"
 
 struct dionaea *g_dionaea;
-gint stub_refs, stub_closes, stub_incidents, stub_overload_logs, stub_give_up_logs, stub_scan_done_logs, stub_trim_thread_logs;
+gint stub_refs, stub_closes, stub_incidents, stub_overload_logs, stub_scan_stopped_logs, stub_connection_warnings,
+	stub_give_up_summaries, stub_overload_summaries, stub_trim_thread_logs;
+static GMutex summary_lock;
+static char *last_summary;
 
 static struct dionaea stub_d;
 static struct threads stub_t;
@@ -73,6 +76,23 @@ static void trigger(struct ev_loop *loop, struct ev_async *watcher, int events)
 	(void)events;
 }
 
+static void summary_seen(gint *counter, const gchar *message)
+{
+	g_mutex_lock(&summary_lock);
+	g_free(last_summary);
+	last_summary = g_strdup(message);
+	g_mutex_unlock(&summary_lock);
+	g_atomic_int_inc(counter);
+}
+
+char *stub_last_summary(void)
+{
+	g_mutex_lock(&summary_lock);
+	char *text = g_strdup(last_summary);
+	g_mutex_unlock(&summary_lock);
+	return text;
+}
+
 static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *message, gpointer data)
 {
 	if( (level & (G_LOG_LEVEL_WARNING | G_LOG_LEVEL_INFO)) && strstr(message, " scan stopped (") != NULL )
@@ -80,7 +100,26 @@ static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *
 		/* the line names the connection, never its data */
 		g_assert_null(strstr(message, "AAAA"));
 		g_assert_nonnull(strstr(message, "goes on"));
-		g_atomic_int_inc((level & G_LOG_LEVEL_WARNING) ? &stub_give_up_logs : &stub_scan_done_logs);
+		g_atomic_int_inc((level & G_LOG_LEVEL_WARNING) ? &stub_connection_warnings : &stub_scan_stopped_logs);
+		return;
+	}
+	if( (level & (G_LOG_LEVEL_WARNING | G_LOG_LEVEL_INFO)) && strstr(message, "Stream processing limit reached") != NULL )
+	{
+		/* the line names the connection, never its data */
+		g_assert_null(strstr(message, "AAAA"));
+		g_atomic_int_inc((level & G_LOG_LEVEL_WARNING) ? &stub_connection_warnings : &stub_overload_logs);
+		return;
+	}
+	if( (level & G_LOG_LEVEL_WARNING) && g_str_has_prefix(message, "processor: scans stopped at a limit: ") )
+	{
+		g_assert_null(strstr(message, "AAAA"));
+		summary_seen(&stub_give_up_summaries, message);
+		return;
+	}
+	if( (level & G_LOG_LEVEL_WARNING) && g_str_has_prefix(message, "processor: connections closed at a limit: ") )
+	{
+		g_assert_null(strstr(message, "AAAA"));
+		summary_seen(&stub_overload_summaries, message);
 		return;
 	}
 	if( level & (G_LOG_LEVEL_DEBUG | G_LOG_LEVEL_INFO) )
@@ -90,14 +129,35 @@ static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *
 		g_atomic_int_inc(&stub_trim_thread_logs);
 		return;
 	}
-	if( (level & G_LOG_LEVEL_WARNING) && strstr(message, "Stream processing limit reached") != NULL )
-	{
-		/* the warning names the connection, never its data */
-		g_assert_null(strstr(message, "AAAA"));
-		g_atomic_int_inc(&stub_overload_logs);
-		return;
-	}
 	g_log_default_handler(domain, level, message, data);
+}
+
+/* the clock of the summaries stands still, their timer is never due */
+static gint64 stub_clock(void)
+{
+	return 1000 * G_USEC_PER_SEC;
+}
+
+static bool stub_schedule(struct log_summary *s, double after)
+{
+	(void)s;
+	(void)after;
+	return true;
+}
+
+static const struct log_summary_hooks stub_summary_hooks = { stub_clock, stub_schedule };
+
+void stub_summaries_reset(void)
+{
+	struct log_summary *summaries[] = { processor_give_up_summary(), processors_overload_summary() };
+	for( size_t i = 0; i < G_N_ELEMENTS(summaries); i++ )
+	{
+		log_summary_set_hooks(summaries[i], &stub_summary_hooks);
+		log_summary_reset(summaries[i]);
+	}
+	g_atomic_int_set(&stub_give_up_summaries, 0);
+	g_atomic_int_set(&stub_overload_summaries, 0);
+	g_atomic_int_set(&stub_connection_warnings, 0);
 }
 
 void stub_quiet_logs(void)
@@ -115,6 +175,7 @@ void stub_dionaea_init(void)
 	stub_t.cmds = g_async_queue_new();
 	ev_async_init(&stub_t.trigger, trigger);
 	ev_async_start(stub_d.loop, &stub_t.trigger);
+	stub_summaries_reset();
 }
 
 void stub_dionaea_exit(void)

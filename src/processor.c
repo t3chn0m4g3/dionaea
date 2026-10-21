@@ -14,6 +14,7 @@
 #include "threads.h"
 
 #include "log.h"
+#include "log_summary.h"
 #include "util.h"
 #include "streamcap.h"
 
@@ -189,6 +190,32 @@ void processor_data_free(struct processor_data *pd)
 static gint processor_overloads;
 static gint processor_gave_up;
 
+static struct log_summary give_up_summary = LOG_SUMMARY_INIT("processor: scans stopped at a limit", "connection(s)");
+static struct log_summary overload_summary = LOG_SUMMARY_INIT("processor: connections closed at a limit", "connection(s)");
+
+struct log_summary *processor_give_up_summary(void)
+{
+	return &give_up_summary;
+}
+
+struct log_summary *processors_overload_summary(void)
+{
+	return &overload_summary;
+}
+
+static struct log_summary streamdumper_writes = LOG_SUMMARY_INIT("bistream writes failed", "write(s)");
+static struct log_summary streamdumper_folders = LOG_SUMMARY_INIT("bistream folders not made", "time(s)");
+
+struct log_summary *streamdumper_write_summary(void)
+{
+	return &streamdumper_writes;
+}
+
+struct log_summary *streamdumper_folder_summary(void)
+{
+	return &streamdumper_folders;
+}
+
 void processor_stats_get(struct processor_stats *stats)
 {
 	struct bistream_stats streams;
@@ -314,10 +341,12 @@ void processors_overload(struct connection *con, const char *reason)
 		return;
 
 	g_atomic_int_inc(&processor_overloads);
-	/* once per connection, without any of its data */
-	g_warning("Stream processing limit reached (%s), closing connection %p %s %s:%i",
-			  reason, con, con->protocol.name != NULL ? con->protocol.name : "-",
-			  con->remote.ip_string, ntohs(con->remote.port));
+	/* once per connection, without any of its data; many connections are one warning a minute */
+	const char *protocol = con->protocol.name != NULL ? con->protocol.name : "-";
+	g_info("Stream processing limit reached (%s), closing connection %p %s %s:%i",
+		   reason, con, protocol, con->remote.ip_string, ntohs(con->remote.port));
+	log_summary_addf(&overload_summary, "%s (%s %s:%i)", reason, protocol, con->remote.ip_string,
+					 ntohs(con->remote.port));
 
 	/* the budget is free for other connections before the close */
 	processors_release_all(con->processor_data);
@@ -365,19 +394,21 @@ static bool processor_give_up_locked(struct processor_data *pd)
 	return true;
 }
 
-/* once per instance, without any of its data */
+/*
+ * once per instance, without any of its data: an info line; a stop at a limit is also an
+ * event of give_up_summary (one warning a minute for all connections, from the thread
+ * that gives up or the event loop, log_summary.h)
+ */
 static void processor_give_up_log(struct connection *con, struct processor_data *pd, const char *reason, bool limit)
 {
 	const char *protocol = con->protocol.name != NULL ? con->protocol.name : "-";
+	g_info("%s scan stopped (%s), connection %p %s %s:%i goes on", pd->processor->name,
+		   reason, con, protocol, con->remote.ip_string, ntohs(con->remote.port));
 	if( limit )
 	{
 		g_atomic_int_inc(&processor_gave_up);
-		g_warning("%s scan stopped (%s), connection %p %s %s:%i goes on", pd->processor->name,
-				  reason, con, protocol, con->remote.ip_string, ntohs(con->remote.port));
-	} else
-	{
-		g_info("%s scan stopped (%s), connection %p %s %s:%i goes on", pd->processor->name,
-			   reason, con, protocol, con->remote.ip_string, ntohs(con->remote.port));
+		log_summary_addf(&give_up_summary, "%s scan, %s (%s %s:%i)", pd->processor->name, reason, protocol,
+						 con->remote.ip_string, ntohs(con->remote.port));
 	}
 }
 
@@ -809,7 +840,10 @@ static bool streamdumper_write(struct streamdumper_ctx *ctx, const void *data, s
 {
 	if( fwrite(data, size, 1, ctx->file->fh) != 1 )
 	{
-		g_warning("Could not write %s %s", what, strerror(errno));
+		/* a full disk fails every write of every connection: info, one warning a minute */
+		int error = errno;
+		g_info("Could not write %s %s", what, strerror(error));
+		log_summary_addf(&streamdumper_writes, "%s (%s)", ctx->file->path, strerror(error));
 		return false;
 	}
 	return true;
@@ -896,7 +930,12 @@ static bool streamdumper_create(struct connection *con, struct streamdumper_ctx 
 	if( stat(path, &s) != 0 )
 	{
 		if( mkdir(path, S_IRWXU|S_IRUSR|S_IWUSR|S_IXUSR|S_IRWXG|S_IRGRP|S_IWGRP|S_IXGRP|S_IRWXO|S_IROTH|S_IWOTH|S_IXOTH) != 0 )
-			g_warning("Could not create %s %s",  path, strerror(errno));
+		{
+			/* tried again by the next data of every connection: info, one warning a minute */
+			int error = errno;
+			g_info("Could not create %s %s",  path, strerror(error));
+			log_summary_addf(&streamdumper_folders, "%s (%s)", path, strerror(error));
+		}
 		else if( cfg->cap != NULL )
 			/* its dumps are all known: the limits never read it at a refusal */
 			streamcap_made(cfg->cap, path);

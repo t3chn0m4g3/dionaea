@@ -7,6 +7,7 @@
 from dionaea import IHandlerLoader, Timer
 from dionaea.core import ihandler, incident, g_dionaea, connection
 from dionaea.util import sha512file
+from dionaea.logtext import LogSummary, log_text
 
 import os
 import logging
@@ -19,6 +20,20 @@ from time import gmtime, strftime
 
 logger = logging.getLogger('hpfeeds')
 logger.setLevel(logging.DEBUG)
+
+# one warning a minute for the incidents whose publication fails; the line of each is info
+PUBLISH_FAILED = LogSummary(logger, "hpfeeds publications failed", "incident(s)")
+
+
+def publish_failed(e):
+    """The publication of an incident failed: an info line, and an event of the summary warning.
+
+    The catch-alls of the handlers end here: a broker that is gone or an own address that is not
+    resolved yet fails the publication of every incident, so of every connection; one warning a
+    minute says so, the line of each incident is info.
+    """
+    logger.info("exception when publishing: %s", log_text(e))
+    PUBLISH_FAILED.add(log_text(e))
 
 #def DEBUGPERF(msg):
 #	print(msg)
@@ -329,7 +344,7 @@ class hpfeedihandler(ihandler):
                 local_port=con.local.port
             )
         except Exception as e:
-            logger.warning('exception when publishing: {0}'.format(e))
+            publish_failed(e)
 
     def handle_incident(self, i):
         pass
@@ -396,7 +411,7 @@ class hpfeedihandler(ihandler):
         try:
             self.client.sendfile(i.file)
         except Exception as e:
-            logger.warning('exception when publishing: {0}'.format(e))
+            publish_failed(e)
 
     def handle_incident_dionaea_download_complete_again(self, i):
         if not hasattr(i, 'con') or not self.client.connected: return
@@ -416,7 +431,7 @@ class hpfeedihandler(ihandler):
                 url=i.url
             )
         except Exception as e:
-            logger.warning('exception when publishing: {0}'.format(e))
+            publish_failed(e)
 
     def handle_incident_dionaea_modules_python_smb_dcerpc_request(self, i):
         if not hasattr(i, 'con') or not self.client.connected:
@@ -433,7 +448,7 @@ class hpfeedihandler(ihandler):
                 dport=str(i.con.local.port)
             )
         except Exception as e:
-            logger.warning('exception when publishing: {0}'.format(e))
+            publish_failed(e)
 
     def handle_incident_dionaea_module_emu_profile(self, icd):
         if not hasattr(icd, 'con') or not self.client.connected:
@@ -442,7 +457,7 @@ class hpfeedihandler(ihandler):
         try:
             self.client.publish(SCPROFCHAN, profile=icd.profile)
         except Exception as e:
-            logger.warning('exception when publishing: {0}'.format(e))
+            publish_failed(e)
 
     def _dynip_resolve(self, events, data):
         i = incident("dionaea.upload.request")

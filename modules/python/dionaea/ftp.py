@@ -65,7 +65,7 @@
 from dionaea import ServiceLoader
 from dionaea.core import connection, ihandler, g_dionaea, incident
 from dionaea.exception import ServiceConfigError
-from dionaea.logtext import log_text
+from dionaea.logtext import LogSummary, log_text
 import errno
 import inspect
 import logging
@@ -84,6 +84,13 @@ from dionaea.upload import (
 )
 
 logger = logging.getLogger('ftp')
+
+# one warning a minute for what fails in the sessions of all clients; the line of each is info
+# (logtext.LogSummary)
+STORAGE = LogSummary(logger, "FTP commands failed for lack of storage", "command(s)")
+NO_SOCKET = LogSummary(logger, "FTP data connections failed for lack of sockets", "command(s)")
+NO_FILE = LogSummary(logger, "uploads not stored, no file could be made", "upload(s)")
+DROPPED = LogSummary(logger, "uploads dropped", "upload(s)")
 logger.setLevel(logging.DEBUG)
 
 #
@@ -302,14 +309,19 @@ class FTPd(connection):
                     msg = self._call(cmd, method, l)
                 except OSError as e:
                     if e.errno in STORAGE_ERRNOS:
-                        # a full disk or quota: a warning, so it is in dionaea-errors.log
-                        logger.warning("%s %s failed: %s", cmd.decode(errors="replace"),
-                                       log_text(" ".join(str(a) for a in l)), log_text(e))
+                        # a full disk or quota: in dionaea-errors.log through the summary
+                        text = "%s %s failed: %s" % (log_text(cmd), log_text(" ".join(str(a) for a in l)),
+                                                     log_text(e))
+                        logger.info("%s", text)
+                        STORAGE.add(text)
                         self.reply("insufficient_storage")
                         return
                     if e.errno in SOCKET_ERRNOS:
-                        # no socket for the data connection (EMFILE in the bind of PASV, ...): unexpected
-                        logger.warning("%s failed: %s", cmd.decode(errors="replace"), e, exc_info=True)
+                        # no socket for the data connection (EMFILE, ENFILE, ENOBUFS in the bind of PASV,
+                        # ...): the resources of the system, of every session: info, one warning a minute
+                        text = "%s failed: %s (%s)" % (log_text(cmd), log_text(e), self.remote.host)
+                        logger.info("%s", text)
+                        NO_SOCKET.add(text)
                         self.reply("cant_open_data_cnx")
                         return
                     # e.g. a root that is read-only (T-Pot mounts it :ro): answer, do not drop the session
@@ -772,7 +784,8 @@ class FTPDataCon(connection):
         try:
             self.upload = UploadFile("ftp-", max_size=max_size)
         except OSError as e:
-            logger.error("unable to create a file for the upload: %s", e)
+            logger.info("unable to create a file for the upload: %s (%s)", log_text(e), self.remote.host)
+            NO_FILE.add("%s (%s)" % (log_text(e), self.remote.host))
             self.mode = None
             answer = "insufficient_storage" if e.errno in STORAGE_ERRNOS else "cant_open_data_cnx"
             self._ctrl_call(lambda ctrl: ctrl.reply(answer))
@@ -832,7 +845,8 @@ class FTPDataCon(connection):
                 self.upload.write(data)
             except UploadError as e:
                 # too large or not writable: drop the upload and the connection
-                logger.warning("upload dropped: %s", e)
+                logger.info("upload dropped: %s (%s)", log_text(e), self.remote.host)
+                DROPPED.add("%s (%s)" % (log_text(e), self.remote.host))
                 self.upload.discard()
                 self.upload = None
                 self.mode = None

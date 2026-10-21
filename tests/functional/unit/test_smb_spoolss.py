@@ -9,9 +9,9 @@
 The data of a job sent in fragments (first, middle, last) is kept on the connection
 until its last fragment, then written as a download. The data of a job is kept for
 that job only: the next job of the connection starts empty. A job above the
-max_upload_size of the SMB service is dropped with one warning, its fragments are
-not kept (con.printer is None until the first fragment of the next job). A fragment is added in
-the time of its own length.
+max_upload_size of the SMB service is dropped with an info line (one warning a minute sums
+them up for all connections), its fragments are not kept (con.printer is None until the
+first fragment of the next job). A fragment is added in the time of its own length.
 
 rpcservices.py is loaded with stand-ins of dionaea.core (it needs the binding).
 """
@@ -129,6 +129,23 @@ def test_a_job_above_max_upload_size_is_dropped(rpc, caplog):
     # the connection goes on: a job within the limit after it
     write(rpc, con, fragments(job(b"small"), 8))
     assert FakeIncident.reported == [("dionaea.download.complete", b"small")]
+
+
+def test_the_dropped_jobs_of_many_connections_are_one_warning_a_minute(rpc, caplog, summaries):
+    clock = summaries(rpc.PRINT_DROPPED)
+    with caplog.at_level(logging.INFO, logger="rpcservices"):
+        for _ in range(6):
+            write(rpc, connection(max_upload_size=64), fragments(job(b"x" * 1000), 16))
+            clock.advance(1)
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and "dropped" in r.getMessage()]
+        assert infos == ["print job of 198.51.100.9 dropped: its fragments are above max_upload_size (64 bytes)"] * 6
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [("print jobs dropped above max_upload_size: 1 job(s) in the last minute, "
+                            "the last: 198.51.100.9, 64 bytes")]
+        clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings[1:] == [("print jobs dropped above max_upload_size: 5 job(s) in the last minute, "
+                            "the last: 198.51.100.9, 64 bytes")]
 
 
 def test_the_fragments_of_a_job_are_kept_up_to_max_upload_size(rpc):

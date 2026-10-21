@@ -47,14 +47,30 @@ CLIENT_TIMEOUT = {"normal": 3600, "overload": 900}
 AFTER_TESTS = ["test_smoke.py", "test_smb_auth.py", "test_ftp.py", "test_tftp.py", "test_upload.py"]
 BAD_LOG = re.compile(r"Traceback|LoaderError|Error loading module|Unable to start service|"
                      r"Assertion .*failed|Segmentation fault|-critical:")
-# the whole line: reason, connection, protocol and address, nothing of the data
-OVERLOAD_LINE = re.compile(r"^\[[^]]+\] processor \S+-warning: Stream processing limit reached "
+# the whole line: reason, connection, protocol and address, nothing of the data (info since 0.12.3,
+# a warning before)
+OVERLOAD_LINE = re.compile(r"^\[[^]]+\] processor \S+-(?:warning|info): Stream processing limit reached "
                            r"\((stream data limit|job queue full|stream offsets)\), "
                            r"closing connection 0x[0-9a-f]+ \S+ [0-9a-fA-F.:]+:(\d+)$", re.M)
-# the emu gives up at a limit (warning) or after its scan limit (info); "stream offsets" would be a bug
-GIVE_UP_LINE = re.compile(r"^\[[^]]+\] processor \S+-(warning|info): emu scan stopped "
+# the emu gives up at a limit or after its scan limit (the reason "scan limit"); "stream offsets"
+# would be a bug
+GIVE_UP_LINE = re.compile(r"^\[[^]]+\] processor \S+-(?:warning|info): emu scan stopped "
                           r"\((stream data limit|job queue full|scan limit)\), "
                           r"connection 0x[0-9a-f]+ \S+ [0-9a-fA-F.:]+:(\d+) goes on$", re.M)
+# the summary warning of both, once a minute: the number, the reason and the address of the last one
+SUMMARY_LINE = re.compile(r"^\[[^]]+\] processor \S+-warning: processor: (scans stopped|connections closed) "
+                          r"at a limit: \d+ connection\(s\) in the last minute, the last: (emu scan, )?"
+                          r"(stream data limit|job queue full|stream offsets) \(\S+ [0-9a-fA-F.:]+:\d+\)$", re.M)
+
+
+def give_ups(load_log):
+    """The (reason, port) of the emu scans stopped at a limit, and the ports of those done at their scan limit."""
+    lines = GIVE_UP_LINE.findall(load_log)
+    gave_up = [(reason, int(port)) for reason, port in lines if reason != "scan limit"]
+    scan_limit = [int(port) for reason, port in lines if reason == "scan limit"]
+    return gave_up, scan_limit
+
+
 # the line probe.py logs when run.py asks for it, before the functional tests
 LOAD_MARK = "load test mark %s"
 MARK_TIMEOUT = 30
@@ -241,9 +257,7 @@ class Run:
         self.summary["overload_lines"] = len(overloads)
         # T-Pot has no processor that needs the whole history: no connection is closed
         self.check("no overload close", not overloads, lines=len(overloads))
-        gave_up = [(reason, int(port)) for level, reason, port in GIVE_UP_LINE.findall(load_log)
-                   if level == "warning"]
-        scan_limit = [int(port) for level, reason, port in GIVE_UP_LINE.findall(load_log) if level == "info"]
+        gave_up, scan_limit = give_ups(load_log)
         reasons = {}
         per_port = {}
         for reason, port in gave_up:
@@ -269,8 +283,9 @@ class Run:
                        missing=sorted(bursts - set(per_port))[:5],
                        other=sorted(set(per_port) - bursts - uploads)[:5])
         other = [line for line in log.splitlines()
-                 if ("limit reached" in line and not OVERLOAD_LINE.match(line))
-                 or ("scan stopped" in line and not GIVE_UP_LINE.match(line))]
+                 if ("Stream processing limit reached" in line and not OVERLOAD_LINE.match(line))
+                 or ("scan stopped" in line and not GIVE_UP_LINE.match(line))
+                 or (" processor: " in line and " at a limit: " in line and not SUMMARY_LINE.match(line))]
         self.check("limit lines carry only reason and address", not other, other=other[:3])
 
     def cleanup(self):

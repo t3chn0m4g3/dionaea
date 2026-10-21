@@ -17,8 +17,9 @@
 # requests from one client (one source address). Then it restores the limit:
 #   - a read request of the same client gets DATA (its places are back)
 #   - no Traceback in the container log meanwhile
-#   - after dionaea stopped, dionaea-errors.log has the EMFILE line of
-#     socket() (run.sh checks it, hc_expect_log)
+#   - after dionaea stopped, dionaea.log has the EMFILE line of socket() at
+#     info, and dionaea-errors.log the summary of them (one warning a minute,
+#     run.sh checks both, hc_expect_log)
 
 set -Eeuo pipefail
 unset CDPATH
@@ -91,6 +92,7 @@ if docker logs --since "${since}" "${DIONAEA_CONTAINER}" 2>&1 | grep -q 'Traceba
 else
   hc_say "no Traceback in the container log"
 fi
-hc_expect_log dionaea-errors.log "socket\(\) failed for con .*\(Too many open files\)"
+hc_expect_log dionaea.log "-info: socket\(\) failed for con .*\(Too many open files\)"
+hc_expect_log dionaea-errors.log "-warning: connections without a socket: [0-9]+ connection\(s\) in the last minute, the last: Too many open files"
 hc_running || { hc_fail "dionaea is not running"; exit 1; }
 exit ${rc}

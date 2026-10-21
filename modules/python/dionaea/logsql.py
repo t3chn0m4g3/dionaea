@@ -6,6 +6,7 @@
 
 from dionaea import IHandlerLoader
 from dionaea.core import ihandler
+from dionaea.logtext import LogSummary, log_text
 
 import logging
 import json
@@ -14,6 +15,12 @@ import time
 
 logger = logging.getLogger('log_sqlite')
 logger.setLevel(logging.DEBUG)
+
+# one warning a minute while the commits of every second fail; the line of each is info
+COMMIT_FAILED = LogSummary(logger, "commits of the sqlite log tried again", "time(s)")
+# one warning a minute for the incidents whose rows sqlite refuses (no descriptor for the journal, a
+# full disk, ...); the line of each is info
+NOT_RECORDED = LogSummary(logger, "logsql", "incident(s) not recorded")
 
 #: Seconds between two commits. Every incident used to be committed at once, about
 #: 130 transactions a second under load. Each transaction costs sqlite file
@@ -637,7 +644,8 @@ class logsqlhandler(ihandler):
             self.dbh.commit()
         except sqlite3.Error as e:
             # e.g. a reader held its lock longer than the busy timeout: the transaction stays, the next flush tries again
-            logger.warning("Unable to commit to %s, trying again: %s", self.filename, e)
+            logger.info("Unable to commit to %s, trying again: %s", self.filename, e)
+            COMMIT_FAILED.add("%s, %s" % (self.filename, log_text(e)))
             return
         self._dirty = False
 
@@ -1095,3 +1103,34 @@ class logsqlhandler(ihandler):
             self.cursor.execute("INSERT INTO mqtt_subscribe_commands (connection, mqtt_subscribe_command_messageid, mqtt_subscribe_command_topic) VALUES (?,?,?)",
                 (attackid, icd.subscribemessageid, icd.subscribetopic))
             self._commit()
+
+
+def _client(icd):
+    """The address of the client of the incident, "-" without its connection."""
+    try:
+        return icd.con.remote.host or "-"
+    except (AttributeError, ReferenceError):
+        return "-"
+
+
+def _recorded(method, origin):
+    """method of an incident, an error of sqlite (sqlite3.Error) is an info line and an event of
+    NOT_RECORDED. sqlite undoes the statement that failed only, the rows of the incidents before
+    stay for the next flush and the connection to the database goes on: no rollback."""
+    def handle(self, icd):
+        try:
+            return method(self, icd)
+        except sqlite3.Error as e:
+            client = _client(icd)
+            logger.info("%s not recorded: %s (%s)", origin, log_text(e), client)
+            NOT_RECORDED.add("%s (%s)" % (log_text(e), client))
+    handle.__name__ = method.__name__
+    handle.__doc__ = method.__doc__
+    return handle
+
+
+# every incident the handler records (handle_incident_<origin with _ for .>)
+for _name in [n for n in vars(logsqlhandler) if n.startswith("handle_incident_")]:
+    setattr(logsqlhandler, _name, _recorded(getattr(logsqlhandler, _name),
+                                            _name[len("handle_incident_"):].replace("_", ".")))
+del _name

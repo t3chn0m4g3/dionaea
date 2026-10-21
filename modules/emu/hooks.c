@@ -35,8 +35,18 @@
 #include "log.h"
 #include "incident.h"
 #include "util.h"
+#include "log_summary.h"
 
 #define D_LOG_DOMAIN "hooks"
+
+struct log_summary emu_no_file_summary = LOG_SUMMARY_INIT("emulations stopped without a file", "emulation(s)");
+struct log_summary emu_write_failed_summary = LOG_SUMMARY_INIT("writes of emulations failed", "write(s)");
+
+/* the address of the client whose code is emulated, "-" without its connection */
+static const char *emulation_client(struct emu_emulate_ctx *ctx)
+{
+	return ctx->ctxcon != NULL && ctx->ctxcon->remote.ip_string[0] != '\0' ? ctx->ctxcon->remote.ip_string : "-";
+}
 
 #define CL g_dionaea->loop
 
@@ -1170,7 +1180,8 @@ HANDLE CreateFile(
 	if( tf == NULL )
 	{
 		/* no descriptor left or a full disk: INVALID_HANDLE_VALUE */
-		g_warning("Could not create a file for the emulation (CreateFile), the emulation stops");
+		g_info("Could not create a file for the emulation (CreateFile), the emulation stops (%s)", emulation_client(ctx));
+		log_summary_addf(&emu_no_file_summary, "CreateFile (%s)", emulation_client(ctx));
 		ctx->state = failed;
 		return -1;
 	}
@@ -1226,7 +1237,10 @@ BOOL WriteFile(
 	{
 		if( fwrite(lpBuffer, nNumberOfBytesToWrite, 1, tf->fh) != 1 )
 		{
-			g_warning("fwrite failed %s",  strerror(errno));
+			/* a full disk fails the writes of every emulation: info, one warning a minute */
+			int error = errno;
+			g_info("fwrite failed %s (%s)",  strerror(error), emulation_client(ctx));
+			log_summary_addf(&emu_write_failed_summary, "%s (%s)", strerror(error), emulation_client(ctx));
 		}
 		long size;
 		if( (size = ftell(tf->fh)) >  conf->limits.filesize )
@@ -1455,7 +1469,8 @@ uint32_t user_hook__lcreat(struct emu_env *env, struct emu_env_hook *hook, ...)
 	if( tf == NULL )
 	{
 		/* no descriptor left or a full disk: HFILE_ERROR */
-		g_warning("Could not create a file for the emulation (_lcreat), the emulation stops");
+		g_info("Could not create a file for the emulation (_lcreat), the emulation stops (%s)", emulation_client(ctx));
+		log_summary_addf(&emu_no_file_summary, "_lcreat (%s)", emulation_client(ctx));
 		ctx->state = failed;
 		return -1;
 	}
@@ -1500,7 +1515,10 @@ uint32_t user_hook__lwrite(struct emu_env *env, struct emu_env_hook *hook, ...)
 	{
 		if( fwrite(lpBuffer, nNumberOfBytesToWrite, 1, tf->fh) != 1 )
 		{
-			g_warning("fwrite failed %s",  strerror(errno));
+			/* a full disk fails the writes of every emulation: info, one warning a minute */
+			int error = errno;
+			g_info("fwrite failed %s (%s)",  strerror(error), emulation_client(ctx));
+			log_summary_addf(&emu_write_failed_summary, "%s (%s)", strerror(error), emulation_client(ctx));
 		}
 		long size;
 		if( (size = ftell(tf->fh)) >  conf->limits.filesize )

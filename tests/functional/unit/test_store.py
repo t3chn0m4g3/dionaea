@@ -71,7 +71,7 @@ def _load_file(name, path):
 @contextlib.contextmanager
 def _stand_ins():
     saved = {name: sys.modules.get(name) for name in
-             ("dionaea", "dionaea.core", "dionaea.exception", "dionaea.util", "dionaea.upload")}
+             ("dionaea", "dionaea.core", "dionaea.exception", "dionaea.logtext", "dionaea.util", "dionaea.upload")}
     package = types.ModuleType("dionaea")
     package.__path__ = []
     package.IHandlerLoader = type("IHandlerLoader", (), {})
@@ -82,6 +82,7 @@ def _stand_ins():
     exception = types.ModuleType("dionaea.exception")
     exception.LoaderError = FakeLoaderError
     sys.modules.update({"dionaea": package, "dionaea.core": core, "dionaea.exception": exception})
+    sys.modules["dionaea.logtext"] = _load_file("dionaea.logtext", _src_root() / "logtext.py")
     sys.modules["dionaea.util"] = _load_file("dionaea_util_for_store", _src_root() / "util.py")
     sys.modules["dionaea.upload"] = _load_file("dionaea_upload_for_store", _src_root() / "upload.py")
     try:
@@ -101,12 +102,19 @@ def _load():
 
 store = _load()
 # the temporary files of the services (FTP STOR, SMB write, the printer); stdlib only at import
-upload = _load_file("upload_for_store", _src_root() / "upload.py")
+with _stand_ins():
+    upload = _load_file("upload_for_store", _src_root() / "upload.py")
 
 
 @pytest.fixture(autouse=True)
 def clear_reported():
     FakeIncident.reported.clear()
+
+
+@pytest.fixture(autouse=True)
+def clock(summaries):
+    """The summary warnings of store.py with the clock of the test, nothing logged before."""
+    return summaries(store.NOT_STORED, store.NOT_PROTECTED)
 
 
 @pytest.fixture
@@ -716,16 +724,41 @@ def test_invalid_max_size_is_unlimited_with_a_warning(binaries, caplog):
     assert (binaries / md5).exists()
 
 
-def test_a_refused_sample_is_warned_about_once(binaries, caplog):
+def test_a_refused_sample_is_an_info_line_once_and_one_warning_a_minute(binaries, caplog, clock):
     handler = make_handler({"max_size": 1})
     store_sample(handler, binaries, b"a" * (600 * 1024))
-    with caplog.at_level("WARNING", logger="store"):
+    with caplog.at_level("INFO", logger="store"):
         for _ in range(5):
             second = store_sample(handler, binaries, b"b" * (600 * 1024))
         other = store_sample(handler, binaries, b"c" * (600 * 1024))
+        infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO" and "Not storing" in r.getMessage()]
+        assert len(infos) == 2
+        assert second in infos[0] and other in infos[1]
+        messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(messages) == 1
+        assert messages[0].startswith("samples not stored at max_size: 1 sample(s) in the last minute, the last: %s "
+                                      "(614400 bytes): " % second)
+        clock.advance(60)
     messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert len(messages) == 2
-    assert second in messages[0] and other in messages[1]
+    assert messages[1].startswith(
+        "samples not stored at max_size: 1 sample(s) in the last minute, the last: %s " % other)
+    assert messages[1].endswith("bytes of %s are used (max_size 1 MiB)" % binaries)
+
+
+def test_the_refused_samples_of_many_clients_are_one_warning_a_minute(binaries, caplog, clock):
+    handler = make_handler({"max_size": 1})
+    store_sample(handler, binaries, b"a" * (900 * 1024))
+    with caplog.at_level("INFO", logger="store"):
+        for number in range(30):
+            store_sample(handler, binaries, b"%d " % number * (100 * 1024))
+            clock.advance(1)
+        assert len([r for r in caplog.records if r.levelname == "INFO" and "Not storing" in r.getMessage()]) == 30
+        assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+        clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2
+    assert warnings[1].startswith("samples not stored at max_size: 29 sample(s) in the last minute")
 
 
 def test_the_memory_of_refused_samples_is_bounded(binaries, caplog):
@@ -895,3 +928,30 @@ def test_empty_env_counts_as_unset(binaries, caplog, monkeypatch):
     assert handler.max_size == MIB
     assert not [r for r in caplog.records if r.levelname == "WARNING"]
     assert _infos(caplog) == ["store: max_size 1 MiB (from store.yaml)"]
+
+
+def test_a_mode_that_can_not_be_set_is_info_and_one_warning_a_minute(binaries, caplog, clock, monkeypatch):
+    handler = make_handler()
+    md5 = store_sample(handler, binaries, b"a" * 100)
+    os.chmod(binaries / md5, 0o644)
+
+    real_chmod = os.chmod
+
+    def no_chmod(path, mode, **kwargs):
+        # the sample of another owner; the temporary files of the test as they are
+        if str(path).endswith(md5):
+            raise PermissionError(1, "Operation not permitted")
+        return real_chmod(path, mode, **kwargs)
+    monkeypatch.setattr(store.os, "chmod", no_chmod)
+    with caplog.at_level("INFO", logger="store"):
+        for _ in range(3):
+            store_sample(handler, binaries, b"a" * 100)
+            clock.advance(1)
+        infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO" and "Unable to set" in r.getMessage()]
+        info = "Unable to set the mode of %s to 440: [Errno 1] Operation not permitted" % (binaries / md5)
+        assert infos == [info] * 3
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings == ["samples whose mode could not be set: 1 sample(s) in the last minute, "
+                            "the last: %s: [Errno 1] Operation not permitted" % md5]
+        clock.advance(60)
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 2

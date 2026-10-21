@@ -53,6 +53,7 @@
 #include "log.h"
 #include "pchild.h"
 #include "incident.h"
+#include "log_summary.h"
 #include "processor.h"
 
 
@@ -118,12 +119,40 @@ struct connection *connection_new(enum connection_transport type)
 	return con;
 }
 
+struct log_summary connection_accept_failed_summary = LOG_SUMMARY_INIT("accepts failed in a row", "time(s)");
+struct log_summary connection_out_of_fds_summary =
+	LOG_SUMMARY_INIT("connections closed for running out of fds", "connection(s)");
+struct log_summary connection_no_socket_summary = LOG_SUMMARY_INIT("connections without a socket", "connection(s)");
+struct log_summary connection_no_address_summary = LOG_SUMMARY_INIT("connections without their address", "connection(s)");
+struct log_summary connection_accept_backoff_summary =
+	LOG_SUMMARY_INIT("listeners paused after accept() failed", "time(s)");
+
+/* the errors of the clients a listener accepts (ECONNABORTED, ...): info, one warning a minute */
+void connection_accept_failed_log(struct connection *con, int count, int error)
+{
+	g_info("accept() failed %i times in a row on %s (%s)", count, con->local.node_string, strerror(error));
+	log_summary_addf(&connection_accept_failed_summary, "%s (%s)", con->local.node_string, strerror(error));
+}
+
+/* a connection closed at once, many clients make many: info, one warning a minute */
+void connection_out_of_fds_log(int fd)
+{
+	g_info("Running out of fds, closing connection (fd %i limit %i applied limit %i)",
+		   fd, g_dionaea->limits.fds, g_dionaea->limits.fds * 70/100);
+	log_summary_addf(&connection_out_of_fds_summary, "fd %i, limit %i, applied limit %i",
+					 fd, g_dionaea->limits.fds, g_dionaea->limits.fds * 70/100);
+}
+
 bool connection_node_set_local(struct connection *con)
 {
 	socklen_t sizeof_sa = sizeof(struct sockaddr_storage);
 	if( getsockname(con->socket, (struct sockaddr *)&con->local.addr, &sizeof_sa) != 0 )
 	{
-		g_warning("getsockname failed (%s)", strerror(errno));
+		/* of every connection: info, one warning a minute */
+		int error = errno;
+		g_info("getsockname failed (%s)", strerror(error));
+		log_summary_addf(&connection_no_address_summary, "getsockname, %s", strerror(error));
+		errno = error;
 		return false;
 	}
 	return node_info_set(&con->local, &con->local.addr);
@@ -139,7 +168,11 @@ bool connection_node_set_remote(struct connection *con)
 		if( error == ENOTCONN )
 			g_debug("getpeername failed (%s)", strerror(error));
 		else
-			g_warning("getpeername failed (%s)", strerror(error));
+		{
+			/* of every connection: info, one warning a minute */
+			g_info("getpeername failed (%s)", strerror(error));
+			log_summary_addf(&connection_no_address_summary, "getpeername, %s", strerror(error));
+		}
 		errno = error;
 		return false;
 	}
@@ -153,7 +186,11 @@ bool connection_socket(struct connection *con, int family, int type, int protoco
 
 	if ((con->socket = socket(family, type, protocol)) == -1 )
 	{
-		g_warning("socket() failed for con %p %i (%s)", con, errno, strerror(errno));
+		/* EMFILE of a session or a data connection of a client: info, one warning a minute */
+		int error = errno;
+		g_info("socket() failed for con %p %i (%s)", con, error, strerror(error));
+		log_summary_add(&connection_no_socket_summary, strerror(error));
+		errno = error;
 		con->protocol.error(con, ECONMANY);
 		connection_free(con);
 		return false;
@@ -1277,8 +1314,10 @@ void connection_accept_backoff(struct connection *con, int error)
 	if( con->socket == -1 )
 		return;
 
-	g_warning("accept() failed on %s (%s), listening again in %.0fs",
-			  con->local.node_string, strerror(error), CONNECTION_ACCEPT_RETRY_INTERVAL);
+	/* up to once a retry interval per listener while it lasts: info, one warning a minute */
+	g_info("accept() failed on %s (%s), listening again in %.0fs",
+		   con->local.node_string, strerror(error), CONNECTION_ACCEPT_RETRY_INTERVAL);
+	log_summary_addf(&connection_accept_backoff_summary, "%s (%s)", con->local.node_string, strerror(error));
 
 	if( ev_is_active(&con->events.io_in) )
 		ev_io_stop(CL, &con->events.io_in);

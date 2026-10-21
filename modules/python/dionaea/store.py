@@ -7,6 +7,7 @@
 from dionaea import IHandlerLoader
 from dionaea.core import ihandler, incident, g_dionaea
 from dionaea.exception import LoaderError
+from dionaea.logtext import LogSummary, log_text
 from dionaea.upload import incoming_dir
 from dionaea.util import md5file, sha256file
 
@@ -23,6 +24,11 @@ import threading
 import time
 logger = logging.getLogger('store')
 logger.setLevel(logging.DEBUG)
+
+# one warning a minute for the samples of all clients that are not stored or whose mode stays; the
+# line of each is info (logtext.LogSummary)
+NOT_STORED = LogSummary(logger, "samples not stored at max_size", "sample(s)")
+NOT_PROTECTED = LogSummary(logger, "samples whose mode could not be set", "sample(s)")
 
 
 #: Mode of a stored sample: read-only, never executable (the folder is on the host of the operator)
@@ -449,18 +455,21 @@ class storehandler(ihandler):
         i.report()
 
     def _warn_refused(self, md5, size, url):
-        """One warning per refused sample (the last REFUSED_MEMORY of them are remembered)."""
+        """One info line per refused sample (the last REFUSED_MEMORY of them are remembered) and the
+        summary warning of all of them."""
         if md5 in self._refused:
             self._refused.move_to_end(md5)
-            logger.debug("still not storing %s (%d bytes, %s)", md5, size, url)
+            logger.debug("still not storing %s (%d bytes, %s)", md5, size, log_text(url))
             return
         self._refused[md5] = True
         while len(self._refused) > REFUSED_MEMORY:
             self._refused.popitem(last=False)
-        logger.warning(
+        logger.info(
             "Not storing %s (%d bytes, %s): %d of %d bytes of %s are used (max_size %d MiB)",
-            md5, size, url, self.quota.used, self.max_size, self.download_dir, self.max_size // MIB
+            md5, size, log_text(url), self.quota.used, self.max_size, self.download_dir, self.max_size // MIB
         )
+        NOT_STORED.add("%s (%d bytes): %d of %d bytes of %s are used (max_size %d MiB)" % (
+            md5, size, self.quota.used, self.max_size, self.download_dir, self.max_size // MIB))
 
     def _protect(self, path):
         """A sample that was stored by an earlier version may have another mode: make it 0440."""
@@ -468,7 +477,8 @@ class storehandler(ihandler):
             if stat.S_IMODE(os.stat(path).st_mode) != SAMPLE_MODE:
                 os.chmod(path, SAMPLE_MODE)
         except OSError as e:
-            logger.warning("Unable to set the mode of %s to %o: %s", path, SAMPLE_MODE, e)
+            logger.info("Unable to set the mode of %s to %o: %s", path, SAMPLE_MODE, e)
+            NOT_PROTECTED.add("%s: %s" % (os.path.basename(path), log_text(e)))
 
     def _place(self, src, dst):
         """

@@ -46,6 +46,7 @@
 #include "connection.h"
 #include "util.h"
 #include "log.h"
+#include "log_summary.h"
 #include "incident.h"
 #include "processor.h"
 
@@ -55,6 +56,8 @@
  *
  */
 
+
+struct log_summary connection_tcp_read_failed_summary = LOG_SUMMARY_INIT("TCP reads failed", "connection(s)");
 
 void connection_tcp_accept_cb (EV_P_ struct ev_io *w, int revents)
 {
@@ -82,8 +85,7 @@ void connection_tcp_accept_cb (EV_P_ struct ev_io *w, int revents)
 				// back to the event loop with the watcher still active
 				if( ++transient_errors < CONNECTION_ACCEPT_TRANSIENT_MAX )
 					continue;
-				g_warning("accept() failed %i times in a row on %s (%s)",
-						  transient_errors, con->local.node_string, strerror(error));
+				connection_accept_failed_log(con, transient_errors, error);
 				break;
 			}
 
@@ -94,10 +96,7 @@ void connection_tcp_accept_cb (EV_P_ struct ev_io *w, int revents)
 
 		if( accepted_socket > g_dionaea->limits.fds * 70/100 )
 		{
-			g_warning("Running out of fds, closing connection (fd %i limit %i applied limit %i)",
-					  accepted_socket,
-					  g_dionaea->limits.fds,
-					  g_dionaea->limits.fds * 70/100);
+			connection_out_of_fds_log(accepted_socket);
 			close(accepted_socket);
 			continue;
 		}
@@ -111,7 +110,8 @@ void connection_tcp_accept_cb (EV_P_ struct ev_io *w, int revents)
 			if( errno == ENOTCONN )
 				g_debug("accepting connection failed, the client is gone, closing connection");
 			else
-				g_warning("accepting connection failed, closing connection");
+				/* the reason is in the summary of connection_node_set_local / _remote */
+				g_info("accepting connection failed, closing connection");
 			close(accepted->socket);
 			accepted->socket = -1;
 			// Free connection information but don't report
@@ -301,8 +301,13 @@ void connection_tcp_io_in_cb(EV_P_ struct ev_io *w, int revents)
 			g_info("recv failed size %i recv_size %i (%s), connection %s", size, recv_size, strerror(lerrno),
 				   con->remote.node_string);
 		else
-			g_warning("recv failed size %i recv_size %i (%s), connection %s", size, recv_size, strerror(lerrno),
-					  con->remote.node_string);
+		{
+			/* every connection can: info, one warning a minute */
+			g_info("recv failed size %i recv_size %i (%s), connection %s", size, recv_size, strerror(lerrno),
+				   con->remote.node_string);
+			log_summary_addf(&connection_tcp_read_failed_summary, "%s, connection %s", strerror(lerrno),
+							 con->remote.node_string);
+		}
 		connection_tcp_disconnect(con);
 	}
 	g_string_free(new_in, TRUE);

@@ -18,6 +18,7 @@ target_sources(
     connection_udp.c
     dns.c
     download_log.c
+    log_summary.c
     log_text.c
     incident.c
     log.c

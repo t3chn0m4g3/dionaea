@@ -111,3 +111,56 @@ def test_hc_count_warnings_fails_outside_its_bounds(tmp_path):
     result = bash(script)
     assert result.returncode != 0
     assert "FAIL: dionaea.log has 0 warnings about refused dumps in 2 minute(s) (expected 1 to 3)" in result.stderr
+
+
+# ---- tools/count_warnings.sh: the warnings of the errors log per message, and their bound ----
+
+COUNT_WARNINGS = FUNCTIONAL / "tools" / "count_warnings.sh"
+
+
+def _warning(t, domain, message):
+    return "[21102026 10:%02d:%02d] %s %s-warning: %s" % (t // 60, t % 60, domain, "x.c:1", message)
+
+
+def run_count_warnings(tmp_path, lines, minutes):
+    log = tmp_path / "dionaea-errors.log"
+    log.write_text("\n".join(lines) + "\n")
+    return subprocess.run(["bash", str(COUNT_WARNINGS), str(log), str(minutes)], capture_output=True, text=True,
+                          timeout=30)
+
+
+def test_a_summary_may_be_there_once_a_started_minute_and_once_more(tmp_path):
+    # a summary of one message a minute over 12 minutes, with a different last text each time
+    lines = [_warning(60 * m, "SMB", "uploads dropped: %d upload(s) in the last minute, the last: "
+                      "write of %d bytes (192.0.2.%d)" % (m + 1, 100 * m, m)) for m in range(13)]
+    result = run_count_warnings(tmp_path, lines, 12)
+    assert result.returncode == 0, result.stderr
+    assert "13 SMB: uploads dropped: N upload(s) in the last minute" in result.stdout
+    result = run_count_warnings(tmp_path, lines + [lines[-1]], 12)
+    assert result.returncode == 1
+    assert "uploads dropped" in result.stderr
+
+
+def test_a_unit_of_several_words_is_one_summary(tmp_path):
+    lines = [_warning(60 * m, "log_sqlite", "logsql: %d incident(s) not recorded in the last minute, the last: "
+                      "unable to open database file (192.0.2.%d)" % (m + 1, m)) for m in range(3)]
+    result = run_count_warnings(tmp_path, lines, 2)
+    assert result.returncode == 0, result.stderr
+    assert "3 log_sqlite: logsql: N incident(s) not recorded in the last minute" in result.stdout
+
+
+def test_another_warning_may_be_there_five_times(tmp_path):
+    lines = [_warning(t, "connection", "socket() failed for con 0x%x 24 (Too many open files)" % t)
+             for t in range(5)]
+    assert run_count_warnings(tmp_path, lines, 30).returncode == 0
+    sixth = _warning(9, "connection", "socket() failed for con 0x1 24 (Too many open files)")
+    result = run_count_warnings(tmp_path, lines + [sixth], 30)
+    assert result.returncode == 1
+    assert "6 connection: socket() failed for con ADDR N (Too many open files)" in result.stderr
+
+
+def test_no_warnings_and_other_levels(tmp_path):
+    lines = ["[21102026 10:00:00] SMB x.c:1-info: upload dropped: write of 1 bytes",
+             "[21102026 10:00:00] SMB-critical: There was an error"]
+    result = run_count_warnings(tmp_path, lines, 1)
+    assert result.returncode == 0 and result.stdout == ""

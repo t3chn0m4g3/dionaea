@@ -30,8 +30,18 @@
 #include "dionaea.h"
 #include "util.h"
 #include "log.h"
+#include "log_summary.h"
 
 #define D_LOG_DOMAIN "util"
+
+struct log_summary util_tempfile_summary = LOG_SUMMARY_INIT("temporary files not made", "file(s)");
+
+/* a temporary file of a dump, a download or an upload that is not made: info, one warning a minute */
+static void tempfile_failed(const char *path, int error)
+{
+	g_info("could not open path %s (%s)", path, strerror(error));
+	log_summary_addf(&util_tempfile_summary, "%s (%s)", path, strerror(error));
+}
 
 void *ADDROFFSET(const void *x)
 {
@@ -250,7 +260,7 @@ static struct tempfile *tempfile_open(const char *path, const char *prefix, bool
 	if( tf->fh == NULL )
 	{
 		int error = errno;
-		g_warning("could not open path %s (%s)", tf->path, strerror(error));
+		tempfile_failed(tf->path, error);
 		unlink(tf->path);
 		close(tf->fd);
 		g_free(tf->path);
@@ -266,7 +276,11 @@ struct tempfile *tempfile_new(char *path, char *prefix)
 	bool made;
 	struct tempfile *tf = tempfile_open(path, prefix, &made);
 	if( tf == NULL && !made )
-		g_warning("could not open path %s (%s)", path, strerror(errno));
+	{
+		int error = errno;
+		tempfile_failed(path, error);
+		errno = error;
+	}
 	return tf;
 }
 
@@ -341,7 +355,11 @@ struct tempfile *tempincoming_new(const char *download_dir, char *prefix)
 			tf = tempfile_open(path, prefix, &made);
 	}
 	if( tf == NULL && !made )
-		g_warning("could not open path %s (%s)", path, strerror(errno));
+	{
+		int error = errno;
+		tempfile_failed(path, error);
+		errno = error;
+	}
 	g_free(path);
 	return tf;
 }

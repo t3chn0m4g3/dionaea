@@ -23,7 +23,7 @@ from .include.packet import Raw
 from .ntlm import Exchange, filetime, legacy_password, negotiate_token, variant
 from .smb2 import SMB2, MAX_MESSAGE
 from dionaea.util import calculate_doublepulsar_opcode, xor
-from dionaea.logtext import PARSE_ERRORS, log_text, log_unreadable
+from dionaea.logtext import PARSE_ERRORS, LogSummary, log_text, log_unreadable
 from .include.asn1.asn1 import ASN1_Error
 from dionaea.upload import (
     DEFAULT_MAX_UPLOAD_SIZE,
@@ -36,6 +36,13 @@ from dionaea.upload import (
 
 
 smblog = logging.getLogger('SMB')
+
+# one warning a minute for the connections at the limit of open files and the uploads that are not
+# kept, of all connections; the line of each is info (logtext.LogSummary)
+FID_LIMIT = LogSummary(smblog, "connections at the limit of open files", "connection(s)")
+UPLOAD_NO_FILE = LogSummary(smblog, "uploads not stored, no file could be made", "upload(s)")
+UPLOAD_DROPPED = LogSummary(smblog, "uploads dropped", "upload(s)")
+UPLOAD_FAILED = LogSummary(smblog, "uploads failed", "upload(s)")
 
 # what the parsers raise for bytes of a client they can not read (also BER / ASN.1 of NTLM)
 SMB_PARSE_ERRORS = PARSE_ERRORS + (ASN1_Error,)
@@ -900,7 +907,8 @@ class smbd(connection):
             # once per connection, a client can ask as often as it likes
             if not self.state.get('fid_limit_logged'):
                 self.state['fid_limit_logged'] = True
-                smblog.warning("%i files are open, no more allowed", len(self.fids))
+                smblog.info("%i files are open, no more allowed", len(self.fids))
+                FID_LIMIT.add("%i files, %s" % (len(self.fids), self.remote.host))
             return None
         fid = 0x4000
         while fid in self.fids:
@@ -1025,7 +1033,8 @@ class smbd(connection):
         try:
             upload = UploadFile("smb-", max_size=getattr(self.config, "max_upload_size", DEFAULT_MAX_UPLOAD_SIZE))
         except OSError as e:
-            smblog.error("unable to create a file for an upload: %s", e)
+            smblog.info("unable to create a file for an upload: %s (%s)", log_text(e), self.remote.host)
+            UPLOAD_NO_FILE.add("%s (%s)" % (log_text(e), self.remote.host))
             self.fids[response.FID] = None
             return
         upload.client_name = filename
@@ -1050,11 +1059,13 @@ class smbd(connection):
             return upload.write(data, offset), 0
         except UploadTooLarge as e:
             # a file this large is not what the service is for: drop it, the client gets the errors
-            smblog.warning("upload dropped: %s", e)
+            smblog.info("upload dropped: %s (%s)", log_text(e), self.remote.host)
+            UPLOAD_DROPPED.add("%s (%s)" % (log_text(e), self.remote.host))
             upload.discard()
             return 0, STATUS_DISK_FULL
         except UploadError as e:
-            smblog.warning("upload failed: %s", e)
+            smblog.info("upload failed: %s (%s)", log_text(e), self.remote.host)
+            UPLOAD_FAILED.add("%s (%s)" % (log_text(e), self.remote.host))
             upload.discard()
             return 0, STATUS_UNSUCCESSFUL
 

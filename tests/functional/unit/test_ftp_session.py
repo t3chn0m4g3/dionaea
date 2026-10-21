@@ -157,6 +157,12 @@ def clean():
     FakeConnection.fail = None
 
 
+@pytest.fixture(autouse=True)
+def clock(summaries):
+    """The summary warnings of ftp.py with the clock of the test, nothing logged before."""
+    return summaries(ftp.STORAGE, ftp.NO_SOCKET, ftp.NO_FILE, ftp.DROPPED)
+
+
 @pytest.fixture
 def session(tmp_path):
     """A control connection of a logged in client."""
@@ -374,8 +380,13 @@ def test_the_safety_net_answers_425_for_errors_of_the_sockets(session, monkeypat
     with caplog.at_level(logging.DEBUG, logger="ftp"):
         session.handle_io_in(b"PASV\r\n")
     assert replies(session) == ["425 Can't open data connection."]
-    logged = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert len(logged) == 1 and logged[0].exc_info is not None, [r.getMessage() for r in caplog.records]
+    # the line of the command with its traceback at info, the summary warning
+    # the resources of the system, no traceback: the line of the command at info, the summary warning
+    infos = [r for r in caplog.records if r.levelno == logging.INFO and r.getMessage().startswith("PASV failed: ")]
+    assert len(infos) == 1 and infos[0].exc_info is None, [r.getMessage() for r in caplog.records]
+    logged = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert logged == [("FTP data connections failed for lack of sockets: 1 command(s) in the last minute, "
+                      "the last: PASV failed: [Errno %d] %s (198.51.100.7)") % (code, os.strerror(code))], logged
     assert not session.closed
 
 
@@ -486,7 +497,69 @@ def test_the_error_of_a_full_disk_with_the_name_of_the_client_is_plain_text(sess
     assert len(logged) == 1, logged
     assert all(0x20 <= ord(c) <= 0x7e for c in logged[0]), logged[0]
     assert logged[0].endswith("..."), logged[0]
-    assert len(logged[0]) < 300
+    # the text of the summary warning and the command line of at most 256 + 3 characters
+    assert len(logged[0]) < 400
+
+
+# ---- the lines of every session are info, one warning a minute sums them up
+
+def test_full_disks_of_many_sessions_are_one_warning_a_minute(tmp_path, monkeypatch, caplog, clock):
+    def fails(self, p):
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+    monkeypatch.setattr(ftp.FTPd, "ftp_MKD", fails)
+    with caplog.at_level(logging.DEBUG, logger="ftp"):
+        for n in range(5):
+            d = ftp.FTPd()
+            d.basedir = str(tmp_path)
+            d.handle_io_in(b"USER root\r\nPASS secret\r\nMKD dir%d\r\n" % n)
+            assert replies(d)[-1] == FULL
+            clock.advance(1)
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and "failed" in r.getMessage()]
+        assert infos == ["MKD dir%d failed: [Errno 28] No space left on device" % n for n in range(5)]
+        logged = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert logged == [("FTP commands failed for lack of storage: 1 command(s) in the last minute, "
+                          "the last: MKD dir0 failed: [Errno 28] No space left on device")]
+        clock.advance(60)
+    logged = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert logged[1:] == [("FTP commands failed for lack of storage: 4 command(s) in the last minute, "
+                          "the last: MKD dir4 failed: [Errno 28] No space left on device")]
+
+
+def test_dropped_uploads_of_many_sessions_are_one_warning_a_minute(session, caplog, clock):
+    with caplog.at_level(logging.DEBUG, logger="ftp"):
+        for _ in range(4):
+            con = data_connection(session)
+            con.mode = "recv_file"
+            con.upload = TooLarge(ftp.UploadTooLarge("write of 3 bytes at offset 10, limit is 4"))
+            con.handle_io_in(b"abc")
+            clock.advance(1)
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and "dropped" in r.getMessage()]
+        assert infos == ["upload dropped: write of 3 bytes at offset 10, limit is 4 (198.51.100.7)"] * 4
+        clock.advance(60)
+    logged = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert logged == [
+        ("uploads dropped: 1 upload(s) in the last minute, the last: write of 3 bytes at offset 10, limit is 4 "
+         "(198.51.100.7)"),
+        ("uploads dropped: 3 upload(s) in the last minute, the last: write of 3 bytes at offset 10, limit is 4 "
+         "(198.51.100.7)")]
+
+
+def test_uploads_without_a_file_are_info_and_one_warning_a_minute(session, monkeypatch, caplog, clock):
+    def no_file(*args, **kwargs):
+        raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+    monkeypatch.setattr(ftp, "UploadFile", no_file)
+    with caplog.at_level(logging.DEBUG, logger="ftp"):
+        for _ in range(3):
+            data_connection(session).recv_file("x.bin")
+        clock.advance(60)
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and "unable" in r.getMessage()]
+    assert infos == ["unable to create a file for the upload: [Errno 24] Too many open files (198.51.100.7)"] * 3
+    logged = [(r.levelno, r.getMessage()) for r in caplog.records if r.levelno >= logging.WARNING]
+    assert logged == [
+        (logging.WARNING, ("uploads not stored, no file could be made: 1 upload(s) in the last minute, "
+                           "the last: [Errno 24] Too many open files (198.51.100.7)")),
+        (logging.WARNING, ("uploads not stored, no file could be made: 2 upload(s) in the last minute, "
+                           "the last: [Errno 24] Too many open files (198.51.100.7)"))]
 
 
 # ---- a PORT whose connect fails leaves no data connection behind

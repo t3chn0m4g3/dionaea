@@ -19,8 +19,17 @@
 
 #include "dionaea.h"
 #include "download_log.h"
+#include "threads.h"
 
 struct dionaea *g_dionaea = NULL;
+
+/* the summary arms no timer through the event loop here (src/threads.c is not linked) */
+struct async_cmd *async_cmd_new(async_cmd_cb function, void *data)
+{
+	(void)function;
+	(void)data;
+	g_assert_not_reached();
+}
 
 #define SECOND G_USEC_PER_SEC
 

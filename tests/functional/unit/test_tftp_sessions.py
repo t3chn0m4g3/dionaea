@@ -377,14 +377,60 @@ def test_a_limited_source_is_logged_once_a_minute_without_payload(server, clock,
         refused(server, "198.51.100.70", 200)
         clock.now += 30
         refused(server, "198.51.100.70", 200)
-    lines = [r.getMessage() for r in caplog.records if "198.51.100.70" in r.getMessage()]
+    lines = [r.getMessage() for r in caplog.records if "198.51.100.70" in r.getMessage() and r.levelname == "INFO"]
     assert len(lines) == 1, lines
     assert "file.bin" not in lines[0]
     with caplog.at_level("INFO", logger="tftp"):
         caplog.clear()
         clock.now += 31
         refused(server, "198.51.100.70", 200)
-    assert len([r for r in caplog.records if "198.51.100.70" in r.getMessage()]) == 1
+    assert len([r for r in caplog.records if "198.51.100.70" in r.getMessage() and r.levelname == "INFO"]) == 1
+
+
+def test_the_limited_sources_are_info_and_one_warning_a_minute(server, clock, caplog, summaries):
+    """A source whose ERROR replies are limited is an info line (once a minute per source); one
+    warning a minute counts the sources."""
+    summary_clock = summaries(tftp.RATE_LIMITED)
+    for n in range(12):
+        fill_source(server, "198.51.100.%d" % (150 + n))
+    with caplog.at_level("INFO", logger="tftp"):
+        for n in range(12):
+            refused(server, "198.51.100.%d" % (150 + n), 30)
+            summary_clock.advance(1)
+        infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO" and "rate limited" in r.getMessage()]
+        # 10 sources by name, then one line for the rest
+        assert len(infos) == 11
+        assert infos[0] == "TFTP error replies to 198.51.100.150 are rate limited, 1 dropped"
+        assert infos[10].startswith("TFTP error replies to more sources are rate limited")
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings == [("TFTP error replies rate limited: 1 source(s) in the last minute, "
+                            "the last: 198.51.100.150, 1 dropped")]
+        summary_clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings[1:] == [("TFTP error replies rate limited: 11 source(s) in the last minute, "
+                            "the last: 198.51.100.161, 1 dropped")]
+
+
+def test_the_session_limit_is_info_and_one_warning_a_minute(server, caplog, summaries):
+    """Every time the sessions reach the limit again is an info line; one warning a minute."""
+    summary_clock = summaries(tftp.SESSION_LIMIT)
+    with caplog.at_level("INFO", logger="tftp"):
+        sessions = [request(server, "198.51.100.%d" % (i // 4), port=40000 + i)[0] for i in range(64)]
+        for round in range(3):
+            assert request(server, "203.0.113.9", port=41000 + round)[0] is None
+            # a place is free and taken again: the limit is reached again
+            sessions[round].close()
+            sessions[round] = request(server, "203.0.113.%d" % (10 + round), port=42000 + round)[0]
+            assert sessions[round] is not None
+            summary_clock.advance(1)
+        assert request(server, "203.0.113.9", port=41010)[0] is None
+        infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO" and "limit reached" in r.getMessage()]
+        assert infos == ["TFTP session limit reached (64 sessions), refusing read requests"] * 4
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings == ["TFTP session limit reached: 1 time(s) in the last minute, the last: 64 sessions"]
+        summary_clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings[1:] == ["TFTP session limit reached: 3 time(s) in the last minute, the last: 64 sessions"]
 
 
 def test_a_write_request_error_is_limited_too(server, clock):
@@ -421,6 +467,32 @@ def test_a_file_that_cannot_be_opened_ends_the_session(server, monkeypatch):
     assert handler.closed and handler.sent == []
     assert tftp.SESSIONS.total == 0
     assert not server.closed
+
+
+def test_files_that_cannot_be_opened_are_info_and_one_warning_a_minute(server, monkeypatch, caplog, summaries):
+    import builtins
+    real_open = builtins.open
+
+    def no_fds(path, *args, **kwargs):
+        if str(path).endswith("file.bin"):
+            raise OSError(24, "Too many open files")
+        return real_open(path, *args, **kwargs)
+    monkeypatch.setattr(builtins, "open", no_fds)
+    summary_clock = summaries(tftp.NOT_OPENED)
+    with caplog.at_level("INFO", logger="tftp"):
+        for n in range(5):
+            request(server, "198.51.100.%d" % (92 + n))
+            summary_clock.advance(1)
+        infos = [r.getMessage() for r in caplog.records if r.levelname == "INFO" and "Unable to open" in r.getMessage()]
+        assert len(infos) == 5
+        assert infos[0].startswith("Unable to open ") and infos[0].endswith("file.bin: Too many open files")
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert warnings[0].startswith("TFTP files not opened: 1 session(s) in the last minute, the last: ")
+        assert warnings[0].endswith("file.bin: Too many open files")
+        summary_clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2 and warnings[1].startswith("TFTP files not opened: 4 session(s) in the last minute")
 
 
 # ---- the ERROR replies of the sessions share the buckets of the server socket

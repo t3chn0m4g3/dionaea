@@ -33,6 +33,12 @@ struct tempfile
 	char *path;
 };
 
+/*
+ * A temporary file that can not be made (no descriptor, a full disk, its folder gone): an info
+ * line, and an event of util_tempfile_summary (one warning a minute, log_summary.h).
+ */
+struct log_summary;
+extern struct log_summary util_tempfile_summary;
 struct tempfile *tempfile_new(char *path, char *prefix);
 struct tempfile *tempdownload_new(char *prefix);
 

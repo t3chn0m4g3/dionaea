@@ -24,6 +24,7 @@
 #include "stubs.h"
 #include "util.h"
 #include "streamcap.h"
+#include "log_summary.h"
 
 /*
  * close() of the code under test is wrapped (-Wl,--wrap=close): a close of a
@@ -297,17 +298,58 @@ static void tempfile_close_keeps_the_next_file(void)
 	g_free(dir);
 }
 
+/* the summaries of the lines of every connection with a clock that stands still: only the first
+ * event after summaries_reset() is a warning (log_summary.h) */
+static gint64 still_clock(void)
+{
+	return 1000 * G_USEC_PER_SEC;
+}
+
+static gint64 summary_now;
+static gint64 moving_clock(void)
+{
+	return summary_now;
+}
+
+static guint schedules;
+static bool no_timer(struct log_summary *s, double after)
+{
+	(void)s;
+	(void)after;
+	schedules++;
+	return true;
+}
+
+static const struct log_summary_hooks still_hooks = { still_clock, no_timer };
+static const struct log_summary_hooks moving_hooks = { moving_clock, no_timer };
+
+static void summaries_reset(const struct log_summary_hooks *hooks)
+{
+	struct log_summary *summaries[] = { &util_tempfile_summary, streamdumper_write_summary(),
+										streamdumper_folder_summary() };
+	for( size_t i = 0; i < G_N_ELEMENTS(summaries); i++ )
+	{
+		log_summary_set_hooks(summaries[i], hooks);
+		log_summary_reset(summaries[i]);
+	}
+	schedules = 0;
+}
+
 static void tempfile_new_fails_cleanly(void)
 {
 	char *dir = tmp_dir();
 	char *missing = g_build_filename(dir, "missing", NULL);
 	/* the path of the failed file is not leaked (ASan) */
 	warnings_reset();
+	summaries_reset(&still_hooks);
 	g_assert_null(tempfile_new(missing, "x-"));
-	g_assert_cmpuint(warnings_with("could not open path"), ==, 1);
+	g_assert_cmpuint(infos_with_prefix("could not open path"), ==, 1);
+	g_assert_cmpuint(warnings_with("temporary files not made: 1 file(s) in the last minute, the last: "), ==, 1);
+	g_assert_cmpuint(warnings_with("/missing (No such file or directory)"), ==, 1);
 	g_free(missing);
 	rm_rf(dir);
 	g_free(dir);
+	summaries_reset(NULL);
 }
 
 /* the streamdumper of one connection: [processor.streamdumper] with config.path below base */
@@ -399,6 +441,87 @@ static char *only_dump(const char *dir)
 	g_free(day_path);
 	g_dir_close(days);
 	return content;
+}
+
+/*
+ * fwrite() of the code under test is wrapped (-Wl,--wrap=fwrite): with fwrite_fails it fails
+ * with ENOSPC, as on a full disk
+ */
+static gint fwrite_fails;
+
+size_t __real_fwrite(const void *ptr, size_t size, size_t n, FILE *fh);
+size_t __wrap_fwrite(const void *ptr, size_t size, size_t n, FILE *fh)
+{
+	if( g_atomic_int_get(&fwrite_fails) )
+	{
+		errno = ENOSPC;
+		return 0;
+	}
+	return __real_fwrite(ptr, size, n, fh);
+}
+
+/*
+ * no dump for many connections (its folder can not be made, no file in it, a full disk): an
+ * info line each, one warning at once and one a minute after it of each message
+ */
+static void streamdumper_failures_are_info_and_one_warning_a_minute(void)
+{
+	char *dir = tmp_dir();
+	/* the base is a file: no folder of the day below it, no file in that */
+	char *base = g_build_filename(dir, "file", NULL);
+	g_assert_true(g_file_set_contents(base, "x", 1, NULL));
+	struct processor *p = streamdumper_new(base, NULL);
+	warnings_reset();
+	summaries_reset(&moving_hooks);
+	summary_now = 1000 * G_USEC_PER_SEC;
+	for( int i = 0; i < 4; i++ )
+	{
+		struct dump d;
+		dump_open(&d, p, 2000 + i);
+		dump_io(&d, bistream_in, "GET /\r\n", 7);
+		dump_close(&d);
+		summary_now += G_USEC_PER_SEC;
+	}
+	g_assert_cmpuint(infos_with_prefix("Could not create "), ==, 4);
+	g_assert_cmpuint(infos_with_prefix("could not open path "), ==, 4);
+	g_assert_cmpuint(warnings->len, ==, 2);
+	g_assert_cmpuint(warnings_with("bistream folders not made: 1 time(s) in the last minute, the last: "), ==, 1);
+	g_assert_cmpuint(warnings_with("temporary files not made: 1 file(s) in the last minute, the last: "), ==, 1);
+	g_assert_cmpuint(warnings_with("(Not a directory)"), ==, 2);
+	summary_now += 60 * G_USEC_PER_SEC;
+	log_summary_due(streamdumper_folder_summary());
+	log_summary_due(&util_tempfile_summary);
+	g_assert_cmpuint(warnings_with("bistream folders not made: 3 time(s) in the last minute"), ==, 1);
+	g_assert_cmpuint(warnings_with("temporary files not made: 3 file(s) in the last minute"), ==, 1);
+	streamdumper_free(p);
+
+	/* a full disk: every write of every connection fails */
+	p = streamdumper_new(dir, NULL);
+	warnings_reset();
+	summaries_reset(&moving_hooks);
+	for( int i = 0; i < 3; i++ )
+	{
+		struct dump d;
+		dump_open(&d, p, 3000 + i);
+		g_atomic_int_set(&fwrite_fails, 1);
+		dump_io(&d, bistream_in, "GET /\r\n", 7);
+		dump_io(&d, bistream_out, "200", 3);
+		dump_close(&d);
+		g_atomic_int_set(&fwrite_fails, 0);
+		summary_now += G_USEC_PER_SEC;
+	}
+	g_assert_cmpuint(infos_with_prefix("Could not write "), >=, 6);
+	g_assert_cmpuint(warnings->len, ==, 1);
+	g_assert_cmpuint(warnings_with("bistream writes failed: 1 write(s) in the last minute, the last: "), ==, 1);
+	g_assert_cmpuint(warnings_with("(No space left on device)"), ==, 1);
+	summary_now += 60 * G_USEC_PER_SEC;
+	log_summary_due(streamdumper_write_summary());
+	g_assert_cmpuint(warnings->len, ==, 2);
+	streamdumper_free(p);
+	summaries_reset(NULL);
+	g_free(base);
+	rm_rf(dir);
+	g_free(dir);
 }
 
 static void streamdumper_closes_once(void)
@@ -2590,10 +2713,13 @@ static void incoming_tempfile(void)
 	tempfile_close(tf);
 	tempfile_unlink(tf);
 	tempfile_free(tf);
-	/* no download.dir: none, one warning, nothing made */
+	/* no download.dir: none, an info line and the summary warning, nothing made */
 	char *missing = g_build_filename(dir, "missing", NULL);
+	summaries_reset(&still_hooks);
 	g_assert_null(tempincoming_new(missing, "http-"));
-	g_assert_cmpuint(warnings_with("could not open path"), ==, 1);
+	g_assert_cmpuint(infos_with_prefix("could not open path"), ==, 1);
+	g_assert_cmpuint(warnings_with("temporary files not made: 1 file(s)"), ==, 1);
+	summaries_reset(NULL);
 	g_assert_false(g_file_test(missing, G_FILE_TEST_EXISTS));
 	g_free(missing);
 	g_free(incoming);
@@ -2631,6 +2757,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/tempfile/close-keeps-the-next-file", tempfile_close_keeps_the_next_file);
 	g_test_add_func("/tempfile/new-fails-cleanly", tempfile_new_fails_cleanly);
 	g_test_add_func("/streamdumper/closes-once", streamdumper_closes_once);
+	g_test_add_func("/streamdumper/failures-are-info", streamdumper_failures_are_info_and_one_warning_a_minute);
 	g_test_add_func("/streamdumper/large-read", streamdumper_large_read);
 	g_test_add_func("/streamdumper/locale", streamdumper_locale);
 	g_test_add_func("/streamcap/parse", parse);

@@ -167,6 +167,8 @@ tty_args=()
 if [[ "${DIONAEA_TTY:-0}" == "1" ]]; then
   tty_args=(-t -i)
 fi
+# the start of dionaea: the minutes of the run bound the summary warnings (tools/count_warnings.sh)
+run_started="$(date +%s)"
 docker run -d --name "${DIONAEA_CONTAINER}" --network "${NETWORK}" \
   --read-only --user 2000:2000 \
   --tmpfs /tmp:uid=2000,gid=2000,size=16m \
@@ -314,20 +316,28 @@ if [[ ${RC} -eq 0 ]]; then
       fi
     done < "${OUT_DIR}/expect-log"
   fi
-  # the warnings left in the errors log, per message (numbers as N, addresses as ADDR): information,
-  # no check. A message a client causes is info; a warning is a capture that was lost or cut,
-  # or a problem of dionaea.
-  warning_counts=""
+  # the warnings left in the errors log, per message (numbers as N, addresses as ADDR). A message a
+  # client causes is info; a warning is a capture that was lost or cut, or a problem of dionaea. One
+  # that every connection can write is one summary a minute (log_summary.c, logtext.LogSummary): it
+  # may be there once per started minute of the run and once more, any other message at most
+  # MAX_SAME_WARNING (5) times (tools/count_warnings.sh)
   if [[ -f "${errors_log}" && -r "${errors_log}" ]]; then
-    warning_counts="$(grep -E '^\[[0-9]{8} [0-9:]{8}\] [^ ]+( [^ ]+)?-warning: ' "${errors_log}" \
-    | sed -E 's/^\[[^]]*\] ([^ ]+)( [^ ]+)?-warning: /\1: /; s/0x[0-9a-fA-F]+/ADDR/g; s/\.incoming\/[^ :]+/.incoming\/FILE/g; s/(^|[^A-Za-z0-9_])[0-9]+/\1N/g' \
-    | sort | uniq -c | sort -rn || true)"
-  fi
-  if [[ -n "${warning_counts}" ]]; then
-    say "warnings in dionaea-errors.log, per message (information only):"
-    printf '%s\n' "${warning_counts}" | cut -c1-200
-  else
-    say "no warnings in dionaea-errors.log"
+    run_minutes=$(( ( $(date +%s) - run_started + 59 ) / 60 ))
+    set +e
+    warning_counts="$("${HERE}/tools/count_warnings.sh" "${errors_log}" "${run_minutes}" 2>"${OUT_DIR}/warnings-over")"
+    counts_rc=$?
+    set -e
+    if [[ -n "${warning_counts}" ]]; then
+      say "warnings in dionaea-errors.log, per message (${run_minutes} minutes of the run):"
+      printf '%s\n' "${warning_counts}" | cut -c1-200
+    else
+      say "no warnings in dionaea-errors.log"
+    fi
+    if [[ ${counts_rc} -ne 0 ]]; then
+      cut -c1-200 "${OUT_DIR}/warnings-over" >&2
+      echo "dionaea-errors.log: message(s) above their bound (see above): a summary once per started minute and once more (${run_minutes} + 1), any other message 5 times" >&2
+      RC=1
+    fi
   fi
 fi
 

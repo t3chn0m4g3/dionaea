@@ -145,3 +145,6 @@ cython_debug/
 ### fuzz targets (tests/fuzz/README.md)
 build-fuzz/
 build-cov/
+
+### macOS
+.DS_Store

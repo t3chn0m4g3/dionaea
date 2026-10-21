@@ -40,6 +40,11 @@ def _load():
     sys.modules["dionaea.core"] = core
     root = Path(os.environ["DIONAEA_PY_SRC"]) if os.environ.get("DIONAEA_PY_SRC") else (
         Path(__file__).resolve().parents[3] / "modules" / "python" / "dionaea")
+    # the real logtext (stdlib only)
+    spec = importlib.util.spec_from_file_location("dionaea.logtext", root / "logtext.py")
+    logtext = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(logtext)
+    sys.modules["dionaea.logtext"] = logtext
     spec = importlib.util.spec_from_file_location("upload_under_test", root / "upload.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -174,6 +179,60 @@ def test_a_file_of_holes_is_not_reported(tmp_path):
     assert f.complete("c", "u") is False
     assert FakeIncident.reported == []
     assert left_over(tmp_path) == []
+
+
+def test_the_files_of_holes_of_many_uploads_are_one_warning_a_minute(tmp_path, caplog, summaries):
+    """A file of holes is dropped with an info line; the warning sums them up, once a minute."""
+    import logging
+    clock = summaries(upload.HOLES)
+    caplog.set_level(logging.INFO, logger="upload")
+    for _ in range(5):
+        f = make(tmp_path, max_size=64 * 1024 * 1024)
+        f.write(b"x" * 100, 32 * 1024 * 1024 - 100)
+        assert f.complete(types.SimpleNamespace(remote=types.SimpleNamespace(host="198.51.100.2")), "u") is False
+        clock.advance(1)
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and "dropping" in r.getMessage()]
+    assert len(infos) == 5
+    assert infos[0].endswith(": 100 bytes written, size is %d (198.51.100.2)" % (32 * 1024 * 1024))
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == ["uploads dropped for their holes: 1 upload(s) in the last minute, "
+                        "the last: 100 bytes written, size is %d (198.51.100.2)" % (32 * 1024 * 1024)]
+    clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings[1:] == ["uploads dropped for their holes: 4 upload(s) in the last minute, "
+                            "the last: 100 bytes written, size is %d (198.51.100.2)" % (32 * 1024 * 1024)]
+    assert FakeIncident.reported == []
+
+
+def test_a_file_that_can_not_be_closed_or_removed_is_one_warning_a_minute(tmp_path, caplog, summaries, monkeypatch):
+    import logging
+    clock = summaries(upload.NOT_CLOSED, upload.NOT_REMOVED)
+    caplog.set_level(logging.INFO, logger="upload")
+
+    def fail(*args):
+        raise OSError(5, "Input/output error")
+
+    for _ in range(3):
+        f = make(tmp_path)
+        f.write(b"x" * 10)
+        fp = f._fp
+        with monkeypatch.context() as m:
+            m.setattr(fp, "close", fail)
+            m.setattr(upload.os, "unlink", fail)
+            f.discard()
+        fp.close()
+        os.unlink(f.name)
+        clock.advance(1)
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert len([m for m in infos if m.startswith("unable to close ")]) == 3
+    assert len([m for m in infos if m.startswith("unable to remove ")]) == 3
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == [
+        "upload files not closed: 1 file(s) in the last minute, the last: [Errno 5] Input/output error",
+        "upload files not removed: 1 file(s) in the last minute, the last: [Errno 5] Input/output error"]
+    clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 4
 
 
 def test_small_holes_and_rewrites_are_fine(tmp_path):

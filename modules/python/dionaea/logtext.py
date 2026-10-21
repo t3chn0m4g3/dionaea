@@ -10,11 +10,15 @@ Every byte outside 0x20..0x7e is a '?' (a str counts by its UTF-8 bytes), and th
 at LIMIT characters with "..." behind, so a url, a file name or a header of a client stays on
 its line and in its size. A traceback keeps its lines: each one is such a text, and at most
 TRACEBACK_LINES of them stay (LogTextFormatter, the formatter of the log handler of dionaea, log.py).
-This module imports nothing of dionaea (tests/functional/unit).
+LogSummary is the summary of src/log_summary.c for the python modules: at most one warning a
+minute for a message that can come once per connection, request or session.
+This module imports nothing of dionaea at its import (tests/functional/unit).
 """
 
 import logging
 import struct
+import threading
+import time
 import traceback
 
 LIMIT = 256
@@ -106,3 +110,90 @@ def log_exception(exc, name="python", message="There was an error in the Python 
         return None
     text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip("\n")
     return message + "\n" + log_traceback(text)
+
+
+#: Seconds between two warnings of a LogSummary (LOG_SUMMARY_PERIOD of src/log_summary.c)
+SUMMARY_PERIOD = 60.0
+
+
+class LogSummary(object):
+    """At most one warning a period for a message that can come once per connection, request or session.
+
+    The caller logs its line of every event at info, with all its detail, and hands the summary a
+    short text of the event (a text of a client through log_text first): add(). The summary writes
+    "<what>: <N> <unit> in the last minute, the last: <text of the last event>" at warning with its
+    logger, as src/log_summary.c does for the core: the first event after a quiet period at once,
+    the ones after it when the period of that warning ends.
+
+    The services and handlers of dionaea run in the thread of the event loop, so is add(): the
+    timer at the end of a period is a dionaea.core.timer, made in that thread. Without the binding
+    (tests) there is no timer and the next event after the period writes the warning. clock and
+    schedule(summary, after) -> bool are for tests.
+    """
+
+    def __init__(self, logger, what, unit, period=SUMMARY_PERIOD, clock=time.monotonic, schedule=None):
+        self.logger = logger if isinstance(logger, logging.Logger) else logging.getLogger(logger)
+        self.what = what
+        self.unit = unit
+        self.period = period
+        self.clock = clock
+        self.schedule = schedule if schedule is not None else LogSummary._timer_schedule
+        self._lock = threading.Lock()
+        self._timer = None
+        self.reset()
+
+    def reset(self):
+        """Forget the events and the last warning (tests)."""
+        with self._lock:
+            self.pending = 0
+            self.last = None
+            self.warned_at = None
+            self.scheduled = False
+
+    def add(self, text):
+        """One event; text is the text of it in the warning (None: "-")."""
+        with self._lock:
+            self.pending += 1
+            self.last = "-" if text is None else str(text)
+            due = self._due_locked()
+        self._finish(due)
+
+    def due(self):
+        """The timer of the summary fired."""
+        with self._lock:
+            self.scheduled = False
+            due = self._due_locked() if self.pending > 0 else None
+        self._finish(due)
+
+    def _due_locked(self):
+        # (count, last) when the warning is due now, else the seconds to schedule (or None)
+        now = self.clock()
+        if self.warned_at is None or now - self.warned_at >= self.period:
+            due = (self.pending, self.last)
+            self.pending = 0
+            self.last = None
+            self.warned_at = now
+            return due
+        if self.scheduled:
+            return None
+        self.scheduled = True
+        return self.warned_at + self.period - now
+
+    def _finish(self, due):
+        if due is None:
+            return
+        if isinstance(due, tuple):
+            self.logger.warning("%s: %d %s in the last minute, the last: %s", self.what, due[0], self.unit, due[1])
+            return
+        if not self.schedule(self, due):
+            with self._lock:
+                self.scheduled = False
+
+    @staticmethod
+    def _timer_schedule(summary, after):
+        try:
+            from dionaea.core import timer
+        except ImportError:
+            return False
+        summary._timer = timer(summary.due, after)
+        return True

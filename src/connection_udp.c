@@ -46,6 +46,7 @@
 #include "connection.h"
 #include "util.h"
 #include "log.h"
+#include "log_summary.h"
 #include "incident.h"
 #include "processor.h"
 
@@ -56,6 +57,9 @@
  *
  */
 
+
+struct log_summary connection_udp_read_failed_summary = LOG_SUMMARY_INIT("UDP reads failed", "read(s)");
+struct log_summary connection_udp_not_sent_summary = LOG_SUMMARY_INIT("UDP replies not sent", "packet(s)");
 
 ssize_t recvfromto(int sockfd, void *buf, size_t len, int flags,
 				 const struct sockaddr *fromaddr, socklen_t *fromlen,
@@ -251,7 +255,11 @@ void connection_udp_io_in_cb(EV_P_ struct ev_io *w, int revents)
 
 	if( ret == -1 && errno != EAGAIN && errno != EWOULDBLOCK )
 	{
-		g_warning("connection error %i %s", ret, strerror(errno));
+		/* an ICMP error of a client (ECONNREFUSED, ...) and the like: info, one warning a minute */
+		int error = errno;
+		const char *peer = con->remote.node_string[0] != '\0' ? con->remote.node_string : "-";
+		g_info("connection error %i %s (%s)", ret, strerror(error), peer);
+		log_summary_addf(&connection_udp_read_failed_summary, "%s (%s)", strerror(error), peer);
 	}
 }
 
@@ -291,7 +299,11 @@ void _connection_send_packets(struct connection *con, int fd, GList **packets)
 			} else
 			{
 				g_debug("domain %i size %i", ((struct sockaddr *)&packet->to)->sa_family, size);
-				g_warning("sendtofrom failed %s",  strerror(errno));
+				/* a reply to every client can: info, one warning a minute */
+				int error = errno;
+				const char *peer = con->remote.node_string[0] != '\0' ? con->remote.node_string : "-";
+				g_info("sendtofrom failed %s (%s)",  strerror(error), peer);
+				log_summary_addf(&connection_udp_not_sent_summary, "%s (%s)", strerror(error), peer);
 				g_string_free(packet->data, TRUE);
 				g_free(packet);
 				*packets = g_list_delete_link(*packets, elem);
@@ -305,7 +317,10 @@ void _connection_send_packets(struct connection *con, int fd, GList **packets)
 			*packets = g_list_delete_link(*packets, elem);
 		} else
 		{
-			g_warning("sendtofrom failed %s",  strerror(errno));
+			const char *peer = con->remote.node_string[0] != '\0' ? con->remote.node_string : "-";
+			g_info("sendtofrom failed: %i of %u bytes (%s)", ret, (unsigned)packet->data->len, peer);
+			log_summary_addf(&connection_udp_not_sent_summary, "%i of %u bytes (%s)", ret,
+							 (unsigned)packet->data->len, peer);
 			g_string_free(packet->data, TRUE);
 			g_free(packet);
 			*packets = g_list_delete_link(*packets, elem);

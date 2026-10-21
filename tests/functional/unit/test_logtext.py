@@ -195,3 +195,174 @@ def test_without_a_handler_the_text_is_returned_cleaned(monkeypatch, capsys):
     assert _printable(lines)
     assert max(len(line) for line in lines) <= logtext.LIMIT + 3
     assert capsys.readouterr().err == ""
+
+
+# ---- LogSummary: at most one warning a minute for a message of every connection ----
+# (as src/log_summary.c: the first event after a quiet minute at once, the others when that
+# minute ends, with their number and the text of the last one)
+
+class SummaryClock:
+    """The clock and the timer of a LogSummary in a test."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.fires_at = None
+        self.schedules = 0
+        self.refuse = False
+
+    def __call__(self):
+        return self.now
+
+    def schedule(self, summary, after):
+        if self.refuse:
+            self.refuse = False
+            return False
+        assert 0 < after <= logtext.SUMMARY_PERIOD
+        self.fires_at = self.now + after
+        self.schedules += 1
+        return True
+
+    def advance(self, summary, to):
+        while self.fires_at is not None and self.fires_at <= to:
+            self.now, self.fires_at = self.fires_at, None
+            summary.due()
+        self.now = to
+
+
+def _summary(caplog, name="unit.summary"):
+    import logging
+    clock = SummaryClock()
+    summary = logtext.LogSummary(logging.getLogger(name), "upload dropped", "upload(s)",
+                                 clock=clock, schedule=clock.schedule)
+    caplog.set_level(logging.DEBUG, logger=name)
+    return summary, clock
+
+
+def _warnings(caplog, name="unit.summary"):
+    import logging
+    return [r.getMessage() for r in caplog.records if r.name == name and r.levelno == logging.WARNING]
+
+
+def test_a_single_event_is_a_warning_at_once(caplog):
+    summary, clock = _summary(caplog)
+    summary.add("write of 100 bytes at offset 5, limit is 4")
+    assert _warnings(caplog) == [
+        "upload dropped: 1 upload(s) in the last minute, the last: write of 100 bytes at offset 5, limit is 4"]
+    assert clock.schedules == 0
+    clock.advance(summary, clock.now + 600)
+    assert len(_warnings(caplog)) == 1
+
+
+def test_the_events_of_a_minute_are_one_more_warning_when_it_ends(caplog):
+    summary, clock = _summary(caplog)
+    summary.add("one")
+    clock.advance(summary, clock.now + 1)
+    summary.add("two")
+    clock.advance(summary, clock.now + 20)
+    summary.add("three")
+    assert len(_warnings(caplog)) == 1
+    assert clock.schedules == 1 and clock.fires_at == 1060.0
+    clock.advance(summary, 1059.0)
+    assert len(_warnings(caplog)) == 1
+    clock.advance(summary, 1060.0)
+    assert _warnings(caplog)[1] == "upload dropped: 2 upload(s) in the last minute, the last: three"
+    clock.advance(summary, clock.now + 600)
+    assert len(_warnings(caplog)) == 2
+
+
+def test_after_a_quiet_minute_an_event_warns_at_once(caplog):
+    summary, clock = _summary(caplog)
+    summary.add("one")
+    clock.advance(summary, clock.now + 61)
+    summary.add("two")
+    assert _warnings(caplog)[1] == "upload dropped: 1 upload(s) in the last minute, the last: two"
+    assert clock.schedules == 0
+
+
+def test_many_events_give_one_warning_a_minute(caplog):
+    import re
+    summary, clock = _summary(caplog)
+    start = clock.now
+    events = 0
+    t = start
+    while t < start + 600:
+        clock.advance(summary, t)
+        summary.add("again")
+        events += 1
+        t += 0.03
+    clock.advance(summary, clock.now + 61)
+    warnings = _warnings(caplog)
+    assert len(warnings) == 11
+    counts = [int(re.match(r"upload dropped: (\d+) upload\(s\) in the last minute", w).group(1)) for w in warnings]
+    assert sum(counts) == events
+
+
+def test_a_timer_that_fires_early_waits_for_the_minute(caplog):
+    summary, clock = _summary(caplog)
+    summary.add("one")
+    clock.advance(summary, clock.now + 30)
+    summary.add("two")
+    clock.now = clock.fires_at - 10
+    clock.fires_at = None
+    summary.due()
+    assert len(_warnings(caplog)) == 1
+    assert clock.fires_at == clock.now + 10
+    clock.advance(summary, clock.fires_at)
+    assert len(_warnings(caplog)) == 2
+
+
+def test_an_unarmed_timer_is_armed_by_the_next_event(caplog):
+    summary, clock = _summary(caplog)
+    summary.add("one")
+    clock.advance(summary, clock.now + 1)
+    clock.refuse = True
+    summary.add("two")
+    assert clock.fires_at is None
+    summary.add("three")
+    assert clock.fires_at is not None
+    clock.advance(summary, clock.fires_at)
+    assert _warnings(caplog)[1] == "upload dropped: 2 upload(s) in the last minute, the last: three"
+
+
+def test_the_default_timer_is_one_of_the_event_loop(monkeypatch, caplog):
+    """Without a schedule the summary makes a dionaea.core.timer; without the binding the
+    next event after the minute warns."""
+    import logging
+    import sys
+    import types
+
+    made = []
+
+    class FakeTimer:
+        def __init__(self, callback, after, repeat=0.0):
+            made.append((callback, after, repeat))
+
+    core = types.ModuleType("dionaea.core")
+    core.timer = FakeTimer
+    monkeypatch.setitem(sys.modules, "dionaea.core", core)
+    clock = SummaryClock()
+    summary = logtext.LogSummary(logging.getLogger("unit.summary"), "upload dropped", "upload(s)", clock=clock)
+    caplog.set_level(logging.DEBUG, logger="unit.summary")
+    summary.add("one")
+    clock.now += 15
+    summary.add("two")
+    assert len(made) == 1
+    callback, after, repeat = made[0]
+    assert (after, repeat) == (45.0, 0.0)
+    clock.now += 45
+    callback()
+    assert _warnings(caplog)[1] == "upload dropped: 1 upload(s) in the last minute, the last: two"
+
+    monkeypatch.setitem(sys.modules, "dionaea.core", None)
+    clock.now += 1
+    summary.add("three")
+    assert len(made) == 1
+    clock.now += 60
+    summary.add("four")
+    assert _warnings(caplog)[2] == "upload dropped: 2 upload(s) in the last minute, the last: four"
+
+
+def test_a_summary_without_a_text_names_none(caplog):
+    summary, clock = _summary(caplog)
+    summary.add(None)
+    assert _warnings(caplog) == ["upload dropped: 1 upload(s) in the last minute, the last: -"]

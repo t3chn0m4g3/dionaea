@@ -6,7 +6,9 @@
  *
  * The file hooks of the emulation (modules/emu/hooks.c): CreateFile and
  * _lcreat when no temp file can be made (no descriptor left, a full disk).
- * The emulation fails and the hook returns the error of the API.
+ * The emulation fails and the hook returns the error of the API. That and a
+ * write of WriteFile that fails (a full disk) are an info line each; one
+ * warning a minute sums them up for all emulations (log_summary.h).
  *
  * The success path: CreateFile, WriteFile and CloseHandle on the real temp
  * files of src/util.c (tempdownload_new makes them in /tmp), then the real
@@ -35,6 +37,7 @@
 #include "threads.h"
 #include "util.h"
 #include "module.h"
+#include "log_summary.h"
 
 struct dionaea *g_dionaea;
 
@@ -157,10 +160,16 @@ NOT_REACHED(bool, thread_submit, struct thread *t)
 /* ---- the tests ---- */
 
 static GPtrArray *warnings;
+static GPtrArray *infos;
 
 static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *message, gpointer data)
 {
-	if( level & (G_LOG_LEVEL_DEBUG | G_LOG_LEVEL_INFO | G_LOG_LEVEL_MESSAGE) )
+	if( level & G_LOG_LEVEL_INFO )
+	{
+		g_ptr_array_add(infos, g_strdup(message));
+		return;
+	}
+	if( level & (G_LOG_LEVEL_DEBUG | G_LOG_LEVEL_MESSAGE) )
 		return;
 	if( level & G_LOG_LEVEL_WARNING )
 	{
@@ -212,11 +221,49 @@ static uint32_t lcreat(struct emulation *e)
 	return user_hook__lcreat(&e->env, NULL, "C:\\x.exe", 0);
 }
 
+/* the summaries with a clock the test moves and no timer */
+static gint64 summary_now;
+static gint64 summary_clock(void)
+{
+	return summary_now;
+}
+
+static bool no_timer(struct log_summary *s, double after)
+{
+	(void)s;
+	(void)after;
+	return true;
+}
+
+static const struct log_summary_hooks summary_hooks = { summary_clock, no_timer };
+
+static void summaries_start(void)
+{
+	struct log_summary *summaries[] = { &emu_no_file_summary, &emu_write_failed_summary };
+	for( size_t i = 0; i < G_N_ELEMENTS(summaries); i++ )
+	{
+		log_summary_set_hooks(summaries[i], &summary_hooks);
+		log_summary_reset(summaries[i]);
+	}
+	summary_now = 1000 * G_USEC_PER_SEC;
+	g_ptr_array_set_size(warnings, 0);
+	g_ptr_array_set_size(infos, 0);
+}
+
+static guint lines_with(GPtrArray *lines, const char *text)
+{
+	guint n = 0;
+	for( guint i = 0; i < lines->len; i++ )
+		if( strstr(g_ptr_array_index(lines, i), text) != NULL )
+			n++;
+	return n;
+}
+
 static void no_tempfile(uint32_t (*hook)(struct emulation *))
 {
 	struct emulation e;
 	emulation_init(&e);
-	g_ptr_array_set_size(warnings, 0);
+	summaries_start();
 
 	/* a file that can be made is a handle in the table of files */
 	tempfiles_fail = false;
@@ -230,8 +277,26 @@ static void no_tempfile(uint32_t (*hook)(struct emulation *))
 	g_assert_cmpuint(hook(&e), ==, (uint32_t)-1);
 	g_assert_cmpint(e.ctx.state, ==, failed);
 	g_assert_cmpuint(g_hash_table_size(e.ctx.files), ==, 1);
+	g_assert_cmpuint(lines_with(infos, "Could not create a file for the emulation"), ==, 1);
 	g_assert_cmpuint(warnings->len, ==, 1);
-	g_assert_nonnull(strstr(g_ptr_array_index(warnings, 0), "Could not create a file for the emulation"));
+	g_assert_true(g_str_has_prefix(g_ptr_array_index(warnings, 0), "emulations stopped without a file: "
+																	"1 emulation(s) in the last minute, the last: "));
+	/* without the connection of the emulation the client is "-" */
+	g_assert_true(g_str_has_suffix(g_ptr_array_index(warnings, 0), " (-)"));
+	/* more emulations in the minute: info lines, one more warning when it ends */
+	for( int i = 0; i < 3; i++ )
+	{
+		e.ctx.state = running;
+		summary_now += G_USEC_PER_SEC;
+		g_assert_cmpuint(hook(&e), ==, (uint32_t)-1);
+	}
+	g_assert_cmpuint(lines_with(infos, "Could not create a file for the emulation"), ==, 4);
+	g_assert_cmpuint(warnings->len, ==, 1);
+	summary_now += 60 * G_USEC_PER_SEC;
+	log_summary_due(&emu_no_file_summary);
+	g_assert_cmpuint(warnings->len, ==, 2);
+	g_assert_true(g_str_has_prefix(g_ptr_array_index(warnings, 1), "emulations stopped without a file: "
+																	"3 emulation(s) in the last minute, "));
 	tempfiles_fail = false;
 
 	emulation_clear(&e);
@@ -318,6 +383,44 @@ static void create_write_close_is_a_sample(void)
 	g_free(path);
 }
 
+/* a write of WriteFile that fails (a full disk: /dev/full without a buffer): info, one warning a minute */
+static void write_failures_are_info_and_one_warning_a_minute(void)
+{
+	struct emulation e;
+	emulation_init(&e);
+	e.conf.limits.filesize = 1024 * 1024;
+	/* the connection of the client whose code is emulated */
+	struct connection con;
+	memset(&con, 0, sizeof(con));
+	g_strlcpy(con.remote.ip_string, "198.51.100.8", sizeof(con.remote.ip_string));
+	e.ctx.ctxcon = &con;
+	summaries_start();
+	struct tempfile *tf = g_malloc0(sizeof(*tf));
+	tf->fd = open("/dev/full", O_WRONLY | O_CLOEXEC);
+	g_assert_cmpint(tf->fd, !=, -1);
+	tf->fh = fdopen(tf->fd, "w");
+	g_assert_cmpint(setvbuf(tf->fh, NULL, _IONBF, 0), ==, 0);
+	tf->path = g_strdup("/dev/full");
+	uint32_t fd = (uint32_t)tf->fd;
+	g_hash_table_insert(e.ctx.files, &tf->fd, tf);
+	for( int i = 0; i < 5; i++ )
+	{
+		g_assert_cmpuint(user_hook_WriteFile(&e.env, NULL, fd, (void *)SAMPLE, (int)sizeof(SAMPLE), (int *)NULL,
+											 (int *)NULL), ==, 1);
+		summary_now += G_USEC_PER_SEC;
+	}
+	g_assert_cmpuint(lines_with(infos, "fwrite failed No space left on device (198.51.100.8)"), ==, 5);
+	g_assert_cmpuint(warnings->len, ==, 1);
+	g_assert_cmpstr(g_ptr_array_index(warnings, 0), ==, "writes of emulations failed: 1 write(s) in the last minute, "
+														"the last: No space left on device (198.51.100.8)");
+	summary_now += 60 * G_USEC_PER_SEC;
+	log_summary_due(&emu_write_failed_summary);
+	g_assert_cmpuint(warnings->len, ==, 2);
+	g_assert_cmpstr(g_ptr_array_index(warnings, 1), ==, "writes of emulations failed: 4 write(s) in the last minute, "
+														"the last: No space left on device (198.51.100.8)");
+	emulation_clear(&e);
+}
+
 /* a file still open when the emulation ends is no sample, and it is removed too */
 static void open_file_is_no_sample(void)
 {
@@ -348,6 +451,7 @@ int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	warnings = g_ptr_array_new_with_free_func(g_free);
+	infos = g_ptr_array_new_with_free_func(g_free);
 	reports = g_ptr_array_new_with_free_func(reported_free);
 	g_log_set_always_fatal(G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL);
 	g_log_set_default_handler(log_handler, NULL);
@@ -355,8 +459,10 @@ int main(int argc, char **argv)
 	g_test_add_func("/emu-hooks/_lcreat/no-tempfile", lcreat_no_tempfile);
 	g_test_add_func("/emu-hooks/files/create-write-close-is-a-sample", create_write_close_is_a_sample);
 	g_test_add_func("/emu-hooks/files/open-file-is-no-sample", open_file_is_no_sample);
+	g_test_add_func("/emu-hooks/WriteFile/write-failures", write_failures_are_info_and_one_warning_a_minute);
 	int result = g_test_run();
 	g_ptr_array_free(reports, TRUE);
 	g_ptr_array_free(warnings, TRUE);
+	g_ptr_array_free(infos, TRUE);
 	return result;
 }

@@ -8,6 +8,7 @@
  * (src/processor.c, src/threads.c): one job per instance, the queue limit,
  * enqueue failures, overload closes, processor_done and teardown.
  */
+#include <arpa/inet.h>
 #include <string.h>
 
 #include "stubs.h"
@@ -101,8 +102,8 @@ static void reset(void)
 	g_atomic_int_set(&calls, 0);
 	g_atomic_int_set(&stub_closes, 0);
 	g_atomic_int_set(&stub_overload_logs, 0);
-	g_atomic_int_set(&stub_give_up_logs, 0);
-	g_atomic_int_set(&stub_scan_done_logs, 0);
+	g_atomic_int_set(&stub_scan_stopped_logs, 0);
+	stub_summaries_reset();
 	g_atomic_int_set(&read_size, 0);
 }
 
@@ -113,7 +114,10 @@ static unsigned gave_up_count(void)
 	return stats.gave_up;
 }
 
-/* pd gave up: done, nothing kept, the connection open; one warning */
+/*
+ * pd gave up: done, nothing kept, the connection open; one info line, and the summary
+ * warning of the give-ups (the first one since reset())
+ */
 static void assert_gave_up(struct connection *con, struct processor_data *pd)
 {
 	g_assert_cmpint(g_atomic_int_get(&pd->state), ==, processor_done);
@@ -121,7 +125,9 @@ static void assert_gave_up(struct connection *con, struct processor_data *pd)
 	g_assert_cmpuint(pd->bistream->bytes, ==, 0);
 	g_assert_cmpuint(pd->pending, ==, 0);
 	g_assert_cmpint(g_atomic_int_get(&con->processor_data->closing), ==, 0);
-	g_assert_cmpint(g_atomic_int_get(&stub_give_up_logs), ==, 1);
+	g_assert_cmpint(g_atomic_int_get(&stub_scan_stopped_logs), ==, 1);
+	g_assert_cmpint(g_atomic_int_get(&stub_connection_warnings), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 1);
 	g_assert_cmpint(g_atomic_int_get(&stub_overload_logs), ==, 0);
 }
 
@@ -325,6 +331,9 @@ static void stream_limit(void)
 		processors_overload(&con, "test");
 	g_assert_cmpint(g_async_queue_length(g_dionaea->threads->cmds), ==, 1);
 	g_assert_cmpint(g_atomic_int_get(&stub_overload_logs), ==, 1);
+	/* an info line of the connection, the summary warning of the overloads */
+	g_assert_cmpint(g_atomic_int_get(&stub_connection_warnings), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_overload_summaries), ==, 1);
 	/* nothing is closed by the worker */
 	g_assert_cmpint(g_atomic_int_get(&stub_closes), ==, 0);
 	stub_gate_release(&gate);
@@ -379,6 +388,9 @@ static void queue_full(void)
 	g_assert_cmpuint(pd->bistream->bytes, ==, 0);
 	g_assert_cmpint(pd->queued.refs, ==, 0);
 	g_assert_cmpint(g_atomic_int_get(&stub_overload_logs), ==, 1);
+	/* an info line of the connection, the summary warning of the overloads */
+	g_assert_cmpint(g_atomic_int_get(&stub_connection_warnings), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_overload_summaries), ==, 1);
 	stub_gate_release(&gate);
 	stub_drain();
 	g_assert_cmpint(g_atomic_int_get(&stub_closes), ==, 1);
@@ -512,6 +524,9 @@ static void overload_releases(void)
 	g_assert_cmpint(g_atomic_int_get(&calls), ==, 1);
 	g_assert_cmpint(g_atomic_int_get(&stub_closes), ==, 1);
 	g_assert_cmpint(g_atomic_int_get(&stub_overload_logs), ==, 1);
+	/* an info line of the connection, the summary warning of the overloads */
+	g_assert_cmpint(g_atomic_int_get(&stub_connection_warnings), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_overload_summaries), ==, 1);
 	stub_dispose(&con, pd);
 }
 
@@ -814,8 +829,8 @@ static void give_up_done(void)
 	processor_give_up(&con, pd, "scan limit", false);
 	g_assert_cmpint(g_atomic_int_get(&pd->state), ==, processor_done);
 	g_assert_cmpuint(pd->bistream->bytes, ==, 0);
-	g_assert_cmpint(g_atomic_int_get(&stub_scan_done_logs), ==, 1);
-	g_assert_cmpint(g_atomic_int_get(&stub_give_up_logs), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_scan_stopped_logs), ==, 1);
+	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 0);
 	g_assert_cmpuint(gave_up_count(), ==, before);
 	/* an instance done on its own (a shellcode found) does not log a stop */
 	stub_drain();
@@ -825,7 +840,8 @@ static void give_up_done(void)
 	g_atomic_int_set(&pd->state, processor_done);
 	processor_give_up(&con, pd, "test", true);
 	g_assert_cmpint(g_atomic_int_get(&pd->gave_up), ==, 0);
-	g_assert_cmpint(g_atomic_int_get(&stub_give_up_logs), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_scan_stopped_logs), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 0);
 	stub_dispose(&con, pd);
 }
 
@@ -903,6 +919,147 @@ static void stop_keeps_fed_instances(void)
 	stub_dispose(&con, pd);
 }
 
+/* the clock and the timer of the summaries of the next two tests */
+static gint64 summary_now;
+static gboolean summary_armed;
+static gint64 summary_fires_at;
+static guint summary_schedules;
+
+static gint64 summary_clock(void)
+{
+	return summary_now;
+}
+
+static bool summary_schedule(struct log_summary *s, double after)
+{
+	(void)s;
+	summary_armed = TRUE;
+	summary_fires_at = summary_now + (gint64)(after * G_USEC_PER_SEC);
+	summary_schedules++;
+	return true;
+}
+
+static const struct log_summary_hooks summary_hooks = { summary_clock, summary_schedule };
+
+static void summary_start(struct log_summary *s)
+{
+	reset();
+	log_summary_set_hooks(s, &summary_hooks);
+	log_summary_reset(s);
+	summary_now = 5000 * G_USEC_PER_SEC;
+	summary_armed = FALSE;
+	summary_schedules = 0;
+}
+
+static void assert_last_summary(const char *expected)
+{
+	char *last = stub_last_summary();
+	g_assert_cmpstr(last, ==, expected);
+	g_free(last);
+}
+
+/* an instance of a connection from 192.0.2.7:port of the protocol smbd */
+static void summary_instance(struct connection *con, struct processor_data **pd, struct processor *p, int port)
+{
+	stub_instance(con, pd, p);
+	con->protocol.name = "smbd";
+	g_strlcpy(con->remote.ip_string, "192.0.2.7", sizeof(con->remote.ip_string));
+	con->remote.port = htons(port);
+}
+
+/*
+ * the give-ups of many connections at a limit (many clients at once): an info line each,
+ * one warning at once and one when its minute ends; after a quiet minute a give-up warns
+ * at once; the scan that is done reading is no give-up at a limit
+ */
+static void give_up_summary(void)
+{
+	struct log_summary *s = processor_give_up_summary();
+	summary_start(s);
+	unsigned before = gave_up_count();
+	struct connection con;
+	struct processor_data *pd;
+	for( int i = 0; i < 100; i++ )
+	{
+		summary_instance(&con, &pd, &giver, 1000 + i);
+		processor_give_up(&con, pd, "job queue full", true);
+		stub_dispose(&con, pd);
+		summary_now += G_USEC_PER_SEC / 10;
+	}
+	g_assert_cmpuint(gave_up_count(), ==, before + 100);
+	g_assert_cmpint(g_atomic_int_get(&stub_scan_stopped_logs), ==, 100);
+	g_assert_cmpint(g_atomic_int_get(&stub_connection_warnings), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 1);
+	assert_last_summary("processor: scans stopped at a limit: 1 connection(s) in the last minute, "
+						"the last: giver scan, job queue full (smbd 192.0.2.7:1000)");
+	/* the rest when the minute of the first warning ends */
+	g_assert_true(summary_armed);
+	g_assert_cmpuint(summary_schedules, ==, 1);
+	g_assert_cmpint(summary_fires_at, ==, 5060 * G_USEC_PER_SEC);
+	summary_now = summary_fires_at;
+	summary_armed = FALSE;
+	log_summary_due(s);
+	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 2);
+	assert_last_summary("processor: scans stopped at a limit: 99 connection(s) in the last minute, "
+						"the last: giver scan, job queue full (smbd 192.0.2.7:1099)");
+	g_assert_false(summary_armed);
+
+	/* a quiet minute, then one give-up: at once */
+	summary_now += 61 * G_USEC_PER_SEC;
+	summary_instance(&con, &pd, &giver, 2000);
+	processor_give_up(&con, pd, "stream data limit", true);
+	stub_dispose(&con, pd);
+	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 3);
+	assert_last_summary("processor: scans stopped at a limit: 1 connection(s) in the last minute, "
+						"the last: giver scan, stream data limit (smbd 192.0.2.7:2000)");
+
+	/* done reading (limit false): its info line, no event of the summary */
+	summary_now += 1 * G_USEC_PER_SEC;
+	summary_instance(&con, &pd, &giver, 2001);
+	processor_give_up(&con, pd, "scan limit", false);
+	stub_dispose(&con, pd);
+	g_assert_cmpint(g_atomic_int_get(&stub_scan_stopped_logs), ==, 102);
+	g_assert_false(summary_armed);
+	g_assert_cmpuint(gave_up_count(), ==, before + 101);
+	stub_summaries_reset();
+}
+
+/* the overloads of many connections: an info line each, one warning a minute */
+static void overload_summary(void)
+{
+	struct log_summary *s = processors_overload_summary();
+	summary_start(s);
+	struct processor_stats before, after;
+	processor_stats_get(&before);
+	struct connection con;
+	struct processor_data *pd;
+	for( int i = 0; i < 50; i++ )
+	{
+		summary_instance(&con, &pd, &in_only, 3000 + i);
+		processors_overload(&con, "stream data limit");
+		/* the close of the event loop */
+		stub_run_async();
+		stub_dispose(&con, pd);
+		summary_now += G_USEC_PER_SEC / 10;
+	}
+	processor_stats_get(&after);
+	g_assert_cmpuint(after.overloads, ==, before.overloads + 50);
+	g_assert_cmpint(g_atomic_int_get(&stub_closes), ==, 50);
+	g_assert_cmpint(g_atomic_int_get(&stub_refs), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_overload_logs), ==, 50);
+	g_assert_cmpint(g_atomic_int_get(&stub_connection_warnings), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_overload_summaries), ==, 1);
+	assert_last_summary("processor: connections closed at a limit: 1 connection(s) in the last minute, "
+						"the last: stream data limit (smbd 192.0.2.7:3000)");
+	g_assert_true(summary_armed);
+	summary_now = summary_fires_at;
+	log_summary_due(s);
+	g_assert_cmpint(g_atomic_int_get(&stub_overload_summaries), ==, 2);
+	assert_last_summary("processor: connections closed at a limit: 49 connection(s) in the last minute, "
+						"the last: stream data limit (smbd 192.0.2.7:3049)");
+	stub_summaries_reset();
+}
+
 static void stats(void)
 {
 	struct processor_stats before, after;
@@ -953,6 +1110,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/processor/give-up-done", give_up_done);
 	g_test_add_func("/processor/unicode-give-up", unicode_give_up);
 	g_test_add_func("/processor/stop-keeps-fed-instances", stop_keeps_fed_instances);
+	g_test_add_func("/processor/give-up-summary", give_up_summary);
+	g_test_add_func("/processor/overload-summary", overload_summary);
 	g_test_add_func("/processor/stats", stats);
 	g_test_add_func("/processor/drop-waiting-job", drop_waiting_job);
 	g_test_add_func("/processor/drop-running-job", drop_running_job);

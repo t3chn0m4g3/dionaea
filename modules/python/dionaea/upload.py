@@ -23,7 +23,14 @@ import tempfile
 from typing import Optional
 from urllib.parse import quote
 
+from dionaea.logtext import LogSummary, log_text
+
 logger = logging.getLogger("upload")
+
+#: The warnings of the uploads that are dropped or whose file stays (one a minute, the line of each is info)
+HOLES = LogSummary(logger, "uploads dropped for their holes", "upload(s)")
+NOT_CLOSED = LogSummary(logger, "upload files not closed", "file(s)")
+NOT_REMOVED = LogSummary(logger, "upload files not removed", "file(s)")
 
 #: Default of the service option ``max_upload_size`` (bytes), the same as the largest HTTP request
 DEFAULT_MAX_UPLOAD_SIZE = 32 * 1024 * 1024
@@ -39,6 +46,13 @@ MAX_URL_NAME_LENGTH = 255
 #: there as ``<download.dir>/<md5>``). A file made and removed there does not change download.dir itself: the size
 #: cap of the store reads download.dir again only when its mtime changed, and counts only its own files.
 INCOMING_DIR = ".incoming"
+
+
+def _client(con) -> str:
+    """The address of the client of con, "-" without one."""
+    remote = getattr(con, "remote", None)
+    host = getattr(remote, "host", None) if remote is not None else None
+    return host if host else "-"
 
 
 def incoming_dir(download_dir: str) -> str:
@@ -234,7 +248,10 @@ class UploadFile(object):
         reported = False
         try:
             if self.size - self.received > MAX_SPARSE_GAP:
-                logger.warning("dropping %s: %d bytes written, size is %d", self.name, self.received, self.size)
+                client = _client(con)
+                logger.info("dropping %s: %d bytes written, size is %d (%s)", self.name, self.received, self.size,
+                            client)
+                HOLES.add("%d bytes written, size is %d (%s)" % (self.received, self.size, client))
             elif self.size > 0 and not self._dropped:
                 icd = incident("dionaea.download.complete")
                 icd.url = url
@@ -251,7 +268,8 @@ class UploadFile(object):
             try:
                 self._fp.close()
             except OSError as e:
-                logger.warning("unable to close %s: %s", self.name, e)
+                logger.info("unable to close %s: %s", self.name, e)
+                NOT_CLOSED.add(log_text(e))
             self._fp = None
 
     def _unlink(self):
@@ -260,4 +278,5 @@ class UploadFile(object):
         except FileNotFoundError:
             pass
         except OSError as e:
-            logger.warning("unable to remove %s: %s", self.name, e)
+            logger.info("unable to remove %s: %s", self.name, e)
+            NOT_REMOVED.add(log_text(e))

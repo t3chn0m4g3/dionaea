@@ -60,7 +60,7 @@ def _load_file(name, path):
 
 @contextlib.contextmanager
 def _stand_ins():
-    names = ("dionaea", "dionaea.core", "dionaea.exception", "dionaea.upload")
+    names = ("dionaea", "dionaea.core", "dionaea.exception", "dionaea.logtext", "dionaea.upload")
     saved = {name: sys.modules.get(name) for name in names}
     package = types.ModuleType("dionaea")
     package.__path__ = []
@@ -72,6 +72,8 @@ def _stand_ins():
     exception = types.ModuleType("dionaea.exception")
     exception.ServiceConfigError = type("ServiceConfigError", (Exception,), {})
     sys.modules.update({"dionaea": package, "dionaea.core": core, "dionaea.exception": exception})
+    # the real logtext and upload (stdlib only)
+    sys.modules["dionaea.logtext"] = _load_file("dionaea.logtext", _src_root() / "logtext.py")
     sys.modules["dionaea.upload"] = _load_file("dionaea.upload", _src_root() / "upload.py")
     try:
         yield
@@ -157,3 +159,29 @@ def test_a_disconnect_without_a_job_is_fine(con, tmp_path):
     con.handle_disconnect()
     assert FakeIncident.reported == []
     assert left_over(tmp_path) == []
+
+
+def test_the_cut_jobs_of_many_connections_are_one_warning_a_minute(tmp_path, monkeypatch, caplog, summaries):
+    """A job above the bound is cut with an info line; one warning a minute sums them up."""
+    import logging
+    monkeypatch.setattr(printer, "MAX_PCL_SIZE", 100)
+    clock = summaries(printer.CUT)
+    FakeDionaea.download_dir = str(tmp_path)
+    with caplog.at_level(logging.INFO, logger="printer"):
+        for _ in range(4):
+            con = printer.Printerd()
+            con.download_dir = str(tmp_path)
+            con.process_pcl(b"\x1bE" + b"a" * 200)
+            con.process_pcl(b"b" * 200)
+            con.handle_disconnect()
+            clock.advance(1)
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and "is cut" in r.getMessage()]
+        assert len(infos) == 4
+        assert infos[0].startswith("print job from 198.51.100.9 is cut: write of 202 bytes at offset 0")
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [("print jobs cut: 1 job(s) in the last minute, the last: 198.51.100.9, "
+                            "write of 202 bytes at offset 0, limit is 100")]
+        clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings[1:] == [("print jobs cut: 3 job(s) in the last minute, the last: 198.51.100.9, "
+                            "write of 202 bytes at offset 0, limit is 100")]

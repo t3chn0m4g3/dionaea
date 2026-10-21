@@ -54,6 +54,37 @@ class SplitTest(unittest.TestCase):
         self.assertIsNone(run.load_lines(self.log("abc"), None))
 
 
+class GiveUpTest(unittest.TestCase):
+    """The lines of the emu scans that stop are info since 0.12.3 (a warning before at a limit): the
+    reason tells a stop at a limit from the scan limit; the summary warning names only reason and address."""
+
+    LOG = "\n".join([
+        SECOND + " processor processor.c:10-info: emu scan stopped (job queue full), "
+        "connection 0x1 smbd 10.0.0.2:4001 goes on",
+        SECOND + " processor processor.c:10-warning: emu scan stopped (stream data limit), "
+        "connection 0x2 smbd 10.0.0.2:4002 goes on",
+        SECOND + " processor processor.c:10-info: emu scan stopped (scan limit), "
+        "connection 0x3 smbd 10.0.0.2:4003 goes on",
+    ])
+
+    def test_the_reason_tells_a_limit_from_the_scan_limit(self):
+        gave_up, scan_limit = run.give_ups(self.LOG)
+        self.assertEqual(gave_up, [("job queue full", 4001), ("stream data limit", 4002)])
+        self.assertEqual(scan_limit, [4003])
+
+    def test_the_summary_line_has_reason_and_address_only(self):
+        line = (SECOND + " processor processor.c:20-warning: processor: scans stopped at a limit: "
+                "704 connection(s) in the last minute, the last: emu scan, job queue full (smbd 10.0.0.2:4001)")
+        self.assertIsNotNone(run.SUMMARY_LINE.match(line))
+        self.assertIsNone(run.SUMMARY_LINE.match(line + " AAAA"))
+        overload = (SECOND + " processor processor.c:20-warning: processor: connections closed at a limit: "
+                    "3 connection(s) in the last minute, the last: stream data limit (smbd 10.0.0.2:4001)")
+        self.assertIsNotNone(run.SUMMARY_LINE.match(overload))
+        info = (SECOND + " processor processor.c:30-info: Stream processing limit reached (job queue full), "
+                "closing connection 0xabc smbd 10.0.0.2:4001")
+        self.assertEqual(run.OVERLOAD_LINE.findall(info), [("job queue full", "4001")])
+
+
 class MarkTest(unittest.TestCase):
     def test_without_the_file_of_the_probe_there_is_no_mark(self):
         # the probe never wrote probe.jsonl (or it is gone): the mark is missing, a failed check, no traceback

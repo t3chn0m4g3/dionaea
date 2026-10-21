@@ -6,7 +6,8 @@
  *
  * The sessions of the curl module (modules/curl/module.c, included here for
  * its static functions) when no temp file can be made (no descriptor left, a
- * full disk): the download or the upload is dropped with one warning.
+ * full disk): the download or the upload is dropped with an info line; one
+ * warning a minute sums them up (log_summary.h), as for an upload that fails.
  *
  * The end of a download that does not complete: a target the download target
  * filter refused (the open-socket callback) is download_refused(), any other
@@ -16,6 +17,7 @@
  * it was attempted); a response of a server (a redirect) starts a new hop.
  */
 #include "../../modules/curl/module.c"
+#include "threads.h"
 
 struct dionaea *g_dionaea;
 
@@ -32,6 +34,8 @@ struct tempfile *tempincoming_new(const char *download_dir, char *prefix)
 }
 
 #define NOT_REACHED(ret, name, ...) ret name(__VA_ARGS__) { g_assert_not_reached(); }
+/* the summaries arm no timer through the event loop here (src/threads.c is not linked) */
+NOT_REACHED(struct async_cmd *, async_cmd_new, async_cmd_cb function, void *data)
 NOT_REACHED(void, tempfile_close, struct tempfile *tf)
 NOT_REACHED(void, tempfile_free, struct tempfile *tf)
 NOT_REACHED(void, tempfile_unlink, struct tempfile *tf)
@@ -150,10 +154,16 @@ bool incident_value_con_get(struct incident *e, const char *name, struct connect
 /* ---- the tests ---- */
 
 static GPtrArray *warnings;
+static GPtrArray *infos;
 
 static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *message, gpointer data)
 {
-	if( level & (G_LOG_LEVEL_DEBUG | G_LOG_LEVEL_INFO | G_LOG_LEVEL_MESSAGE) )
+	if( level & G_LOG_LEVEL_INFO )
+	{
+		g_ptr_array_add(infos, g_strdup(message));
+		return;
+	}
+	if( level & (G_LOG_LEVEL_DEBUG | G_LOG_LEVEL_MESSAGE) )
 		return;
 	if( level & G_LOG_LEVEL_WARNING )
 	{
@@ -163,13 +173,42 @@ static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *
 	g_log_default_handler(domain, level, message, data);
 }
 
+/* the summaries of the module with a clock the test moves and no timer */
+static gint64 summary_now;
+static gint64 summary_clock(void)
+{
+	return summary_now;
+}
+
+static bool no_timer(struct log_summary *s, double after)
+{
+	(void)s;
+	(void)after;
+	return true;
+}
+
+static const struct log_summary_hooks summary_hooks = { summary_clock, no_timer };
+
+static void lines_reset(void)
+{
+	struct log_summary *summaries[] = { &download_no_file, &upload_no_file, &upload_failed };
+	for( size_t i = 0; i < G_N_ELEMENTS(summaries); i++ )
+	{
+		log_summary_set_hooks(summaries[i], &summary_hooks);
+		log_summary_reset(summaries[i]);
+	}
+	summary_now = 1000 * G_USEC_PER_SEC;
+	g_ptr_array_set_size(warnings, 0);
+	g_ptr_array_set_size(infos, 0);
+}
+
 static void download_without_tempfile(void)
 {
 	struct connection con;
 	memset(&con, 0, sizeof(con));
 	g_strlcpy(con.local.ip_string, "10.0.0.1", sizeof(con.local.ip_string));
 	the_con = &con;
-	g_ptr_array_set_size(warnings, 0);
+	lines_reset();
 	g_atomic_int_set(&tempfiles_asked, 0);
 
 	struct incident *i = test_incident();
@@ -178,8 +217,25 @@ static void download_without_tempfile(void)
 	/* nothing queued, the connection given back */
 	g_assert_cmpint(curl_runtime.queued, ==, 0);
 	g_assert_cmpint(refs, ==, 0);
+	g_assert_cmpuint(infos->len, ==, 1);
+	g_assert_cmpstr(g_ptr_array_index(infos, 0), ==, "Could not create the file of the download of "
+					"http://192.0.2.1/x.exe, the download is dropped");
 	g_assert_cmpuint(warnings->len, ==, 1);
-	g_assert_nonnull(strstr(g_ptr_array_index(warnings, 0), "Could not create the file of the download"));
+	g_assert_cmpstr(g_ptr_array_index(warnings, 0), ==, "downloads dropped, no file could be made: "
+					"1 download(s) in the last minute, the last: http://192.0.2.1/x.exe");
+	/* more of them in the minute: info lines, one warning when it ends */
+	for( int n = 0; n < 3; n++ )
+	{
+		summary_now += G_USEC_PER_SEC;
+		session_download_new(i, "http://192.0.2.1/y.exe");
+	}
+	g_assert_cmpuint(infos->len, ==, 4);
+	g_assert_cmpuint(warnings->len, ==, 1);
+	summary_now += 60 * G_USEC_PER_SEC;
+	log_summary_due(&download_no_file);
+	g_assert_cmpuint(warnings->len, ==, 2);
+	g_assert_cmpstr(g_ptr_array_index(warnings, 1), ==, "downloads dropped, no file could be made: "
+					"3 download(s) in the last minute, the last: http://192.0.2.1/y.exe");
 
 	test_incident_free(i);
 	the_con = NULL;
@@ -187,7 +243,7 @@ static void download_without_tempfile(void)
 
 static void upload_without_tempfile(void)
 {
-	g_ptr_array_set_size(warnings, 0);
+	lines_reset();
 	g_atomic_int_set(&tempfiles_asked, 0);
 
 	struct incident *i = test_incident();
@@ -199,15 +255,18 @@ static void upload_without_tempfile(void)
 	g_assert_cmpint(g_atomic_int_get(&tempfiles_asked), ==, 1);
 	/* nothing queued: its end would have closed the file that is not there */
 	g_assert_cmpint(curl_runtime.queued, ==, 0);
+	g_assert_cmpuint(infos->len, ==, 1);
+	g_assert_nonnull(strstr(g_ptr_array_index(infos, 0), "Could not create the file of the upload"));
 	g_assert_cmpuint(warnings->len, ==, 1);
-	g_assert_nonnull(strstr(g_ptr_array_index(warnings, 0), "Could not create the file of the upload"));
+	g_assert_cmpstr(g_ptr_array_index(warnings, 0), ==, "uploads dropped, no file could be made: "
+					"1 upload(s) in the last minute, the last: http://192.0.2.1/submit");
 
 	test_incident_free(i);
 }
 
 static void reset_downloads(void)
 {
-	g_ptr_array_set_size(warnings, 0);
+	lines_reset();
 	g_ptr_array_set_size(filter_asked, 0);
 	g_ptr_array_set_size(refused_urls, 0);
 	g_ptr_array_set_size(failed, 0);
@@ -375,39 +434,53 @@ static void other_sockets_are_no_refusal(void)
 	session_free(session);
 }
 
-/* the warnings of the module name the url of the client as printable text, at most 256 characters */
+/* the lines of the module name the url of the client as printable text, at most 256 characters */
 static void the_warnings_hold_the_url_as_plain_text(void)
 {
-	g_ptr_array_set_size(warnings, 0);
+	lines_reset();
 	struct incident *i = test_incident();
 	session_download_new(i, "http://192.0.2.1/a\nb \x1b[31m");
 	test_incident_free(i);
-	g_assert_cmpuint(warnings->len, ==, 1);
-	g_assert_cmpstr(g_ptr_array_index(warnings, 0), ==, "Could not create the file of the download of "
+	g_assert_cmpuint(infos->len, ==, 1);
+	g_assert_cmpstr(g_ptr_array_index(infos, 0), ==, "Could not create the file of the download of "
 					"http://192.0.2.1/a?b ?[31m, the download is dropped");
+	g_assert_cmpuint(warnings->len, ==, 1);
+	g_assert_cmpstr(g_ptr_array_index(warnings, 0), ==, "downloads dropped, no file could be made: "
+					"1 download(s) in the last minute, the last: http://192.0.2.1/a?b ?[31m");
 
-	g_ptr_array_set_size(warnings, 0);
+	lines_reset();
 	i = test_incident();
 	char *long_url = g_strdup_printf("http://192.0.2.1/%0400d", 0);
 	test_incident_string(i, "_url", long_url);
 	test_incident_string(i, "_callback", "dionaea.modules.python.test.result");
 	session_upload_new(i);
 	test_incident_free(i);
-	g_assert_cmpuint(warnings->len, ==, 1);
+	g_assert_cmpuint(infos->len, ==, 1);
 	char *expected = g_strdup_printf("Could not create the file of the upload to %.256s..., the upload is dropped", long_url);
+	g_assert_cmpstr(g_ptr_array_index(infos, 0), ==, expected);
+	g_free(expected);
+	expected = g_strdup_printf("uploads dropped, no file could be made: 1 upload(s) in the last minute, "
+							   "the last: %.256s...", long_url);
 	g_assert_cmpstr(g_ptr_array_index(warnings, 0), ==, expected);
 	g_free(expected);
 
-	/* the end of an upload that failed */
-	g_ptr_array_set_size(warnings, 0);
+	/* the end of an upload that failed: an info line, one warning a minute */
+	lines_reset();
 	struct session *session = g_malloc0(sizeof(*session));
 	session->type = session_type_upload;
 	session->url = g_strdup("http://192.0.2.1/submit");
 	g_strlcpy(session->error, "Failed\r\nb \x1b]0;t\x07", sizeof(session->error));
 	upload_done(session, CURLE_COULDNT_CONNECT, "http://192.0.2.1/next\n");
-	g_assert_cmpuint(warnings->len, ==, 1);
-	g_assert_cmpstr(g_ptr_array_index(warnings, 0), ==,
+	g_assert_cmpuint(infos->len, ==, 1);
+	g_assert_cmpstr(g_ptr_array_index(infos, 0), ==,
 					"UPLOAD FAIL: http://192.0.2.1/next? => (7) Failed??b ?]0;t?");
+	g_assert_cmpuint(warnings->len, ==, 1);
+	g_assert_cmpstr(g_ptr_array_index(warnings, 0), ==, "uploads failed: 1 upload(s) in the last minute, "
+					"the last: http://192.0.2.1/next? => (7) Failed??b ?]0;t?");
+	summary_now += G_USEC_PER_SEC;
+	upload_done(session, CURLE_COULDNT_CONNECT, "http://192.0.2.1/next\n");
+	g_assert_cmpuint(infos->len, ==, 2);
+	g_assert_cmpuint(warnings->len, ==, 1);
 	session_free(session);
 	g_free(long_url);
 }
@@ -416,6 +489,7 @@ int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	warnings = g_ptr_array_new_with_free_func(g_free);
+	infos = g_ptr_array_new_with_free_func(g_free);
 	filter_asked = g_ptr_array_new_with_free_func(g_free);
 	refused_urls = g_ptr_array_new_with_free_func(g_free);
 	failed = g_ptr_array_new_with_free_func(g_free);
@@ -439,6 +513,7 @@ int main(int argc, char **argv)
 	g_free(curl_runtime.download_dir);
 	curl_global_cleanup();
 	g_ptr_array_free(warnings, TRUE);
+	g_ptr_array_free(infos, TRUE);
 	g_ptr_array_free(filter_asked, TRUE);
 	g_ptr_array_free(refused_urls, TRUE);
 	g_ptr_array_free(failed, TRUE);

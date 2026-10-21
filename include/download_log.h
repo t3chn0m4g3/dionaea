@@ -12,12 +12,13 @@
 #include <glib.h>
 #include <stdbool.h>
 
+#include "log_summary.h"
 #include "log_text.h"
 
 /*
  * The log lines of downloads that do not complete, for every download client (curl,
- * the FTP and TFTP clients of the python module). Only for the thread of the event
- * loop: the summary uses an ev_timer of g_dionaea->loop and no lock.
+ * the FTP and TFTP clients of the python module). The summary of the failures is a
+ * log_summary (log_summary.h).
  *
  * The url and the reason come from the client: in every line (and in the summary) a
  * byte outside 0x20..0x7e is a '?', and each is cut at DOWNLOAD_LOG_TEXT_MAX
@@ -37,7 +38,7 @@
  */
 
 /* seconds between two summaries of the failed downloads */
-#define DOWNLOAD_FAILURES_PERIOD 60
+#define DOWNLOAD_FAILURES_PERIOD LOG_SUMMARY_PERIOD
 
 /* characters of a url or a reason in a log line (log_text.h) */
 #define DOWNLOAD_LOG_TEXT_MAX LOG_TEXT_MAX

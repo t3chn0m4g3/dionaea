@@ -118,6 +118,14 @@ struct emu_file
 	char *path;
 };
 
+/*
+ * An emulation that stops for want of a file (CreateFile, _lcreat) and a write of WriteFile or
+ * _lwrite that fails: an info line each, one warning a minute of each summary (log_summary.h).
+ */
+struct log_summary;
+extern struct log_summary emu_no_file_summary;
+extern struct log_summary emu_write_failed_summary;
+
 void user_hook_accept_cb(EV_P_ struct ev_io *w, int revents);
 uint32_t user_hook_accept(struct emu_env *env, struct emu_env_hook *hook, ...);
 uint32_t user_hook_bind(struct emu_env *env, struct emu_env_hook *hook, ...);

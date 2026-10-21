@@ -15,8 +15,9 @@
 # the fds. Then 200 idle connections each to 445 (tcp) and 443 (tls):
 #   - while they are held, dionaea must not spin (CPU below the limit)
 #   - after they are closed, a new connection to 21 gets the 220 banner
-#   - after dionaea stopped, dionaea-errors.log has the EMFILE line of
-#     accept() for every port (run.sh checks it, hc_expect_log)
+#   - after dionaea stopped, dionaea.log has the EMFILE line of accept() at
+#     info for every port, and dionaea-errors.log the summary of them (one
+#     warning a minute, run.sh checks both, hc_expect_log)
 # The check fails if the lowered limit cannot lead to EMFILE (above the 70 %
 # guard).
 
@@ -79,12 +80,13 @@ fi
 
 hc_exec_root prlimit --pid "${pid}" --nofile="${soft}:${hard}" || hc_fail "could not restore the fd limit"
 
-# EMFILE really happened: one backoff warning per port, checked by run.sh
-# once dionaea has written its logs
+# EMFILE really happened: one backoff line per port and the summary, checked by
+# run.sh once dionaea has written its logs
 IFS=',' read -r -a port_list <<< "${PORTS}"
 for port in "${port_list[@]}"; do
-  hc_expect_log dionaea-errors.log "accept\(\) failed on [^ ]+:${port} \(Too many open files\)"
+  hc_expect_log dionaea.log "-info: accept\(\) failed on [^ ]+:${port} \(Too many open files\)"
 done
+hc_expect_log dionaea-errors.log "-warning: listeners paused after accept\(\) failed: [0-9]+ time\(s\) in the last minute, the last: [^ ]+ \(Too many open files\)"
 hc_running || { hc_fail "dionaea is not running"; exit 1; }
 hc_check_cpu 10 "after the connections were closed" || rc=1
 exit ${rc}

@@ -16,11 +16,14 @@ from time import time, localtime, altzone
 
 from dionaea import ndrlib
 from dionaea.core import g_dionaea, incident
-from dionaea.logtext import log_text
+from dionaea.logtext import LogSummary, log_text
 from dionaea.upload import DEFAULT_MAX_UPLOAD_SIZE, incoming_file
 from .include.smbfields import DCERPC_Header, DCERPC_Response
 
 rpclog = logging.getLogger('rpcservices')
+
+# one warning a minute for the print jobs of all connections that are dropped; the line of each is info
+PRINT_DROPPED = LogSummary(rpclog, "print jobs dropped above max_upload_size", "job(s)")
 
 # Set the operating system of Dionaea by changing the value
 # Default value is 2
@@ -2869,8 +2872,9 @@ class spoolss(RPCService):
             con.printer += p.StubData
             limit = getattr(con.config, "max_upload_size", DEFAULT_MAX_UPLOAD_SIZE)
             if len(con.printer) > limit:
-                rpclog.warning("print job of %s dropped: its fragments are above max_upload_size (%d bytes)",
-                               con.remote.host, limit)
+                rpclog.info("print job of %s dropped: its fragments are above max_upload_size (%d bytes)",
+                            con.remote.host, limit)
+                PRINT_DROPPED.add("%s, %d bytes" % (con.remote.host, limit))
                 con.printer = None
                 return None
             if p.PacketFlags != 2:

@@ -9,10 +9,15 @@ import logging
 from dionaea import IHandlerLoader
 from dionaea.core import ihandler, incident
 from dionaea.exception import LoaderError
+from dionaea.logtext import LogSummary, log_text
 
 
 logger = logging.getLogger("emu_scripts")
 logger.setLevel(logging.DEBUG)
+
+# one warning a minute for the scripts of all connections whose urls are not all followed; the line
+# of each is info
+SUBDOWNLOADS = LogSummary(logger, "subdownloads not followed at max_subdownloads", "script(s)")
 
 
 class EmulateScriptsLoader(IHandlerLoader):
@@ -109,7 +114,8 @@ class EmulateScriptsHandler(ihandler):
                 continue
 
             if len(url_levels) > self.max_subdownloads:
-                logger.warning("Max number of subdownloads reached")
+                logger.info("Max number of subdownloads reached")
+                SUBDOWNLOADS.add("%s (%d)" % (log_text(icd.url), self.max_subdownloads))
                 break
             url_levels[url] = next_level
             i = incident("dionaea.download.offer")

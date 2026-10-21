@@ -18,6 +18,7 @@ sees the rows at most a second later, the schema and the rows are the same.
 
 import contextlib
 import importlib.util
+import logging
 import os
 import sqlite3
 import sys
@@ -85,6 +86,12 @@ def _stand_ins():
     modules["dionaea.core"].ihandler = type("ihandler", (), {"__init__": lambda self, path: None})
     modules["dionaea.core"].timer = FakeTimer
     sys.modules.update(modules)
+    # the real logtext (stdlib only)
+    spec = importlib.util.spec_from_file_location("dionaea.logtext", _src_root() / "logtext.py")
+    logtext = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(logtext)
+    saved.setdefault("dionaea.logtext", sys.modules.get("dionaea.logtext"))
+    sys.modules["dionaea.logtext"] = logtext
     try:
         yield
     finally:
@@ -174,6 +181,77 @@ def test_a_failed_commit_is_tried_again(handler, tmp_path):
     reader.close()
     FakeTimer.made[-1].fire()
     assert not handler._dirty
+    assert rows(db) == 1
+
+
+def test_failed_commits_are_info_and_one_warning_a_minute(handler, tmp_path, caplog, summaries):
+    """The flush of every second that fails: an info line each, one warning a minute."""
+    clock = summaries(logsql.COMMIT_FAILED)
+    db = tmp_path / "dionaea.sqlite"
+    reader = sqlite3.connect(str(db), timeout=0, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM connections").fetchone()
+    handler.dbh.execute("PRAGMA busy_timeout = 0")
+    with caplog.at_level(logging.INFO, logger="log_sqlite"):
+        for _ in range(10):
+            handler.connection_insert(FakeIncident(con=FakeCon()), "accept")
+            FakeTimer.made[-1].fire()
+            clock.advance(1)
+        infos = [r.getMessage() for r in caplog.records
+                 if r.levelno == logging.INFO and "Unable to commit" in r.getMessage()]
+        assert len(infos) == 10
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [("commits of the sqlite log tried again: 1 time(s) in the last minute, "
+                            "the last: %s, database is locked") % db]
+        clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings[1:] == [("commits of the sqlite log tried again: 9 time(s) in the last minute, "
+                            "the last: %s, database is locked") % db]
+    reader.execute("COMMIT")
+    reader.close()
+
+
+class FailingCursor:
+    """The cursor of the handler whose statements fail as sqlite does without a free descriptor."""
+
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def execute(self, *args):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    def __getattr__(self, name):
+        return getattr(self.cursor, name)
+
+
+def test_incidents_that_can_not_be_recorded_are_info_and_one_warning_a_minute(handler, tmp_path, caplog, summaries):
+    """An insert of an incident that fails (sqlite3.Error) is an info line with the client, the
+    summary warning sums them up; the handler and its connection to the database go on."""
+    clock = summaries(logsql.NOT_RECORDED)
+    db = tmp_path / "dionaea.sqlite"
+    cursor = handler.cursor
+    handler.cursor = FailingCursor(cursor)
+    with caplog.at_level(logging.INFO, logger="log_sqlite"):
+        for _ in range(4):
+            handler.handle_incident_dionaea_connection_tcp_accept(FakeIncident(con=FakeCon()))
+            clock.advance(1)
+        handler.handle_incident_dionaea_download_offer(FakeIncident(con=FakeCon(), url="http://x/\n"))
+        infos = [r.getMessage() for r in caplog.records
+                 if r.levelno == logging.INFO and "not recorded" in r.getMessage()]
+        assert infos == [("dionaea.connection.tcp.accept not recorded: unable to open database file "
+                         "(198.51.100.4)")] * 4
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [("logsql: 1 incident(s) not recorded in the last minute, "
+                            "the last: unable to open database file (198.51.100.4)")]
+        clock.advance(60)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings[1:] == [("logsql: 3 incident(s) not recorded in the last minute, "
+                            "the last: unable to open database file (198.51.100.4)")]
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    # the connection to the database is usable: the next incident is recorded
+    handler.cursor = cursor
+    handler.handle_incident_dionaea_connection_tcp_accept(FakeIncident(con=FakeCon()))
+    FakeTimer.made[-1].fire()
     assert rows(db) == 1
 
 

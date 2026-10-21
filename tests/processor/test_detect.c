@@ -119,8 +119,8 @@ static void reset(void)
 	g_atomic_int_set(&stub_incidents, 0);
 	g_atomic_int_set(&stub_closes, 0);
 	g_atomic_int_set(&stub_overload_logs, 0);
-	g_atomic_int_set(&stub_give_up_logs, 0);
-	g_atomic_int_set(&stub_scan_done_logs, 0);
+	g_atomic_int_set(&stub_scan_stopped_logs, 0);
+	stub_summaries_reset();
 	/* stops the trailing trim of a test before */
 	emu_trim_reset();
 	g_atomic_int_set(&trims, 0);
@@ -274,8 +274,9 @@ static void scan_limit(void)
 	g_assert_cmpuint(ctx->offset, ==, SCAN_LIMIT);
 	g_assert_cmpuint(check_windows(0), ==, SCAN_LIMIT);
 	g_assert_cmpuint(pd->bistream->bytes, ==, 0);
-	g_assert_cmpint(g_atomic_int_get(&stub_scan_done_logs), ==, 1);
-	g_assert_cmpint(g_atomic_int_get(&stub_give_up_logs), ==, 0);
+	/* done reading: an info line, no give-up at a limit */
+	g_assert_cmpint(g_atomic_int_get(&stub_scan_stopped_logs), ==, 1);
+	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 0);
 	g_assert_cmpint(g_atomic_int_get(&profiled), ==, 0);
 	stub_pool_new(1);
 	processor_io_single(&con, pd, piece, 1000, bistream_in);
@@ -300,7 +301,7 @@ static void scan_limit(void)
 	}
 	g_assert_cmpint(g_atomic_int_get(&profiled), ==, 1);
 	g_assert_cmpmem(profiled_code->data, sizeof(shellcode), shellcode, sizeof(shellcode));
-	g_assert_cmpint(g_atomic_int_get(&stub_scan_done_logs), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_scan_stopped_logs), ==, 0);
 	g_free(data);
 	emu_dispose(&con, pd);
 }
@@ -324,7 +325,10 @@ static void give_up(void)
 	processor_io_single(&con, pd, data + BISTREAM_MAX_BYTES, 1, bistream_in);
 	g_assert_cmpint(g_atomic_int_get(&pd->state), ==, processor_done);
 	g_assert_cmpuint(pd->bistream->bytes, ==, 0);
-	g_assert_cmpint(g_atomic_int_get(&stub_give_up_logs), ==, 1);
+	/* an info line of the connection and the summary warning, no warning of the connection */
+	g_assert_cmpint(g_atomic_int_get(&stub_scan_stopped_logs), ==, 1);
+	g_assert_cmpint(g_atomic_int_get(&stub_connection_warnings), ==, 0);
+	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 1);
 	stub_gate_release(busy);
 	stub_drain();
 	/* the waiting job found nothing to scan */

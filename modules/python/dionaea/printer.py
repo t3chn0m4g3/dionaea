@@ -12,7 +12,7 @@
 from dionaea import ServiceLoader
 from dionaea.core import connection, g_dionaea, incident
 from dionaea.exception import ServiceConfigError
-from dionaea.logtext import log_text
+from dionaea.logtext import LogSummary, log_text
 from dionaea.upload import DEFAULT_MAX_UPLOAD_SIZE, UploadError, UploadFile, upload_url
 import logging
 import os
@@ -21,6 +21,9 @@ import time
 
 logger = logging.getLogger("printer")
 logger.setLevel(logging.DEBUG)
+
+# one warning a minute for the print jobs of all connections that are cut; the line of each is info
+CUT = LogSummary(logger, "print jobs cut", "job(s)")
 
 
 #: Largest print job that is kept (bytes), the rest of the data is read and dropped
@@ -587,5 +590,6 @@ class Printerd(connection):
         except UploadError as e:
             if not self.pcl_too_large:
                 self.pcl_too_large = True
-                logger.warning("print job from %s is cut: %s", self.remote.host, e)
+                logger.info("print job from %s is cut: %s", self.remote.host, e)
+                CUT.add("%s, %s" % (self.remote.host, log_text(e)))
         return len(data)

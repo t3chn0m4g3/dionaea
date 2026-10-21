@@ -16,8 +16,14 @@ import sqlite3
 import struct
 import time
 
+from dionaea.logtext import LogSummary, log_text
+
 logger = logging.getLogger('sip')
 logger.setLevel(logging.DEBUG)
+
+# one warning a minute for the RTP streams of all calls whose dump can not be made; the line of each
+# is info
+RTP_NOT_DUMPED = LogSummary(logger, "RTP dumps not made", "stream(s)")
 
 DEFAULT_SDP = """
 v=0
@@ -342,8 +348,9 @@ class PCAP(object):
 
         try:
             self._fp = open(os.path.join(path, filename), "wb")
-        except:
-            logger.warning("Can't create RTP-Dump file: %s", os.path.join(path, filename))
+        except Exception as e:
+            logger.info("Can't create RTP-Dump file: %s", os.path.join(path, filename))
+            RTP_NOT_DUMPED.add("%s: %s" % (log_text(filename), log_text(e)))
 
         if self._fp is None:
             return False

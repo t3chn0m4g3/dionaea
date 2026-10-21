@@ -674,8 +674,7 @@ void connection_tls_accept_cb (EV_P_ struct ev_io *w, int revents)
 				// back to the event loop with the watcher still active
 				if( ++transient_errors < CONNECTION_ACCEPT_TRANSIENT_MAX )
 					continue;
-				g_warning("accept() failed %i times in a row on %s (%s)",
-						  transient_errors, con->local.node_string, strerror(error));
+				connection_accept_failed_log(con, transient_errors, error);
 				break;
 			}
 
@@ -688,10 +687,7 @@ void connection_tls_accept_cb (EV_P_ struct ev_io *w, int revents)
 
 		if( accepted_socket > g_dionaea->limits.fds * 70/100 )
 		{
-			g_warning("Running out of fds, closing connection (fd %i limit %i applied limit %i)",
-					  accepted_socket,
-					  g_dionaea->limits.fds,
-					  g_dionaea->limits.fds * 70/100);
+			connection_out_of_fds_log(accepted_socket);
 			close(accepted_socket);
 			continue;
 		}

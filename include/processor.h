@@ -134,7 +134,8 @@ void processors_clear(struct connection *con);
  * A limit of the stream processing was reached for a processor of this
  * connection that needs the whole history (no give_up_on_limit): stop its
  * processing and close it from the eventloop. Callable from any thread; only
- * the first call per connection logs and closes.
+ * the first call per connection logs (an info line, and an event of the summary
+ * warning, processors_overload_summary()) and closes.
  */
 void processors_overload(struct connection *con, const char *reason);
 /*
@@ -142,14 +143,26 @@ void processors_overload(struct connection *con, const char *reason);
  * instances it feeds) is given back now, nothing more is kept or queued for
  * it; the connection and the other instances go on. A job of it that runs
  * finishes its current step on its copy. Callable from any thread, without a
- * lock of the instance; only the first call per instance logs (reason and
- * address, none of the data).
+ * lock of the instance; only the first call per instance logs (an info line,
+ * reason and address, none of the data).
  * limit true: a limit of the stream processing stopped a give_up_on_limit
- *             processor (a warning, counted in processor_stats.gave_up)
+ *             processor (counted in processor_stats.gave_up and in the summary
+ *             warning, processor_give_up_summary())
  * limit false: the processor is done with what it wants to read (the scan
- *             limit of the emu; info)
+ *             limit of the emu)
  */
 void processor_give_up(struct connection *con, struct processor_data *pd, const char *reason, bool limit);
+/*
+ * The summaries of the lines above (log_summary.h, tests set their hooks): the line of
+ * every connection is info, at most one warning a minute counts the connections of
+ * processors_overload() and of processor_give_up() with limit true.
+ */
+struct log_summary *processor_give_up_summary(void);
+struct log_summary *processors_overload_summary(void);
+/* the dumps of the streamdumper whose writes fail or whose folder of the day can not be made:
+ * an info line each, one warning a minute of each summary */
+struct log_summary *streamdumper_write_summary(void);
+struct log_summary *streamdumper_folder_summary(void);
 /*
  * The connection ends (connection_free()): no more stream data is kept. An
  * instance with a job (waiting or running) still reads what arrived before

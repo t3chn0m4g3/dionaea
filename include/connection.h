@@ -350,6 +350,29 @@ bool connection_accept_error_is_transient(int error);
 void connection_accept_backoff(struct connection *con, int error);
 void connection_accept_retry_timeout_cb(struct ev_loop *loop, struct ev_timer *w, int revents);
 
+/*
+ * The lines of every connection that the core writes when a limit or the system refuses it
+ * are info; one warning a minute of each of these summaries counts them (log_summary.h):
+ * accept() failing in a row (connection_accept_failed_log()), a connection closed for
+ * running out of fds (connection_out_of_fds_log()), no socket (connection_socket()), a TCP
+ * read that fails other than by a reset of the client, a UDP read and a UDP reply that fail,
+ * an accepted connection whose address can not be read (other than a client that is gone).
+ */
+struct log_summary;
+extern struct log_summary connection_accept_failed_summary;
+extern struct log_summary connection_out_of_fds_summary;
+extern struct log_summary connection_no_socket_summary;
+extern struct log_summary connection_tcp_read_failed_summary;
+extern struct log_summary connection_udp_read_failed_summary;
+extern struct log_summary connection_udp_not_sent_summary;
+extern struct log_summary connection_no_address_summary;
+/* a listener that pauses after accept() failed for want of fds or memory (connection_accept_backoff()) */
+extern struct log_summary connection_accept_backoff_summary;
+/* the accept loop of the listener con stopped after count transient errors in a row, the last error */
+void connection_accept_failed_log(struct connection *con, int count, int error);
+/* the accept loop closes the connection of fd, it is above 70 % of the fds */
+void connection_out_of_fds_log(int fd);
+
 void connection_tcp_accept_cb (struct ev_loop *loop, struct ev_io *w, int revents);
 void connection_tcp_connecting_cb(struct ev_loop *loop, struct ev_io *w, int revents);
 void connection_tcp_io_in_cb(struct ev_loop *loop, struct ev_io *w, int revents);

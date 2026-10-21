@@ -8,8 +8,40 @@
 Changelog
 =========
 
-0.12.2 - (`master`_)
+0.12.3 - (`master`_)
 --------------------
+
+**logs**
+
+* A line that every connection, request or session can write is info, with its detail as
+  before, and one warning a minute sums it up: how many there were in the last minute and
+  the last of them. The first one after a quiet minute is a warning at once, so a single
+  one is in the errors log within a minute and many give one line a minute.
+* In the core and its modules this holds for an emu scan that stops at a limit of the
+  stream processing (``processor: scans stopped at a limit``) and a connection closed at
+  such a limit, accept() errors in a row, a listener that pauses after accept() failed for
+  want of fds, a connection closed for running out of fds, a
+  connection without a socket or without its address, TCP and UDP reads and UDP replies
+  that fail, temporary files that can not be made, the folders and the writes of the
+  streamdumper, the files and the writes of the emulation, and the downloads and uploads
+  of curl without a file and the uploads that fail.
+* In the Python modules it holds for uploads that are dropped or fail (SMB, FTP, a file
+  of holes), the limit of open SMB files, FTP commands without storage or a socket, print
+  jobs that are dropped or cut, the TFTP session limit, TFTP error replies that are rate
+  limited and TFTP files that can not be opened, MQTT packets above the limit, samples
+  the store does not keep or whose mode it can not set, subdownloads beyond
+  ``max_subdownloads``, RTP dumps, hpfeeds publications and the commits of the sqlite log
+  that are tried again.
+* The info lines and the summaries of dropped or failed uploads, of UDP reads and replies and
+  of the files of the emulation name the address of the client.
+* An incident whose rows the sqlite log can not write (``sqlite3.Error``) is an info line with
+  the client and an event of the summary ``logsql: N incident(s) not recorded in the last
+  minute``; the handler and its database go on.
+* The functional tests fail when one message is more than five times in
+  ``dionaea-errors.log``.
+
+0.12.2 - (2026-10-21)
+---------------------
 
 **logs**
 

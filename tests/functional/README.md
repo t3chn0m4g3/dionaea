@@ -90,13 +90,22 @@ above) so the startup can be checked.
 - `unit/test_unreadable_messages.py`: a message of a client that SMB, epmapper, MQTT or MSSQL
   can not read is info when the parser raised (its traceback at debug), a warning with the
   traceback for any other exception.
+- `unit/test_logtext.py` (`LogSummary`) and the unit tests of the services and handlers (SMB, FTP,
+  TFTP, MQTT, the printer and spoolss, the uploads, the store, emu_scripts, SIP, hpfeeds, log_sqlite):
+  a line that every connection can write (a limit, a lost capture, a failure of the system) is info,
+  one warning a minute sums them up with their number and the last one.
 - `unit/test_log_json_credentials.py`: credential limits for SMB, FTP, MySQL
   and MSSQL, both JSON output forms, and independent connection records.
 - `test_errors_log_live.py`: `dionaea-errors.log` (`warning,error,critical`) is written per line: the
-  warning of an SMB1 write beyond `max_upload_size` (the upload is dropped) is in it within 1 s while
-  dionaea runs. An SMB1 message shorter than its header and a POST with more parts than
-  `max_num_fields` are info, no line of it. After the stop, `run.sh` allows no critical line in it
-  (other than `OWN_CRITICAL`) and prints the warnings left, per message, as information.
+  summary warning of the SMB1 writes beyond `max_upload_size` (the uploads are dropped, the line of
+  each is info) is in it within 1 s while dionaea runs, and the drops after it in the same minute
+  are in the summary when that minute ends. An SMB1 message shorter than its header and a POST
+  with more parts than `max_num_fields` are info, no line of it. After the stop, `run.sh` allows
+  no critical line in it (other than `OWN_CRITICAL`), prints the warnings left, per message
+  (`tools/count_warnings.sh`), and fails when a message is there too often: a message that every
+  connection can write is one summary a minute (`src/log_summary.c`, `LogSummary` of
+  `modules/python/dionaea/logtext.py`), counted by its text before the number, which may be there
+  once per started minute of the run and once more; any other message five times.
 - `test_smoke.py`: service ports, FTP login in `dionaea.json`, HTTP upload. The
   multipart tests (`test_http_multipart_*`: a file part is stored, a part with a
   Content-Transfer-Encoding is stored as sent, a line that starts with the boundary inside the

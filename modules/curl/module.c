@@ -28,6 +28,12 @@
 
 #define D_LOG_DOMAIN "curl"
 
+/* the downloads and uploads of every connection that are dropped or fail: an info line each, one
+ * warning a minute of each summary (log_summary.h) */
+static struct log_summary download_no_file = LOG_SUMMARY_INIT("downloads dropped, no file could be made", "download(s)");
+static struct log_summary upload_no_file = LOG_SUMMARY_INIT("uploads dropped, no file could be made", "upload(s)");
+static struct log_summary upload_failed = LOG_SUMMARY_INIT("uploads failed", "upload(s)");
+
 static struct
 {
 	struct ev_timer timer_event;
@@ -174,12 +180,13 @@ static void download_done(struct session *session, CURLcode result, const char *
 		tempfile_close(session->action.download.file);
 }
 
-/* An upload that failed: one warning, the url and curl's text as printable text (log_text.h) */
+/* An upload that failed: an info line and the summary, the url and curl's text as printable text (log_text.h) */
 static void upload_done(struct session *session, CURLcode result, const char *eff_url)
 {
 	char *url = log_text_new(eff_url != NULL ? eff_url : session->url, "(no url)");
 	char *error = log_text_new(session->error, "");
-	g_warning("UPLOAD FAIL: %s => (%d) %s", url, result, error);
+	g_info("UPLOAD FAIL: %s => (%d) %s", url, result, error);
+	log_summary_addf(&upload_failed, "%s => (%d) %s", url, result, error);
 	g_free(error);
 	g_free(url);
 
@@ -527,7 +534,8 @@ void session_upload_new(struct incident *i)
 	{
 		/* the answer for the callback has no file (no descriptor left, a full disk) */
 		char *text = log_text_new(session->url, "(no url)");
-		g_warning("Could not create the file of the upload to %s, the upload is dropped", text);
+		g_info("Could not create the file of the upload to %s, the upload is dropped", text);
+		log_summary_add(&upload_no_file, text);
 		g_free(text);
 		curl_easy_cleanup(session->easy);
 		session_free(session);
@@ -662,7 +670,8 @@ static void session_download_new(struct incident *i, char *url)
 	{
 		/* no descriptor left or a full disk: no download, the connection is given back */
 		char *text = log_text_new(session->url, "(no url)");
-		g_warning("Could not create the file of the download of %s, the download is dropped", text);
+		g_info("Could not create the file of the download of %s, the download is dropped", text);
+		log_summary_add(&download_no_file, text);
 		g_free(text);
 		curl_easy_cleanup(session->easy);
 		session_free(session);

@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 from dionaea.core import *
-from dionaea.logtext import log_text, log_unreadable
+from dionaea.logtext import LogSummary, log_text, log_unreadable
 
 import datetime
 import logging
@@ -17,6 +17,10 @@ import tempfile
 from dionaea.mqtt.include.packets import *
 
 logger = logging.getLogger('mqtt')
+
+# one warning a minute for the connections of all clients closed at a packet above the limit; the line
+# of each is info
+OVERSIZED = LogSummary(logger, "MQTT packets above the limit, connections closed", "connection(s)")
 
 # what the packet classes raise for a packet whose body does not hold the fields of its type
 MALFORMED = (AttributeError, IndexError, KeyError, TypeError, ValueError, struct.error)
@@ -258,10 +262,11 @@ class mqttd(connection):
 			if length > MAX_PACKET_SIZE:
 				# the topic and the size, never the payload
 				topic = packet_topic(data[offset:], self.protocol_level)
-				logger.warning("MQTT packet of %d bytes (type %d, topic %s) from %s:%s is above the limit of %d bytes, closing the connection",
+				logger.info("MQTT packet of %d bytes (type %d, topic %s) from %s:%s is above the limit of %d bytes, closing the connection",
 					length, data[offset] >> 4,
 					"unknown" if topic is None else "'%s'" % printable(topic),
 					self.remote.host, self.remote.port, MAX_PACKET_SIZE)
+				OVERSIZED.add("%d bytes (type %d) from %s:%s" % (length, data[offset] >> 4, self.remote.host, self.remote.port))
 				self.close()
 				return len(data)
 			if offset + length > len(data):

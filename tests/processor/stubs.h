@@ -17,13 +17,16 @@
 #include "connection.h"
 #include "processor.h"
 #include "threads.h"
+#include "log_summary.h"
 
 extern gint stub_refs;          /* connection_ref - connection_unref */
 extern gint stub_closes;        /* connection_close calls */
 extern gint stub_incidents;     /* incidents reported */
-extern gint stub_overload_logs; /* "Stream processing limit" warnings */
-extern gint stub_give_up_logs;  /* "<name> scan stopped" warnings (a limit) */
-extern gint stub_scan_done_logs; /* "<name> scan stopped" infos (done reading) */
+extern gint stub_overload_logs; /* "Stream processing limit" lines of a connection (info) */
+extern gint stub_scan_stopped_logs; /* "<name> scan stopped" lines of an instance (info: at a limit or done reading) */
+extern gint stub_connection_warnings; /* either line at warning (none is) */
+extern gint stub_give_up_summaries; /* "processor: scans stopped at a limit" warnings */
+extern gint stub_overload_summaries; /* "processor: connections closed at a limit" warnings */
 extern gint stub_trim_thread_logs; /* "no thread for the trailing trim" warnings of the emu */
 
 /* g_dionaea with a threadpool of workers workers, an eventloop and its async queue */
@@ -35,6 +38,11 @@ void stub_drain(void);
 /* run the async commands of the eventloop */
 void stub_run_async(void);
 void stub_quiet_logs(void);
+/* the text of the last summary warning (to g_free) */
+char *stub_last_summary(void);
+/* the summaries of processor.c with the clock of the stubs (it stands still: only the
+ * first event after this warns), their events and warnings forgotten */
+void stub_summaries_reset(void);
 
 /* a connection with its processor root and one instance of p */
 void stub_instance(struct connection *con, struct processor_data **pd, struct processor *p);

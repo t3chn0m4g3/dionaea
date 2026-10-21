@@ -18,7 +18,7 @@
 from dionaea import IHandlerLoader, ServiceLoader
 from dionaea.core import connection, ihandler, g_dionaea, incident, download_failed, download_refused
 from dionaea.exception import ConnectionRefusedByFilter, ServiceConfigError
-from dionaea.logtext import log_text
+from dionaea.logtext import LogSummary, log_text
 from dionaea.mirror_policy import normalize
 from dionaea.upload import incoming_file
 
@@ -36,6 +36,12 @@ MAX_BLKSIZE = 65536
 
 logger = logging.getLogger('tftp')
 logger.setLevel(logging.INFO)
+
+# one warning a minute for the limits of the sessions of all clients and the files of the sessions
+# that cannot be opened; the line of each is info (logtext.LogSummary)
+SESSION_LIMIT = LogSummary(logger, "TFTP session limit reached", "time(s)")
+RATE_LIMITED = LogSummary(logger, "TFTP error replies rate limited", "source(s)")
+NOT_OPENED = LogSummary(logger, "TFTP files not opened", "session(s)")
 
 # Sessions of the server (TftpServerHandler) at a time: each one is a UDP socket of
 # its own until the transfer ends or its idle timeout runs out. At most MAX_SESSIONS
@@ -64,7 +70,8 @@ class TftpSessionLimits(object):
             self.refused += 1
             if self.total >= self.total_max and not self.full:
                 self.full = True
-                logger.warning("TFTP session limit reached (%d sessions), refusing read requests", self.total_max)
+                logger.info("TFTP session limit reached (%d sessions), refusing read requests", self.total_max)
+                SESSION_LIMIT.add("%d sessions" % self.total_max)
             return False
         self.total += 1
         self.per_source[source] = self.per_source.get(source, 0) + 1
@@ -162,9 +169,10 @@ class TftpErrorLimiter(object):
             self.logged_in_window = 0
         self.logged_in_window += 1
         if self.logged_in_window <= self.log_sources:
-            logger.warning("TFTP error replies to %s are rate limited, %d dropped", source, dropped)
+            logger.info("TFTP error replies to %s are rate limited, %d dropped", source, dropped)
         elif self.logged_in_window == self.log_sources + 1:
-            logger.warning("TFTP error replies to more sources are rate limited, %d dropped in all", self.dropped)
+            logger.info("TFTP error replies to more sources are rate limited, %d dropped in all", self.dropped)
+        RATE_LIMITED.add("%s, %d dropped" % (source, dropped))
 
 
 ERRORS = TftpErrorLimiter()
@@ -977,7 +985,8 @@ class TftpServerHandler(TftpSession):
             self.fileobj = open(self.filename, "rb")
         except OSError as e:
             # e.g. EMFILE: no reply, the session ends and gives its place back
-            logger.warning("Unable to open %s: %s", log_text(self.filename), e.strerror)
+            logger.info("Unable to open %s: %s", log_text(self.filename), e.strerror)
+            NOT_OPENED.add("%s: %s" % (log_text(self.filename), e.strerror))
             self.close()
             return
         self.send_dat()

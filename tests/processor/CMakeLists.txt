@@ -33,7 +33,7 @@ target_link_libraries(test_bistream PRIVATE ${GLIB2_LIBRARIES})
 add_test(NAME bistream COMMAND test_bistream)
 
 add_executable(test_processor test_processor.c stubs.c stubs_tempfile.c ../../src/processor.c
-               ../../src/streamcap.c ../../src/threads.c ../../src/bistream.c
+               ../../src/log_summary.c ../../src/streamcap.c ../../src/threads.c ../../src/bistream.c
                ../../src/refcount.c ${PROCESSOR_TEST_SUPPORT})
 target_include_directories(test_processor PRIVATE ${PROCESSOR_TEST_INCLUDES})
 # g_thread_pool_push is wrapped to inject enqueue failures
@@ -43,13 +43,13 @@ add_test(NAME processor COMMAND test_processor)
 
 # the streamdumper and its limits with the temp files of util.c; close and fclose are wrapped
 # to catch a second close of a descriptor, fstatat and readdir to count the reads of the
-# counting thread and to slow them down
+# counting thread and to slow them down, fwrite to fail as on a full disk
 add_executable(test_streamdumper test_streamdumper.c stubs.c ../../src/processor.c
-               ../../src/streamcap.c ../../src/util.c ../../src/threads.c ../../src/bistream.c
+               ../../src/log_summary.c ../../src/streamcap.c ../../src/util.c ../../src/threads.c ../../src/bistream.c
                ../../src/refcount.c ${PROCESSOR_TEST_SUPPORT})
 target_include_directories(test_streamdumper PRIVATE ${PROCESSOR_TEST_INCLUDES})
 target_link_options(test_streamdumper PRIVATE -Wl,--wrap=close -Wl,--wrap=fclose
-                    -Wl,--wrap=fstatat -Wl,--wrap=readdir)
+                    -Wl,--wrap=fstatat -Wl,--wrap=readdir -Wl,--wrap=fwrite)
 target_link_libraries(test_streamdumper PRIVATE ${GLIB2_LIBRARIES} EV::EV)
 add_test(NAME streamdumper COMMAND test_streamdumper)
 
@@ -60,7 +60,7 @@ set(DIONAEA_CORE_SOURCES
   ../../src/connection_tls.c ../../src/connection_udp.c ../../src/dns.c ../../src/incident.c
   ../../src/log.c ../../src/modules.c ../../src/node_info.c ../../src/pchild.c ../../src/processor.c
   ../../src/refcount.c ../../src/signals.c ../../src/streamcap.c ../../src/ssl.c ../../src/threads.c
-  ../../src/util.c ../../src/download_log.c ../../src/log_text.c)
+  ../../src/util.c ../../src/download_log.c ../../src/log_summary.c ../../src/log_text.c)
 add_executable(test_connection_listen test_connection_listen.c ${DIONAEA_CORE_SOURCES} ${PROCESSOR_TEST_SUPPORT})
 # no local of connection.c hides another (the errno of a failed listen() was named as the GError)
 set_source_files_properties(../../src/connection.c PROPERTIES COMPILE_OPTIONS "-Werror=shadow")
@@ -69,7 +69,8 @@ target_include_directories(test_connection_listen PRIVATE ${PROCESSOR_TEST_INCLU
 # the core uses the OpenSSL 1.x API (DH, RSA) and GLib's g_pattern_match
 target_compile_options(test_connection_listen PRIVATE -Wno-deprecated-declarations)
 target_link_options(test_connection_listen PRIVATE -Wl,--wrap=listen -Wl,--wrap=close -Wl,--wrap=accept
-                    -Wl,--wrap=pchild_sent_bind)
+                    -Wl,--wrap=pchild_sent_bind -Wl,--wrap=socket -Wl,--wrap=recv -Wl,--wrap=recvmsg
+                    -Wl,--wrap=sendmsg -Wl,--wrap=getpeername -Wl,--wrap=__recv_chk)
 target_link_libraries(test_connection_listen PRIVATE ${GLIB2_LIBRARIES} ${GMODULE2_LIBRARIES}
                       ${OPENSSL_LIBRARIES} EV::EV UDNS::UDNS)
 add_test(NAME connection_listen COMMAND test_connection_listen)
@@ -81,12 +82,18 @@ target_link_libraries(test_log PRIVATE ${GLIB2_LIBRARIES} EV::EV)
 add_test(NAME log COMMAND test_log)
 
 # the log lines of downloads that do not complete (src/download_log.c)
-add_executable(test_download_log test_download_log.c ../../src/download_log.c ../../src/log_text.c ${PROCESSOR_TEST_SUPPORT})
+add_executable(test_download_log test_download_log.c ../../src/download_log.c ../../src/log_summary.c ../../src/log_text.c ${PROCESSOR_TEST_SUPPORT})
 target_include_directories(test_download_log PRIVATE ${PROCESSOR_TEST_INCLUDES})
 target_link_libraries(test_download_log PRIVATE ${GLIB2_LIBRARIES} EV::EV)
 add_test(NAME download_log COMMAND test_download_log)
 
-set(PROCESSOR_TESTS bistream processor streamdumper connection_listen log download_log)
+# at most one warning a minute for a message of every connection (src/log_summary.c)
+add_executable(test_log_summary test_log_summary.c ../../src/log_summary.c ../../src/threads.c ${PROCESSOR_TEST_SUPPORT})
+target_include_directories(test_log_summary PRIVATE ${PROCESSOR_TEST_INCLUDES})
+target_link_libraries(test_log_summary PRIVATE ${GLIB2_LIBRARIES} EV::EV)
+add_test(NAME log_summary COMMAND test_log_summary)
+
+set(PROCESSOR_TESTS bistream processor streamdumper connection_listen log download_log log_summary)
 
 if(WITH_MODULE_EMU AND DIONAEA_BUNDLED_LIBEMU)
   if(CMAKE_C_FLAGS MATCHES "-fsanitize=[^ ]*undefined")
@@ -95,7 +102,7 @@ if(WITH_MODULE_EMU AND DIONAEA_BUNDLED_LIBEMU)
     target_compile_options(emu PRIVATE -fno-sanitize=shift,signed-integer-overflow)
   endif()
   add_executable(test_detect test_detect.c stubs.c stubs_tempfile.c ../../modules/emu/detect.c
-                 ../../modules/emu/trim.c ../../src/processor.c ../../src/streamcap.c ../../src/threads.c ../../src/bistream.c
+                 ../../modules/emu/trim.c ../../src/processor.c ../../src/log_summary.c ../../src/streamcap.c ../../src/threads.c ../../src/bistream.c
                  ../../src/refcount.c ${PROCESSOR_TEST_SUPPORT})
   target_include_directories(test_detect PRIVATE ${PROCESSOR_TEST_INCLUDES} ../../modules/emu)
   # emu_shellcode_test is wrapped to record the scanned windows, malloc_trim to count the trims,
@@ -110,7 +117,7 @@ if(WITH_MODULE_EMU AND DIONAEA_BUNDLED_LIBEMU)
   # and emulate_ctx_free of emulate.c (stubs for the rest of dionaea); tempdownload_new is wrapped
   # to make it fail
   add_executable(test_emu_hooks test_emu_hooks.c ../../modules/emu/hooks.c ../../modules/emu/emulate.c
-                 ../../src/util.c ${PROCESSOR_TEST_SUPPORT})
+                 ../../src/util.c ../../src/log_summary.c ${PROCESSOR_TEST_SUPPORT})
   target_include_directories(test_emu_hooks PRIVATE ${PROCESSOR_TEST_INCLUDES} ../../modules/emu)
   target_link_options(test_emu_hooks PRIVATE -Wl,--wrap=tempdownload_new)
   target_link_libraries(test_emu_hooks PRIVATE emu ${GLIB2_LIBRARIES} EV::EV)
@@ -128,7 +135,7 @@ endif()
 
 if(WITH_MODULE_CURL AND CURL_FOUND)
   # the download and upload sessions of the curl module without a temp file
-  add_executable(test_curl_session test_curl_session.c ../../src/log_text.c ${PROCESSOR_TEST_SUPPORT})
+  add_executable(test_curl_session test_curl_session.c ../../src/log_text.c ../../src/log_summary.c ${PROCESSOR_TEST_SUPPORT})
   target_include_directories(test_curl_session PRIVATE ${PROCESSOR_TEST_INCLUDES} ../../src ${CURL_INCLUDE_DIRS})
   # the module uses the form API of curl
   target_compile_options(test_curl_session PRIVATE -Wno-deprecated-declarations)

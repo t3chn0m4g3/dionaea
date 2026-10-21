@@ -9,7 +9,7 @@
 # the check starts a second dionaea with ``max_size: 1`` (MiB) in
 # ihandlers/store.yaml on the same network and runs test_store_cap_instance.py
 # against it (it also runs the printer service, whose PCL jobs go through the store). After dionaea was stopped (its log files are written then) the
-# check expects the warning of every refused sample in dionaea.log, once per md5
+# check expects the info line of every refused sample in dionaea.log, once per md5
 # even if the sample was uploaded again.
 
 set -Eeuo pipefail
@@ -101,9 +101,9 @@ else
     [[ -n "${md5}" ]] || continue
     count="$(grep -c "Not storing ${md5} " "${log}" || true)"
     if [[ "${count}" == "1" ]]; then
-      hc_say "dionaea.log has the warning for ${md5}"
+      hc_say "dionaea.log has the line for ${md5}"
     else
-      hc_fail "dionaea.log has ${count} warnings for the refused sample ${md5} (expected one)"
+      hc_fail "dionaea.log has ${count} lines for the refused sample ${md5} (expected one)"
       rc=1
     fi
   done < "${root}/out/cap-refused"

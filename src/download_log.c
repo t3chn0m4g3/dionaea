@@ -15,73 +15,30 @@
 
 #include "dionaea.h"
 #include "download_log.h"
+#include "log_summary.h"
 #include "log_text.h"
-#include "log.h"
 
 #define D_LOG_DOMAIN "download"
+#include "log.h"
 
-#define PERIOD_US ((gint64)DOWNLOAD_FAILURES_PERIOD * G_USEC_PER_SEC)
+/* the warnings of the failures: at most one a minute (log_summary.h) */
+static struct log_summary failures = LOG_SUMMARY_INIT("downloads", "failed");
 
-static gint64 default_clock(void);
-static bool default_schedule(double after);
+/* the hooks of a test, through those of the summary */
+static const struct download_failures_hooks *test_hooks;
 
-static const struct download_failures_hooks default_hooks = { default_clock, default_schedule };
-
-static struct
+static gint64 test_clock(void)
 {
-	const struct download_failures_hooks *hooks;
-	/* failures since the last summary, and the last of them */
-	guint64 pending;
-	char *last_url;
-	char *last_reason;
-	/* the last summary */
-	bool warned;
-	gint64 warned_at;
-	/* the timer of the next summary is armed */
-	bool scheduled;
-	struct ev_timer timer;
-} failures = { .hooks = &default_hooks };
-
-static gint64 default_clock(void)
-{
-	return g_get_monotonic_time();
+	return test_hooks->clock();
 }
 
-static void timer_cb(struct ev_loop *loop, struct ev_timer *w, int revents)
+static bool test_schedule(struct log_summary *s, double after)
 {
-	(void)loop;
-	(void)w;
-	(void)revents;
-	download_failures_due();
+	(void)s;
+	return test_hooks->schedule(after);
 }
 
-static bool default_schedule(double after)
-{
-	if( g_dionaea == NULL || g_dionaea->loop == NULL )
-		return false;
-	ev_timer_stop(g_dionaea->loop, &failures.timer);
-	ev_timer_init(&failures.timer, timer_cb, after, 0.);
-	ev_timer_start(g_dionaea->loop, &failures.timer);
-	return true;
-}
-
-static void summary(gint64 now)
-{
-	g_warning("downloads: %" G_GUINT64_FORMAT " failed in the last minute, the last: %s (%s)",
-			  failures.pending, failures.last_url, failures.last_reason);
-	failures.pending = 0;
-	failures.warned = true;
-	failures.warned_at = now;
-}
-
-/* the next summary comes when the period of the last one ends */
-static void schedule(gint64 now)
-{
-	if( failures.scheduled )
-		return;
-	/* armed, or the next failure tries again */
-	failures.scheduled = failures.hooks->schedule((double)(failures.warned_at + PERIOD_US - now) / G_USEC_PER_SEC);
-}
+static const struct log_summary_hooks summary_hooks = { test_clock, test_schedule };
 
 void download_refused(const char *url)
 {
@@ -95,44 +52,23 @@ void download_failed(const char *url, const char *reason)
 	char *u = log_text_new(url, "(no url)");
 	char *r = log_text_new(reason, "no reason");
 	g_info("download failed: %s (%s)", u, r);
-	failures.pending++;
-	g_free(failures.last_url);
-	g_free(failures.last_reason);
-	failures.last_url = u;
-	failures.last_reason = r;
-
-	gint64 now = failures.hooks->clock();
-	if( !failures.warned || now - failures.warned_at >= PERIOD_US )
-		summary(now);
-	else
-		schedule(now);
+	log_summary_addf(&failures, "%s (%s)", u, r);
+	g_free(u);
+	g_free(r);
 }
 
 void download_failures_due(void)
 {
-	failures.scheduled = false;
-	if( failures.pending == 0 )
-		return;
-	gint64 now = failures.hooks->clock();
-	if( now - failures.warned_at >= PERIOD_US )
-		summary(now);
-	else
-		schedule(now);
+	log_summary_due(&failures);
 }
 
 void download_failures_set_hooks(const struct download_failures_hooks *hooks)
 {
-	failures.hooks = hooks != NULL ? hooks : &default_hooks;
+	test_hooks = hooks;
+	log_summary_set_hooks(&failures, hooks != NULL ? &summary_hooks : NULL);
 }
 
 void download_failures_reset(void)
 {
-	failures.pending = 0;
-	g_free(failures.last_url);
-	g_free(failures.last_reason);
-	failures.last_url = NULL;
-	failures.last_reason = NULL;
-	failures.warned = false;
-	failures.warned_at = 0;
-	failures.scheduled = false;
+	log_summary_reset(&failures);
 }
