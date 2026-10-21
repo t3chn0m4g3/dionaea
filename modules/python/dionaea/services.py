@@ -7,7 +7,7 @@
 import logging
 import fnmatch
 
-from dionaea.core import g_dionaea, ihandler
+from dionaea.core import g_dionaea, ihandler, TransportError
 from dionaea import ServiceLoader, load_config_from_files, load_submodules
 
 
@@ -18,6 +18,24 @@ logger = logging.getLogger('services')
 # able to restart them
 g_slave = None
 
+
+def _start(service, addr, iface, srv, refused):
+    """The daemons of service with its config entry srv on addr, None when it does not start. An
+    entry that asks for a transport the core does not have (dtls, ...) does not start: one warning
+    line with the service and the transport, the entry (id(srv)) goes into the set refused and is
+    not tried on another address; another entry of the same service starts. Any other exception is
+    a warning with its traceback."""
+    if id(srv) in refused:
+        return None
+    try:
+        return service.start(addr, iface=iface, config=srv.get("config", {}))
+    except TransportError as e:
+        refused.add(id(srv))
+        logger.warning("Unable to start service %s: %s", service.name, e)
+    except Exception:
+        logger.warning("Unable to start service %s", service.name, exc_info=True)
+    return None
+
 g_service_configs = []
 
 
@@ -26,6 +44,8 @@ class slave():
         self.addresses = addresses
         self.services = []
         self.daemons = {}
+        # the config entries (id) of services that ask for a transport the core does not have
+        self.refused = set()
 
     def start(self):
         for iface in self.addresses:
@@ -40,11 +60,7 @@ class slave():
                         if service not in self.daemons[addr]:
                             self.daemons[addr][service] = []
 
-                        try:
-                            daemons = service.start(addr, iface=iface, config=srv.get("config", {}))
-                        except Exception as e:
-                            logger.warning("Unable to start service", exc_info=True)
-                            continue
+                        daemons = _start(service, addr, iface, srv, self.refused)
                         if isinstance(daemons, (list, tuple)):
                             self.daemons[addr][service] += daemons
                         elif daemons is not None:
@@ -60,6 +76,7 @@ class nlslave(ihandler):
         self.ifaces = ifaces
         self.services = []
         self.daemons = {}
+        self.refused = set()
 
     def handle_incident(self, icd):
         print("SERVANT!\n")
@@ -77,14 +94,10 @@ class nlslave(ihandler):
                             if service not in self.daemons[addr]:
                                 self.daemons[addr][service] = []
                             print(service)
-                            try:
-                                daemons = service.start(addr, iface=iface, config=srv.get("config", {}))
-                            except Exception as e:
-                                logger.warning("Unable to start service", exc_info=True)
-                                continue
+                            daemons = _start(service, addr, iface, srv, self.refused)
                             if isinstance(daemons, (list, tuple)):
                                 self.daemons[addr][service] += daemons
-                            else:
+                            elif daemons is not None:
                                 self.daemons[addr][service].append(daemons)
 
                 if icd.origin == "dionaea.module.nl.addr.del":

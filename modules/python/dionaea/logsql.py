@@ -20,7 +20,10 @@ logger.setLevel(logging.DEBUG)
 COMMIT_FAILED = LogSummary(logger, "commits of the sqlite log tried again", "time(s)")
 # one warning a minute for the incidents whose rows sqlite refuses (no descriptor for the journal, a
 # full disk, ...); the line of each is info
-NOT_RECORDED = LogSummary(logger, "logsql", "incident(s) not recorded")
+NOT_RECORDED = LogSummary(logger, "incidents not recorded in the sqlite log", "incident(s)")
+# one warning a minute for the transactions sqlite undid as a whole (a full disk, an I/O error, ...):
+# the rows since the last commit are lost; the line of each is info
+LOST = LogSummary(logger, "transactions of the sqlite log undone", "transaction(s)")
 
 #: Seconds between two commits. Every incident used to be committed at once, about
 #: 130 transactions a second under load. Each transaction costs sqlite file
@@ -49,6 +52,10 @@ class logsqlhandler(ihandler):
         ihandler.__init__(self, self.path)
         # mapping socket -> attackid
         self.attacks = {}
+        # the ids of the connections inserted since the last commit (_rolled_back)
+        self.uncommitted = set()
+        # the ids of the children whose root a link changed since the last commit (_rolled_back)
+        self.relinked = set()
 
         self.pending = {}
 
@@ -633,6 +640,8 @@ class logsqlhandler(ihandler):
         """The statements of an incident are done: commit them with the next flush."""
         if self._commit_timer is None:
             self.dbh.commit()
+            self.uncommitted.clear()
+            self.relinked.clear()
         else:
             self._dirty = True
 
@@ -643,11 +652,56 @@ class logsqlhandler(ihandler):
         try:
             self.dbh.commit()
         except sqlite3.Error as e:
+            if not self.dbh.in_transaction:
+                # a full disk, an I/O error, ...: sqlite undid the transaction, nothing to try again
+                self._rolled_back(e)
+                return
             # e.g. a reader held its lock longer than the busy timeout: the transaction stays, the next flush tries again
             logger.info("Unable to commit to %s, trying again: %s", self.filename, e)
             COMMIT_FAILED.add("%s, %s" % (self.filename, log_text(e)))
             return
         self._dirty = False
+        self.uncommitted.clear()
+        self.relinked.clear()
+
+    def _rolled_back(self, e):
+        """sqlite undid the whole open transaction (it may after SQLITE_FULL, IOERR, BUSY, NOMEM or
+        INTERRUPT; in_transaction is False then), not only the statement that failed: the rows
+        since the last commit are gone. Their ids are no ids of the handler any more, sqlite gives
+        them to new rows (no AUTOINCREMENT): a later event of such a connection is not recorded, as
+        after an insert that failed. A connection that took such an id as its root, and a child
+        whose link the transaction undid, take the root of their committed row again (their own id
+        if that can not be read), and a lost id waits for no parent."""
+        if self._dirty:
+            self._dirty = False
+            logger.info("The rows of %s since the last commit are lost: %s", self.filename, e)
+            LOST.add("%s, %s" % (self.filename, log_text(e)))
+        lost, self.uncommitted = self.uncommitted, set()
+        relinked, self.relinked = self.relinked, set()
+        if not lost and not relinked:
+            return
+        for con, (root, attackid) in list(self.attacks.items()):
+            if attackid in lost:
+                del self.attacks[con]
+            elif root in lost or attackid in relinked:
+                self.attacks[con] = (self._committed_root(attackid), attackid)
+        for parent, children in list(self.pending.items()):
+            for attackid in lost.intersection(children):
+                del children[attackid]
+            if not children:
+                del self.pending[parent]
+
+    def _committed_root(self, attackid):
+        """The root of the committed row attackid, attackid itself if sqlite can not read it."""
+        try:
+            row = self.dbh.execute("SELECT connection_root FROM connections WHERE connection = ?",
+                                   (attackid,)).fetchone()
+        except sqlite3.Error as e:
+            logger.info("The root of connection %d is not read: %s", attackid, e)
+            return attackid
+        if row is None or row[0] is None:
+            return attackid
+        return row[0]
 
     def stop(self):
         """dionaea stops: no more timer, everything written is committed."""
@@ -682,6 +736,7 @@ class logsqlhandler(ihandler):
                                 (time.time(), connection_type, con.transport, con.protocol, con.local.host, con.local.port, con.remote.host, con.remote.hostname, con.remote.port) )
         attackid = self.cursor.lastrowid
         self.attacks[con] = (attackid, attackid)
+        self.uncommitted.add(attackid)
         self._commit()
 
         # maybe this was a early connection?
@@ -760,12 +815,9 @@ class logsqlhandler(ihandler):
         # if we have to link a connection with a connection we do not know yet,
         # we store the unknown connection in self.pending and associate the
         # childs id with it
-        if icd.parent not in self.attacks:
-            if icd.parent not in self.pending:
-                self.pending[icd.parent] = {self.attacks[icd.child][1]: True}
-            else:
-                if icd.child not in self.pending[icd.parent]:
-                    self.pending[icd.parent][self.attacks[icd.child][1]] = True
+        # (a child without an id, its row is gone or its insert failed, waits for nothing)
+        if icd.parent not in self.attacks and icd.child in self.attacks:
+            self.pending.setdefault(icd.parent, {})[self.attacks[icd.child][1]] = True
 
     def handle_incident_dionaea_connection_link(self, icd):
         if icd.parent in self.attacks:
@@ -777,6 +829,7 @@ class logsqlhandler(ihandler):
             else:
                 childid = parentid
             self.attacks[icd.child] = (parentroot, childid)
+            self.relinked.add(childid)
             logger.info("child has ids %s" % str(self.attacks[icd.child]))
             logger.info("child %i parent %i root %i" %
                         (childid, parentid, parentroot) )
@@ -784,7 +837,7 @@ class logsqlhandler(ihandler):
                                     (parentroot, parentid, childid) )
             self._commit()
 
-        if icd.child in self.pending:
+        if icd.child in self.pending and icd.parent in self.attacks:
             # if the new accepted connection was pending
             # assign the connection_root to all connections which have been
             # waiting for this connection
@@ -1115,8 +1168,11 @@ def _client(icd):
 
 def _recorded(method, origin):
     """method of an incident, an error of sqlite (sqlite3.Error) is an info line and an event of
-    NOT_RECORDED. sqlite undoes the statement that failed only, the rows of the incidents before
-    stay for the next flush and the connection to the database goes on: no rollback."""
+    NOT_RECORDED; the connection to the database goes on. After most errors (a constraint, ...)
+    sqlite undoes the statement that failed only, the rows of the incidents before stay for the
+    next flush. After SQLITE_FULL, IOERR, BUSY, NOMEM or INTERRUPT it may undo the whole open
+    transaction (in_transaction is False then): the rows since the last commit are gone
+    (_rolled_back)."""
     def handle(self, icd):
         try:
             return method(self, icd)
@@ -1124,6 +1180,8 @@ def _recorded(method, origin):
             client = _client(icd)
             logger.info("%s not recorded: %s (%s)", origin, log_text(e), client)
             NOT_RECORDED.add("%s (%s)" % (log_text(e), client))
+            if not self.dbh.in_transaction:
+                self._rolled_back(e)
     handle.__name__ = method.__name__
     handle.__doc__ = method.__doc__
     return handle

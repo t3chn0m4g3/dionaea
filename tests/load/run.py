@@ -58,9 +58,18 @@ GIVE_UP_LINE = re.compile(r"^\[[^]]+\] processor \S+-(?:warning|info): emu scan 
                           r"\((stream data limit|job queue full|scan limit)\), "
                           r"connection 0x[0-9a-f]+ \S+ [0-9a-fA-F.:]+:(\d+) goes on$", re.M)
 # the summary warning of both, once a minute: the number, the reason and the address of the last one
-SUMMARY_LINE = re.compile(r"^\[[^]]+\] processor \S+-warning: processor: (scans stopped|connections closed) "
+SUMMARY_LINE = re.compile(r"^\[[^]]+\] processor \S+-warning: (scans stopped|connections closed) "
                           r"at a limit: \d+ connection\(s\) in the last minute, the last: (emu scan, )?"
                           r"(stream data limit|job queue full|stream offsets) \(\S+ [0-9a-fA-F.:]+:\d+\)$", re.M)
+
+
+def odd_limit_lines(log):
+    """The lines of the limits of the stream processing with more than their reason and address."""
+    return [line for line in log.splitlines()
+            if ("Stream processing limit reached" in line and not OVERLOAD_LINE.match(line))
+            or ("scan stopped" in line and not GIVE_UP_LINE.match(line))
+            or (re.match(r"^\[[^]]+\] processor \S+-warning: ", line) and " at a limit: " in line
+                and not SUMMARY_LINE.match(line))]
 
 
 def give_ups(load_log):
@@ -282,10 +291,7 @@ class Run:
                        connections=len(bursts), lines=len(gave_up), reasons=reasons,
                        missing=sorted(bursts - set(per_port))[:5],
                        other=sorted(set(per_port) - bursts - uploads)[:5])
-        other = [line for line in log.splitlines()
-                 if ("Stream processing limit reached" in line and not OVERLOAD_LINE.match(line))
-                 or ("scan stopped" in line and not GIVE_UP_LINE.match(line))
-                 or (" processor: " in line and " at a limit: " in line and not SUMMARY_LINE.match(line))]
+        other = odd_limit_lines(log)
         self.check("limit lines carry only reason and address", not other, other=other[:3])
 
     def cleanup(self):

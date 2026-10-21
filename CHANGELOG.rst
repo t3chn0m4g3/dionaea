@@ -8,8 +8,55 @@
 Changelog
 =========
 
-0.12.3 - (`master`_)
+0.12.4 - (`master`_)
 --------------------
+
+**logs**
+
+* An error after which sqlite undoes the whole open transaction of the sqlite log (a full
+  disk, an I/O error, ...), not only the statement that failed: the handler forgets the ids
+  of the connections of that transaction, so a later event of such a connection writes no
+  row, as after an insert that failed, and no row goes to another connection that gets the
+  same id. A connection linked to one of them takes the root of its committed row again. The
+  lost rows since the last commit are an info line and an event of the summary ``transactions
+  of the sqlite log undone: N transaction(s) in the last minute``; a commit after which the
+  transaction is gone is not tried again. A link of a connection without an id is left out.
+* The summaries name their domain or logger once: ``scans stopped at a limit`` and
+  ``connections closed at a limit`` (domain ``processor``), ``incidents not recorded in the
+  sqlite log: N incident(s) in the last minute`` (logger ``log_sqlite``).
+* The info line and the summary of a UDP read that fails name the address as
+  ``(last peer <address>)``: on a listener it is the client of the last read that worked, not
+  always the one whose error came, and ``-`` before the first.
+* The warning of a service that does not start names the service. A config entry of a service
+  that asks for a transport the core does not have is one warning with the service and the
+  transport, no traceback, and is not tried on the other addresses; another entry of the same
+  service starts.
+
+**core**
+
+* The DTLS transport is removed; no service of dionaea used it. A service that asks for it
+  does not start.
+* The blackhole service makes the connections of all its ports before the first bind: a port
+  of a transport the core does not have leaves no listener of another port open. Without
+  ``services`` in its config it starts nothing.
+* The hash of the peers of UDP listeners shifts the port of the client as an unsigned number,
+  also a port whose stored value has its top bit set; the hash values are the same as before.
+
+**tests**
+
+* The functional tests fail when a message is in ``dionaea-errors.log`` more often than its
+  bound (``tests/functional/tools/count_warnings.sh``): a summary, counted by its text before
+  the number, may be there once per started minute of the run and once more, any other
+  message five times.
+* ``count_warnings.sh`` takes the key of a summary up to the first ``in the last minute, the
+  last:``, also when its last text has these words.
+* The load tool (``tests/load/run.py``) checks the summary lines of the limits by their domain.
+* ``tests/processor`` has tests of the hash of the peers and of the names of the transports;
+  the times of the summary tests of the processor are 64-bit numbers.
+* The host check ``52-unknown-transport`` starts a service with the transport ``dtls``.
+
+0.12.3 - (2026-10-21)
+---------------------
 
 **logs**
 

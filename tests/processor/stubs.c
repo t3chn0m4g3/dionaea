@@ -110,13 +110,13 @@ static void log_handler(const gchar *domain, GLogLevelFlags level, const gchar *
 		g_atomic_int_inc((level & G_LOG_LEVEL_WARNING) ? &stub_connection_warnings : &stub_overload_logs);
 		return;
 	}
-	if( (level & G_LOG_LEVEL_WARNING) && g_str_has_prefix(message, "processor: scans stopped at a limit: ") )
+	if( (level & G_LOG_LEVEL_WARNING) && g_str_has_prefix(message, "scans stopped at a limit: ") )
 	{
 		g_assert_null(strstr(message, "AAAA"));
 		summary_seen(&stub_give_up_summaries, message);
 		return;
 	}
-	if( (level & G_LOG_LEVEL_WARNING) && g_str_has_prefix(message, "processor: connections closed at a limit: ") )
+	if( (level & G_LOG_LEVEL_WARNING) && g_str_has_prefix(message, "connections closed at a limit: ") )
 	{
 		g_assert_null(strstr(message, "AAAA"));
 		summary_seen(&stub_overload_summaries, message);

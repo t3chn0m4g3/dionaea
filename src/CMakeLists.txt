@@ -12,7 +12,6 @@ target_sources(
     dionaea.c
     bistream.c
     connection.c
-    connection_dtls.c
     connection_tcp.c
     connection_tls.c
     connection_udp.c

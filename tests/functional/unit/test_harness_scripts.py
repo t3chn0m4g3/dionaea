@@ -142,11 +142,27 @@ def test_a_summary_may_be_there_once_a_started_minute_and_once_more(tmp_path):
 
 
 def test_a_unit_of_several_words_is_one_summary(tmp_path):
+    # the summary of the sqlite log up to 0.12.3 (what "logsql", unit "incident(s) not recorded"):
+    # a unit of several words
     lines = [_warning(60 * m, "log_sqlite", "logsql: %d incident(s) not recorded in the last minute, the last: "
                       "unable to open database file (192.0.2.%d)" % (m + 1, m)) for m in range(3)]
     result = run_count_warnings(tmp_path, lines, 2)
     assert result.returncode == 0, result.stderr
     assert "3 log_sqlite: logsql: N incident(s) not recorded in the last minute" in result.stdout
+
+
+def test_a_summary_counts_by_its_first_in_the_last_minute(tmp_path):
+    # the last text of a summary holds the words of a summary itself: the key ends at their first
+    # place, not at the last one
+    names = "abcdefghijklmn"
+    lines = [_warning(60 * m, "SMB", "uploads dropped: %d upload(s) in the last minute, the last: "
+                      "file %s: %d x in the last minute, the last: y" % (m + 1, names[m], m)) for m in range(13)]
+    result = run_count_warnings(tmp_path, lines, 12)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "     13 SMB: uploads dropped: N upload(s) in the last minute\n"
+    result = run_count_warnings(tmp_path, lines + [lines[-1].replace("file m:", "file n:")], 12)
+    assert result.returncode == 1
+    assert "14 SMB: uploads dropped: N upload(s) in the last minute" in result.stderr
 
 
 def test_another_warning_may_be_there_five_times(tmp_path):

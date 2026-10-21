@@ -22,7 +22,15 @@ MAX_SAME_WARNING=5
 
 { grep -E '^\[[0-9]{8} [0-9:]{8}\] [^ ]+( [^ ]+)?-warning: ' "${log}" || true; } \
   | sed -E 's/^\[[^]]*\] ([^ ]+)( [^ ]+)?-warning: /\1: /; s/0x[0-9a-fA-F]+/ADDR/g; s/\.incoming\/[^ :]+/.incoming\/FILE/g; s/(^|[^A-Za-z0-9_])[0-9]+/\1N/g' \
-  | sed -E 's/^(.*: N [^:,]+ in the last minute), the last: .*$/\1/' \
+  | awk '
+      # the key of a summary ends at the first " in the last minute, the last: ": its last text may
+      # hold the words of a summary itself
+      {
+        at = index($0, " in the last minute, the last: ")
+        if( at > 0 && substr($0, 1, at - 1) ~ /: N [^:,]+$/ )
+          $0 = substr($0, 1, at - 1) " in the last minute"
+        print
+      }' \
   | sort | uniq -c | sort -rn \
   | awk -v summary_max="$(( minutes + 1 ))" -v max="${MAX_SAME_WARNING}" '
       {

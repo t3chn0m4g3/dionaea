@@ -61,6 +61,30 @@
 struct log_summary connection_udp_read_failed_summary = LOG_SUMMARY_INIT("UDP reads failed", "read(s)");
 struct log_summary connection_udp_not_sent_summary = LOG_SUMMARY_INIT("UDP replies not sent", "packet(s)");
 
+/* the peers of a UDP listener by their addresses (connection_listen) */
+guint connection_addrs_hash(gconstpointer key)
+{
+	g_debug("%s con %p", __PRETTY_FUNCTION__, key);
+	const struct connection *con = key;
+	/* the port of the client in the upper half, shifted as unsigned (a stored value with its top bit set stays in range) */
+	guint local = con->local.port;
+	guint remote = (guint)con->remote.port << 16;
+	return local | remote;
+}
+
+gboolean connection_addrs_cmp(gconstpointer a, gconstpointer b)
+{
+	const struct connection *ca = a;
+	const struct connection *cb = b;
+	g_debug("%s con %p %p %s %s | %s %s", __PRETTY_FUNCTION__, a, b,
+			ca->local.node_string, cb->local.node_string,
+			ca->remote.node_string, cb->remote.node_string);
+	if( memcmp(&ca->local.addr, &cb->local.addr, sizeof(struct sockaddr_storage)) == 0 &&
+		memcmp(&ca->remote.addr, &cb->remote.addr, sizeof(struct sockaddr_storage)) == 0)
+		return true;
+	return false;
+}
+
 ssize_t recvfromto(int sockfd, void *buf, size_t len, int flags,
 				 const struct sockaddr *fromaddr, socklen_t *fromlen,
 				 const struct sockaddr *toaddr, socklen_t *tolen)
@@ -255,11 +279,13 @@ void connection_udp_io_in_cb(EV_P_ struct ev_io *w, int revents)
 
 	if( ret == -1 && errno != EAGAIN && errno != EWOULDBLOCK )
 	{
-		/* an ICMP error of a client (ECONNREFUSED, ...) and the like: info, one warning a minute */
+		/* an ICMP error of a client (ECONNREFUSED, ...) and the like: info, one warning a minute.
+		 * The address of the connection is the client of the last read that worked: on a listener
+		 * not always the one whose error came now (the error queue is not read) */
 		int error = errno;
 		const char *peer = con->remote.node_string[0] != '\0' ? con->remote.node_string : "-";
-		g_info("connection error %i %s (%s)", ret, strerror(error), peer);
-		log_summary_addf(&connection_udp_read_failed_summary, "%s (%s)", strerror(error), peer);
+		g_info("connection error %i %s (last peer %s)", ret, strerror(error), peer);
+		log_summary_addf(&connection_udp_read_failed_summary, "%s (last peer %s)", strerror(error), peer);
 	}
 }
 

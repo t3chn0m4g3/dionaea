@@ -25,8 +25,8 @@ extern gint stub_incidents;     /* incidents reported */
 extern gint stub_overload_logs; /* "Stream processing limit" lines of a connection (info) */
 extern gint stub_scan_stopped_logs; /* "<name> scan stopped" lines of an instance (info: at a limit or done reading) */
 extern gint stub_connection_warnings; /* either line at warning (none is) */
-extern gint stub_give_up_summaries; /* "processor: scans stopped at a limit" warnings */
-extern gint stub_overload_summaries; /* "processor: connections closed at a limit" warnings */
+extern gint stub_give_up_summaries; /* "scans stopped at a limit" warnings */
+extern gint stub_overload_summaries; /* "connections closed at a limit" warnings */
 extern gint stub_trim_thread_logs; /* "no thread for the trailing trim" warnings of the emu */
 
 /* g_dionaea with a threadpool of workers workers, an eventloop and its async queue */

@@ -693,6 +693,10 @@ static void udp_reads_and_replies_that_fail_are_info_and_one_warning_a_minute(vo
 		connection_udp_io_in_cb(d.loop, &con->events.io_in, EV_READ);
 		lines_advance(1);
 	}
+	/* a listener that has had no client yet */
+	con->remote.node_string[0] = '\0';
+	connection_udp_io_in_cb(d.loop, &con->events.io_in, EV_READ);
+	g_strlcpy(con->remote.node_string, "198.51.100.4:6969", sizeof(con->remote.node_string));
 	recvmsg_fails_with = 0;
 	sendmsg_fails_with = EINVAL;
 	for( int i = 0; i < 4; i++ )
@@ -710,11 +714,13 @@ static void udp_reads_and_replies_that_fail_are_info_and_one_warning_a_minute(vo
 		lines_advance(1);
 	}
 	sendmsg_fails_with = 0;
-	g_assert_cmpuint(lines_with(infos, "connection error -1 Connection refused (198.51.100.4:6969)"), ==, 4);
+	/* the address of the connection is the last client of the listener, not the one whose ICMP error came */
+	g_assert_cmpuint(lines_with(infos, "connection error -1 Connection refused (last peer 198.51.100.4:6969)"), ==, 4);
+	g_assert_cmpuint(lines_with(infos, "connection error -1 Connection refused (last peer -)"), ==, 1);
 	g_assert_cmpuint(lines_with(infos, "sendtofrom failed Invalid argument (198.51.100.4:6969)"), ==, 4);
 	g_assert_cmpuint(warnings->len, ==, 2);
 	g_assert_cmpstr(warnings->pdata[0], ==, "UDP reads failed: 1 read(s) in the last minute, the last: "
-											"Connection refused (198.51.100.4:6969)");
+											"Connection refused (last peer 198.51.100.4:6969)");
 	g_assert_cmpstr(warnings->pdata[1], ==, "UDP replies not sent: 1 packet(s) in the last minute, the last: "
 											"Invalid argument (198.51.100.4:6969)");
 	lines_advance(60);
@@ -724,6 +730,31 @@ static void udp_reads_and_replies_that_fail_are_info_and_one_warning_a_minute(vo
 	con->socket = -1;
 	connection_free_cb(d.loop, &con->events.free, 0, false);
 	lines_end();
+}
+
+/* the hash of the peers of UDP listeners: both ports, also a stored port with its top bit set */
+static void the_hash_of_a_peer_takes_both_ports(void)
+{
+	struct connection con;
+	memset(&con, 0, sizeof(con));
+	con.local.port = 1;
+	con.remote.port = 0xffff;
+	g_assert_cmpuint(connection_addrs_hash(&con), ==, (0xffffu << 16) | 1u);
+}
+
+/* the transports of the core by their names; there is no DTLS */
+static void the_transports_have_their_names(void)
+{
+	enum connection_transport trans;
+	const char *names[] = { "udp", "tcp", "tls" };
+	for( size_t i = 0; i < G_N_ELEMENTS(names); i++ )
+	{
+		g_assert_true(connection_transport_from_string(names[i], &trans));
+		g_assert_cmpstr(connection_transport_to_string(trans), ==, names[i]);
+	}
+	g_assert_cmpstr(connection_transport_to_string(connection_transport_io), ==, "io");
+	g_assert_false(connection_transport_from_string("dtls", &trans));
+	g_assert_false(connection_transport_from_string("io", &trans));
 }
 
 int main(int argc, char **argv)
@@ -754,6 +785,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/connection/lines/tcp-read", tcp_reads_that_fail_are_info_and_one_warning_a_minute);
 	g_test_add_func("/connection/lines/no-address", connections_without_their_address_are_info_and_one_warning_a_minute);
 	g_test_add_func("/connection/lines/udp", udp_reads_and_replies_that_fail_are_info_and_one_warning_a_minute);
+	g_test_add_func("/connection/peers-hash", the_hash_of_a_peer_takes_both_ports);
+	g_test_add_func("/connection/transport-names", the_transports_have_their_names);
 	int result = g_test_run();
 	ev_loop_destroy(d.loop);
 	g_key_file_free(d.config);

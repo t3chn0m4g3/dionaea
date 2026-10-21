@@ -56,7 +56,7 @@ add_test(NAME streamdumper COMMAND test_streamdumper)
 # connection_listen() of the core: the sources of dionaea without dionaea.c (the test has
 # g_dionaea); listen, close, accept and the bind of the privileged child are wrapped
 set(DIONAEA_CORE_SOURCES
-  ../../src/bistream.c ../../src/connection.c ../../src/connection_dtls.c ../../src/connection_tcp.c
+  ../../src/bistream.c ../../src/connection.c ../../src/connection_tcp.c
   ../../src/connection_tls.c ../../src/connection_udp.c ../../src/dns.c ../../src/incident.c
   ../../src/log.c ../../src/modules.c ../../src/node_info.c ../../src/pchild.c ../../src/processor.c
   ../../src/refcount.c ../../src/signals.c ../../src/streamcap.c ../../src/ssl.c ../../src/threads.c

@@ -504,6 +504,11 @@ ctypedef enum:
 	ECONMANY         = 4,
 	ECONFILTERED     = 5
 
+class TransportError(ValueError):
+	"""A connection with a transport the core does not have (it has tcp, udp and tls; DTLS was
+	removed). services.py logs it as one line and the service does not start."""
+
+
 # the connection classes whose __init__ has a default for every argument (connection.__init__)
 _init_checked = weakref.WeakSet()
 
@@ -557,7 +562,7 @@ cdef class connection:
 				raise ValueError(u"requires text input, got %s" % type(con_type))
 
 			if not c_connection_transport_from_string(con_type_utf8, &enum_type):
-				raise ValueError(str(con_type) + u'is not a valid protocol')
+				raise TransportError(u"unknown transport %r, the core has tcp, udp and tls" % con_type)
 			self.thisptr = c_connection_new(enum_type)
 #			print(u"XXXXXXXXXXXXX" + self.__class__.__name__)
 			protoname = getattr(self, "protocol_name", self.__class__.__name__)

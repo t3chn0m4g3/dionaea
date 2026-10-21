@@ -190,8 +190,8 @@ void processor_data_free(struct processor_data *pd)
 static gint processor_overloads;
 static gint processor_gave_up;
 
-static struct log_summary give_up_summary = LOG_SUMMARY_INIT("processor: scans stopped at a limit", "connection(s)");
-static struct log_summary overload_summary = LOG_SUMMARY_INIT("processor: connections closed at a limit", "connection(s)");
+static struct log_summary give_up_summary = LOG_SUMMARY_INIT("scans stopped at a limit", "connection(s)");
+static struct log_summary overload_summary = LOG_SUMMARY_INIT("connections closed at a limit", "connection(s)");
 
 struct log_summary *processor_give_up_summary(void)
 {

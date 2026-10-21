@@ -30,7 +30,6 @@
 
 #include <openssl/x509v3.h>
 #include <openssl/pem.h>
-#include <openssl/rand.h>
 #include <stddef.h>
 #include <sys/ioctl.h>
 #include <sys/uio.h>
@@ -90,14 +89,6 @@ struct connection *connection_new(enum connection_transport type)
 		con->transport.tls.io_out = g_string_new("");
 		con->transport.tls.io_out_again = g_string_new("");
 //		SSL_CTX_set_timeout(con->transport.ssl.ctx, 60);
-		break;
-	case connection_transport_dtls:
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-		con->transport.tls.meth = DTLSv1_method();
-#else
-		con->transport.tls.meth = DTLS_method();
-#endif
-		con->transport.tls.ctx = SSL_CTX_new((SSL_METHOD *)con->transport.tls.meth);
 		break;
 	case connection_transport_udp:
 		break;
@@ -255,7 +246,6 @@ bool bind_local(struct connection *con)
 
 		break;
 
-	case connection_transport_dtls:
 	case connection_transport_udp:
 		if( pchild_sent_bind(con->socket, (struct sockaddr *)&sa, sizeof_sa) != 0 )
 		{
@@ -316,7 +306,6 @@ bool connection_bind(struct connection *con, const char *addr, uint16_t port, co
 	switch( con->trans )
 	{
 	case connection_transport_udp:
-	case connection_transport_dtls:
 		con->type = connection_type_bind;
 		if( con->socket == -1 )
 			if( connection_socket(con,  socket_domain, SOCK_DGRAM, IPPROTO_UDP) == false )
@@ -378,10 +367,7 @@ bool connection_bind(struct connection *con, const char *addr, uint16_t port, co
 		}
 
 		connection_set_nonblocking(con);
-		if( con->trans == connection_transport_udp )
-			ev_io_init(&con->events.io_in, connection_udp_io_in_cb, con->socket, EV_READ);
-		else
-			ev_io_init(&con->events.io_in, connection_dtls_io_in_cb, con->socket, EV_READ);
+		ev_io_init(&con->events.io_in, connection_udp_io_in_cb, con->socket, EV_READ);
 
 		if( port != 0 )
 			ev_io_start(CL, &con->events.io_in);
@@ -481,15 +467,6 @@ bool connection_listen(struct connection *con, int len)
 	case connection_transport_udp:
 		con->type = connection_type_listen;
 		con->transport.udp.type.server.peers = g_hash_table_new_full(connection_addrs_hash, connection_addrs_cmp, NULL, NULL);
-		break;
-
-	case connection_transport_dtls:
-		con->type = connection_type_listen;
-		con->transport.dtls.type.server.peers = g_hash_table_new_full(connection_addrs_hash, connection_addrs_cmp, NULL, NULL);
-		connection_dtls_mkcert(con);
-		RAND_bytes(con->transport.dtls.type.server.cookie_secret, DTLS_COOKIE_SECRET_LENGTH);
-		SSL_CTX_set_cookie_generate_cb(con->transport.dtls.ctx, dtls_generate_cookie_cb);
-		SSL_CTX_set_cookie_verify_cb(con->transport.dtls.ctx, dtls_verify_cookie_cb);
 		break;
 
 	case connection_transport_io:
@@ -624,9 +601,6 @@ void connection_close(struct connection *con)
 	case connection_transport_udp:
 		connection_set_state(con, connection_state_close);
 		connection_udp_disconnect(con);
-		break;
-	case connection_transport_dtls:
-		g_warning("FIXME");
 		break;
 	case connection_transport_io:
 		break;
@@ -1029,31 +1003,6 @@ void connection_connect_next_addr(struct connection *con)
 			return;
 			break;
 
-		case connection_transport_dtls:
-			if( con->socket == -1 )
-				if( connection_socket(con, socket_domain, SOCK_DGRAM, 0) == false )
-					return;
-			connection_set_nonblocking(con);
-			ret = connect(con->socket, (struct sockaddr *)&sa, sizeof_sa);
-			connection_node_set_local(con);
-			memcpy(&con->remote.addr, &sa, sizeof_sa);
-
-			con->type = connection_type_connect;
-			con->state = connection_state_handshake;
-			g_debug("new dtls con %s %s", con->local.node_string, con->remote.node_string);
-			con->transport.dtls.ssl = SSL_new(con->transport.dtls.ctx);
-			con->transport.dtls.reading = BIO_new(BIO_s_mem());
-			con->transport.dtls.writing = BIO_new(BIO_s_mem());
-			BIO_set_mem_eof_return(con->transport.dtls.reading, -1);
-			BIO_set_mem_eof_return(con->transport.dtls.writing, -1);
-			SSL_set_bio(con->transport.dtls.ssl, con->transport.dtls.reading, con->transport.dtls.writing);
-			SSL_set_connect_state(con->transport.dtls.ssl);
-			ev_io_init(&con->events.io_in, connection_dtls_io_in_cb, con->socket, EV_READ);
-			ev_io_start(CL, &con->events.io_in);
-			connection_dtls_connect_again(CL, &con->events.io_in, 0);
-			return;
-			break;
-
 		case connection_transport_io:
 			break;
 
@@ -1120,8 +1069,6 @@ void connection_connect(struct connection* con, const char* addr, uint16_t port,
 			i = incident_new("dionaea.connection.tcp.connect");
 		else if( con->trans == connection_transport_tls )
 			i = incident_new("dionaea.connection.tls.connect");
-		else if( con->trans == connection_transport_dtls )
-			i = incident_new("dionaea.connection.dtls.connect");
 		else
 		{
 			g_warning("unexpected ... ");
@@ -1390,14 +1337,6 @@ void connection_send(struct connection *con, const void *data, uint32_t size)
 		break;
 
 
-	case connection_transport_dtls:
-		{
-			int err = SSL_write(con->transport.dtls.ssl, data, size);
-			g_debug("SSL_write %i", err);
-			connection_dtls_error(con);
-			connection_dtls_drain_bio(con);
-		}
-		break;
 	case connection_transport_udp:
 		{
 			struct udp_packet *packet = g_malloc0(sizeof(struct udp_packet));
@@ -1493,7 +1432,6 @@ void connection_idle_timeout_cb(struct ev_loop *loop, struct ev_timer *w, int re
 			connection_udp_disconnect(con);
 			break;
 
-		case connection_transport_dtls:
 		case connection_transport_io:
 			break;
 		}
@@ -1569,7 +1507,6 @@ void connection_sustain_timeout_cb(struct ev_loop *loop, struct ev_timer *w, int
 		case connection_transport_udp:
 			connection_udp_disconnect(con);
 			break;
-		case connection_transport_dtls:
 		case connection_transport_io:
 			break;
 		}
@@ -1637,7 +1574,6 @@ void connection_listen_timeout_cb(struct ev_loop *loop, struct ev_timer *w, int 
 		connection_disconnect(con);
 		connection_free(con);
 		break;
-	case connection_transport_dtls:
 	case connection_transport_udp:
 	case connection_transport_io:
 		break;
@@ -1723,9 +1659,6 @@ void connection_connecting_timeout_set(struct connection *con, double timeout_in
 		ev_timer_init(&con->events.connecting_timeout, connection_connecting_timeout_cb, 0., timeout_interval_ms);
 		break;
 
-	case connection_transport_dtls:
-		g_warning("FIXME");
-		break;
 	case connection_transport_udp:
 	case connection_transport_io:
 		break;
@@ -1750,7 +1683,6 @@ void connection_connecting_timeout_cb(EV_P_ struct ev_timer *w, int revents)
 		connection_connect_next_addr(con);
 		break;
 	case connection_transport_udp:
-	case connection_transport_dtls:
 	case connection_transport_io:
 		break;
 	}
@@ -1852,9 +1784,6 @@ void connection_established(struct connection *con)
 		if( con->events.sustain_timeout.repeat >= 0. )
 			ev_timer_again(CL,  &con->events.sustain_timeout);
 
-		break;
-	case connection_transport_dtls:
-		con->protocol.established(con);
 		break;
 	case connection_transport_io:
 		break;
@@ -2235,8 +2164,6 @@ bool connection_transport_from_string(const char *type_str, enum connection_tran
 		*type = connection_transport_udp;
 	else if( strcmp(type_str, "tls") == 0 )
 		*type = connection_transport_tls;
-	else if( strcmp(type_str, "dtls") == 0 )
-		*type = connection_transport_dtls;
 	else
 		return false;
 
@@ -2250,7 +2177,6 @@ const char *connection_transport_to_string(enum connection_transport trans)
 		"udp",
 		"tcp",
 		"tls",
-		"dtls",
 		"io"
 	};
 	return connection_transport_str[trans];

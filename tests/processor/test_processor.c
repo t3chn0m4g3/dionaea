@@ -946,7 +946,7 @@ static void summary_start(struct log_summary *s)
 	reset();
 	log_summary_set_hooks(s, &summary_hooks);
 	log_summary_reset(s);
-	summary_now = 5000 * G_USEC_PER_SEC;
+	summary_now = (gint64)5000 * G_USEC_PER_SEC;
 	summary_armed = FALSE;
 	summary_schedules = 0;
 }
@@ -990,17 +990,17 @@ static void give_up_summary(void)
 	g_assert_cmpint(g_atomic_int_get(&stub_scan_stopped_logs), ==, 100);
 	g_assert_cmpint(g_atomic_int_get(&stub_connection_warnings), ==, 0);
 	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 1);
-	assert_last_summary("processor: scans stopped at a limit: 1 connection(s) in the last minute, "
+	assert_last_summary("scans stopped at a limit: 1 connection(s) in the last minute, "
 						"the last: giver scan, job queue full (smbd 192.0.2.7:1000)");
 	/* the rest when the minute of the first warning ends */
 	g_assert_true(summary_armed);
 	g_assert_cmpuint(summary_schedules, ==, 1);
-	g_assert_cmpint(summary_fires_at, ==, 5060 * G_USEC_PER_SEC);
+	g_assert_cmpint(summary_fires_at, ==, (gint64)5060 * G_USEC_PER_SEC);
 	summary_now = summary_fires_at;
 	summary_armed = FALSE;
 	log_summary_due(s);
 	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 2);
-	assert_last_summary("processor: scans stopped at a limit: 99 connection(s) in the last minute, "
+	assert_last_summary("scans stopped at a limit: 99 connection(s) in the last minute, "
 						"the last: giver scan, job queue full (smbd 192.0.2.7:1099)");
 	g_assert_false(summary_armed);
 
@@ -1010,7 +1010,7 @@ static void give_up_summary(void)
 	processor_give_up(&con, pd, "stream data limit", true);
 	stub_dispose(&con, pd);
 	g_assert_cmpint(g_atomic_int_get(&stub_give_up_summaries), ==, 3);
-	assert_last_summary("processor: scans stopped at a limit: 1 connection(s) in the last minute, "
+	assert_last_summary("scans stopped at a limit: 1 connection(s) in the last minute, "
 						"the last: giver scan, stream data limit (smbd 192.0.2.7:2000)");
 
 	/* done reading (limit false): its info line, no event of the summary */
@@ -1049,13 +1049,13 @@ static void overload_summary(void)
 	g_assert_cmpint(g_atomic_int_get(&stub_overload_logs), ==, 50);
 	g_assert_cmpint(g_atomic_int_get(&stub_connection_warnings), ==, 0);
 	g_assert_cmpint(g_atomic_int_get(&stub_overload_summaries), ==, 1);
-	assert_last_summary("processor: connections closed at a limit: 1 connection(s) in the last minute, "
+	assert_last_summary("connections closed at a limit: 1 connection(s) in the last minute, "
 						"the last: stream data limit (smbd 192.0.2.7:3000)");
 	g_assert_true(summary_armed);
 	summary_now = summary_fires_at;
 	log_summary_due(s);
 	g_assert_cmpint(g_atomic_int_get(&stub_overload_summaries), ==, 2);
-	assert_last_summary("processor: connections closed at a limit: 49 connection(s) in the last minute, "
+	assert_last_summary("connections closed at a limit: 49 connection(s) in the last minute, "
 						"the last: stream data limit (smbd 192.0.2.7:3049)");
 	stub_summaries_reset();
 }

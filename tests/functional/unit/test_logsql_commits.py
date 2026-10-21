@@ -241,11 +241,11 @@ def test_incidents_that_can_not_be_recorded_are_info_and_one_warning_a_minute(ha
         assert infos == [("dionaea.connection.tcp.accept not recorded: unable to open database file "
                          "(198.51.100.4)")] * 4
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-        assert warnings == [("logsql: 1 incident(s) not recorded in the last minute, "
+        assert warnings == [("incidents not recorded in the sqlite log: 1 incident(s) in the last minute, "
                             "the last: unable to open database file (198.51.100.4)")]
         clock.advance(60)
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings[1:] == [("logsql: 3 incident(s) not recorded in the last minute, "
+    assert warnings[1:] == [("incidents not recorded in the sqlite log: 3 incident(s) in the last minute, "
                             "the last: unable to open database file (198.51.100.4)")]
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
     # the connection to the database is usable: the next incident is recorded
@@ -273,3 +273,228 @@ def test_an_existing_database_of_an_earlier_version_is_taken_over(tmp_path):
         assert rows(db) == 2
     finally:
         del h
+
+
+class RollingBackCursor:
+    """The cursor of the handler whose next statement fails as sqlite does on SQLITE_FULL, IOERR, ...:
+    sqlite undoes the whole open transaction, not only the statement."""
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.cursor = handler.cursor
+
+    def execute(self, *args):
+        self.handler.dbh.rollback()
+        raise sqlite3.OperationalError("database or disk is full")
+
+    def __getattr__(self, name):
+        return getattr(self.cursor, name)
+
+
+@pytest.fixture
+def memory_handler():
+    h = logsql.logsqlhandler("*", config={"file": ":memory:"})
+    h.start()
+    yield h
+    h.stop()
+    del h
+
+
+def memory_rows(handler, sql="SELECT count(*) FROM connections"):
+    return handler.dbh.execute(sql).fetchone()[0]
+
+
+class OtherCon(FakeCon):
+    remote = FakeNode("198.51.100.5", 40001)
+
+
+def test_a_rollback_of_the_transaction_forgets_its_connections(memory_handler, caplog, summaries):
+    """A statement that makes sqlite undo the whole transaction: the rows of the connections since
+    the last commit are gone, their ids are no ids of the handler any more; an event of such a
+    connection later writes no row (as after an insert that failed), and no row of another
+    connection that gets the same id."""
+    summaries(logsql.COMMIT_FAILED, logsql.LOST, logsql.NOT_RECORDED)
+    h = memory_handler
+    committed = FakeCon()
+    h.connection_insert(FakeIncident(con=committed), "accept")
+    h._commit_timer.fire()
+    a = OtherCon()
+    h.connection_insert(FakeIncident(con=a), "accept")
+    lost_id = h.attacks[a][1]
+    cursor = h.cursor
+    h.cursor = RollingBackCursor(h)
+    with caplog.at_level(logging.INFO, logger="log_sqlite"):
+        h.handle_incident_dionaea_connection_tcp_accept(FakeIncident(con=FakeCon()))
+    h.cursor = cursor
+    assert not h.dbh.in_transaction
+    assert a not in h.attacks
+    assert committed in h.attacks
+    assert not h.uncommitted
+    # a new connection: sqlite gives it the id of the row that is gone (no AUTOINCREMENT)
+    b = FakeCon()
+    h.connection_insert(FakeIncident(con=b), "accept")
+    assert h.attacks[b][1] == lost_id
+    # a later event of the connection whose row is gone writes nothing (not on the row of b)
+    h.handle_incident_dionaea_download_offer(FakeIncident(con=a, url="http://x/"))
+    h.handle_incident_dionaea_modules_python_ftp_login(FakeIncident(con=a, username="u", password="p"))
+    h._commit_timer.fire()
+    assert memory_rows(h, "SELECT count(*) FROM offers") == 0
+    assert memory_rows(h, "SELECT count(*) FROM logins") == 0
+    assert memory_rows(h) == 2
+    # the connection of the earlier commit goes on
+    h.handle_incident_dionaea_download_offer(FakeIncident(con=committed, url="http://x/"))
+    h._commit_timer.fire()
+    assert memory_rows(h, "SELECT count(*) FROM offers") == 1
+
+
+def test_a_failed_statement_that_keeps_the_transaction_keeps_its_connections(memory_handler, summaries):
+    """sqlite undoes only the statement (a constraint, ...): the rows before it stay, and so do the ids."""
+    summaries(logsql.COMMIT_FAILED, logsql.LOST, logsql.NOT_RECORDED)
+    h = memory_handler
+    a = FakeCon()
+    h.connection_insert(FakeIncident(con=a), "accept")
+    cursor = h.cursor
+    h.cursor = FailingCursor(cursor)
+    h.handle_incident_dionaea_connection_tcp_accept(FakeIncident(con=FakeCon()))
+    h.cursor = cursor
+    assert h.dbh.in_transaction
+    assert a in h.attacks
+    h._commit_timer.fire()
+    assert not h.uncommitted
+    h.handle_incident_dionaea_download_offer(FakeIncident(con=a, url="http://x/"))
+    h._commit_timer.fire()
+    assert memory_rows(h, "SELECT count(*) FROM offers") == 1
+
+
+def test_a_rollback_forgets_the_ids_of_links_and_pending_connections(memory_handler, summaries):
+    """A connection linked to one whose row is gone takes no lost id: a child that shares the id of
+    its parent is forgotten with it, a child of an earlier commit keeps its own id as its root, and
+    a lost id is no pending child any more."""
+    summaries(logsql.COMMIT_FAILED, logsql.LOST, logsql.NOT_RECORDED)
+    h = memory_handler
+    older = FakeCon()
+    h.connection_insert(FakeIncident(con=older), "accept")
+    h._commit_timer.fire()
+    older_id = h.attacks[older][1]
+    parent, shares = OtherCon(), FakeCon()
+    h.connection_insert(FakeIncident(con=parent), "accept")
+    lost_id = h.attacks[parent][1]
+    # a child without a row of its own takes the id of its parent; a child of the earlier commit its root
+    h.handle_incident_dionaea_connection_link(FakeIncident(parent=parent, child=shares))
+    h.handle_incident_dionaea_connection_link(FakeIncident(parent=parent, child=older))
+    assert h.attacks[shares] == (lost_id, lost_id) and h.attacks[older] == (lost_id, older_id)
+    # the lost id waits for a parent dionaea does not know yet
+    unknown = FakeCon()
+    h.handle_incident_dionaea_connection_link_early(FakeIncident(parent=unknown, child=parent))
+    assert h.pending[unknown] == {lost_id: True}
+    cursor = h.cursor
+    h.cursor = RollingBackCursor(h)
+    h.handle_incident_dionaea_connection_tcp_accept(FakeIncident(con=FakeCon()))
+    h.cursor = cursor
+    assert parent not in h.attacks and shares not in h.attacks
+    assert h.attacks[older] == (older_id, older_id)
+    assert unknown not in h.pending
+
+
+class CommitUndone:
+    """The database of the handler whose commit fails as sqlite does on SQLITE_FULL, IOERR, ...:
+    the transaction is undone."""
+
+    def __init__(self, dbh):
+        self.real = dbh
+
+    def commit(self):
+        self.real.rollback()
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def test_a_commit_that_undoes_the_transaction_forgets_its_connections(memory_handler, caplog, summaries):
+    """The flush whose commit made sqlite undo the transaction: nothing is left to try again, the
+    connections of it are forgotten, an info line and one warning a minute say the rows are lost."""
+    clock = summaries(logsql.COMMIT_FAILED, logsql.LOST, logsql.NOT_RECORDED)
+    h = memory_handler
+    a = FakeCon()
+    h.connection_insert(FakeIncident(con=a), "accept")
+    real = h.dbh
+    h.dbh = CommitUndone(real)
+    with caplog.at_level(logging.INFO, logger="log_sqlite"):
+        h._commit_timer.fire()
+    h.dbh = real
+    assert not h._dirty
+    assert a not in h.attacks and not h.uncommitted
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert "The rows of :memory: since the last commit are lost: disk I/O error" in infos
+    assert not [i for i in infos if "trying again" in i]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == [("transactions of the sqlite log undone: 1 transaction(s) in the last minute, "
+                         "the last: :memory:, disk I/O error")]
+    clock.advance(60)
+    h.handle_incident_dionaea_download_offer(FakeIncident(con=a, url="http://x/"))
+    h._commit_timer.fire()
+    assert memory_rows(h, "SELECT count(*) FROM offers") == 0
+
+
+def test_links_of_a_connection_without_an_id_are_left_out(memory_handler):
+    """A link of a connection the handler has no id of (its row is gone or its insert failed):
+    nothing is recorded and nothing raises (a KeyError went to the core as a warning)."""
+    h = memory_handler
+    known, unknown, waiting = FakeCon(), OtherCon(), FakeCon()
+    h.connection_insert(FakeIncident(con=known), "accept")
+    h.handle_incident_dionaea_connection_link_early(FakeIncident(parent=FakeCon(), child=unknown))
+    assert not h.pending
+    # waiting is the parent of known before it has an id of its own
+    h.handle_incident_dionaea_connection_link_early(FakeIncident(parent=waiting, child=known))
+    h.handle_incident_dionaea_connection_link(FakeIncident(parent=unknown, child=waiting))
+    assert waiting in h.pending
+    h._commit_timer.fire()
+    assert memory_rows(h, "SELECT count(*) FROM connections WHERE connection_root != connection") == 0
+
+
+def test_a_child_linked_again_keeps_the_root_of_its_committed_row(memory_handler, summaries):
+    """A child linked to a parent of an earlier commit and then to a parent whose row is gone: it
+    takes the root its committed row has again, not its own id."""
+    summaries(logsql.COMMIT_FAILED, logsql.LOST, logsql.NOT_RECORDED)
+    h = memory_handler
+    first, child = FakeCon(), OtherCon()
+    h.connection_insert(FakeIncident(con=first), "accept")
+    h.connection_insert(FakeIncident(con=child), "accept")
+    h.handle_incident_dionaea_connection_link(FakeIncident(parent=first, child=child))
+    h._commit_timer.fire()
+    first_id, child_id = h.attacks[first][1], h.attacks[child][1]
+    assert h.attacks[child] == (first_id, child_id)
+    second = FakeCon()
+    h.connection_insert(FakeIncident(con=second), "accept")
+    h.handle_incident_dionaea_connection_link(FakeIncident(parent=second, child=child))
+    assert h.attacks[child] == (h.attacks[second][1], child_id)
+    cursor = h.cursor
+    h.cursor = RollingBackCursor(h)
+    h.handle_incident_dionaea_connection_tcp_accept(FakeIncident(con=FakeCon()))
+    h.cursor = cursor
+    assert second not in h.attacks
+    assert h.attacks[child] == (first_id, child_id)
+    assert memory_rows(h, "SELECT connection_root FROM connections WHERE connection = %d" % child_id) == first_id
+
+
+def test_a_link_the_rollback_undid_gives_the_child_its_committed_root(memory_handler, summaries):
+    """A child with a committed root R1 is linked to a parent of an earlier commit with root R2;
+    the transaction of that link is undone: the child has R1 again, in memory and in the database."""
+    summaries(logsql.COMMIT_FAILED, logsql.LOST, logsql.NOT_RECORDED)
+    h = memory_handler
+    first, second, child = FakeCon(), FakeCon(), OtherCon()
+    for con in (first, second, child):
+        h.connection_insert(FakeIncident(con=con), "accept")
+    h.handle_incident_dionaea_connection_link(FakeIncident(parent=first, child=child))
+    h._commit_timer.fire()
+    r1, r2, child_id = h.attacks[first][1], h.attacks[second][1], h.attacks[child][1]
+    h.handle_incident_dionaea_connection_link(FakeIncident(parent=second, child=child))
+    assert h.attacks[child] == (r2, child_id)
+    cursor = h.cursor
+    h.cursor = RollingBackCursor(h)
+    h.handle_incident_dionaea_connection_tcp_accept(FakeIncident(con=FakeCon()))
+    h.cursor = cursor
+    assert h.attacks[child] == (r1, child_id)
+    assert h.attacks[first] == (r1, r1) and h.attacks[second] == (r2, r2)
+    assert memory_rows(h, "SELECT connection_root FROM connections WHERE connection = %d" % child_id) == r1

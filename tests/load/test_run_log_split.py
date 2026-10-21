@@ -73,16 +73,24 @@ class GiveUpTest(unittest.TestCase):
         self.assertEqual(scan_limit, [4003])
 
     def test_the_summary_line_has_reason_and_address_only(self):
-        line = (SECOND + " processor processor.c:20-warning: processor: scans stopped at a limit: "
+        line = (SECOND + " processor processor.c:20-warning: scans stopped at a limit: "
                 "704 connection(s) in the last minute, the last: emu scan, job queue full (smbd 10.0.0.2:4001)")
         self.assertIsNotNone(run.SUMMARY_LINE.match(line))
         self.assertIsNone(run.SUMMARY_LINE.match(line + " AAAA"))
-        overload = (SECOND + " processor processor.c:20-warning: processor: connections closed at a limit: "
+        overload = (SECOND + " processor processor.c:20-warning: connections closed at a limit: "
                     "3 connection(s) in the last minute, the last: stream data limit (smbd 10.0.0.2:4001)")
         self.assertIsNotNone(run.SUMMARY_LINE.match(overload))
         info = (SECOND + " processor processor.c:30-info: Stream processing limit reached (job queue full), "
                 "closing connection 0xabc smbd 10.0.0.2:4001")
         self.assertEqual(run.OVERLOAD_LINE.findall(info), [("job queue full", "4001")])
+
+    def test_a_limit_line_with_more_than_reason_and_address_is_found(self):
+        summary = (SECOND + " processor processor.c:20-warning: scans stopped at a limit: "
+                   "704 connection(s) in the last minute, the last: emu scan, job queue full (smbd 10.0.0.2:4001)")
+        give_up = self.LOG.splitlines()[0]
+        self.assertEqual(run.odd_limit_lines("\n".join([summary, give_up])), [])
+        self.assertEqual(run.odd_limit_lines("\n".join([summary + " AAAA", give_up + " AAAA"])),
+                         [summary + " AAAA", give_up + " AAAA"])
 
 
 class MarkTest(unittest.TestCase):

@@ -445,6 +445,12 @@ dionaea's file capabilities close `/proc/<pid>/fd` and its limits).
   warnings at least 59 s apart whose N add up to the failed offers; `dionaea.log` has one
   `download target refused by the filter: <url>` or `download failed: <url> (<reason>)` info
   line per offer. It takes about 2.5 minutes.
+- `52-unknown-transport.sh` always: a second dionaea whose blackhole service has port 4434 of
+  the transport `tcp` and then port 4433 of the transport `dtls` (the core has tcp, udp and
+  tls). The service does not start: 4434 accepts no connection on any address of the container
+  (IPv4, and IPv6 when the container has it), `dionaea-errors.log` has one warning `Unable to
+  start service blackhole: unknown transport 'dtls', the core has tcp, udp and tls` and no
+  Traceback, and port 21 answers.
 - `47-shutdown-flush.sh` always: a second dionaea gets 40 FTP connections (each up to its
   banner, so its row of `connections` is written but not yet committed) and is stopped
   right after the last one. All of them have to be in `dionaea.sqlite`, and `dionaea.log`

@@ -165,6 +165,32 @@ def test_no_service_logs_a_traceback_as_its_message():
     assert found == []
 
 
+def test_no_summary_names_its_logger_again():
+    """The line of a summary has the name of its logger already ("log_sqlite ... <what>: N <unit>
+    ..."): its what is no name of its logger or module and has no "<name>: " of its own."""
+    import ast
+
+    found = []
+    for path in sorted(ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+        loggers = {}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call) and getattr(node.value.func, "attr", None) == "getLogger"
+                    and node.value.args and isinstance(node.value.args[0], ast.Constant)):
+                loggers[node.targets[0].id] = node.value.args[0].value
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "LogSummary"):
+                continue
+            what = node.args[1].value
+            names = {path.stem, path.parent.name}
+            if isinstance(node.args[0], ast.Name) and node.args[0].id in loggers:
+                names.add(loggers[node.args[0].id])
+            if what in names or ": " in what:
+                found.append("%s:%d %r" % (path.relative_to(ROOT), node.lineno, what))
+    assert found == []
+
+
 # ---- an exception of the C code of the python module (module.c traceback()) ----
 
 def test_an_exception_goes_to_the_logger_when_it_has_a_handler(caplog):

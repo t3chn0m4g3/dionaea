@@ -26,9 +26,11 @@ class BlackholeService(ServiceLoader):
         services = config.get("services")
         if services is None:
             logger.warning("No services configured")
+            return []
 
+        # every port gets its connection and its config first: a transport the core does not have
+        # (TransportError) stops the start before a socket of another port is open
         daemons = []
-
         for service in services:
             protocol = service.get("protocol")
             port = service.get("port")
@@ -48,12 +50,12 @@ class BlackholeService(ServiceLoader):
             except ServiceConfigError as e:
                 logger.error(e.msg, *e.args)
                 continue
+            daemons.append((daemon, port))
 
+        for daemon, port in daemons:
             daemon.bind(addr, port, iface=iface)
             daemon.listen()
-            daemons.append(daemon)
-
-        return daemons
+        return [daemon for daemon, _port in daemons]
 
 
 class Blackhole(connection):
