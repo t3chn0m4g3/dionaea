@@ -92,7 +92,10 @@ class FTPCtrl(connection):
         self.send(cmd + "\r\n")
 
     def handle_error(self, err):
-        # the connect of the download failed; the core closes the connection afterwards
+        # the connect of the download failed; the core closes the connection afterwards,
+        # so the client lets go of it without a close of its own
+        if self.ftp.ctrl is self:
+            self.ftp.ctrl = None
         if isinstance(err, ConnectionRefusedByFilter):
             self.ftp.refused()
         else:

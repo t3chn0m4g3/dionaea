@@ -340,7 +340,8 @@ class mysqld(connection):
             try:
                 data = bytearray.fromhex(data.decode("ascii"))
             except (UnicodeDecodeError, ValueError):
-                logger.warning("Unable to decode hex string %s", log_text(query[0][2:]), exc_info=True)
+                logger.info("Unable to decode hex string %s", log_text(query[0][2:]))
+                logger.debug("Unable to decode hex string", exc_info=True)
                 return False
 
             self._report_raw_data(data)
@@ -358,7 +359,8 @@ class mysqld(connection):
             try:
                 data = bytearray.fromhex(query[0][2:].decode("ascii"))
             except UnicodeDecodeError as e:
-                logger.warning("Unable to decode hex string %s", log_text(query[0][2:]), exc_info=True)
+                logger.info("Unable to decode hex string %s", log_text(query[0][2:]))
+                logger.debug("Unable to decode hex string", exc_info=True)
                 return False
 
             self._report_raw_data(data)

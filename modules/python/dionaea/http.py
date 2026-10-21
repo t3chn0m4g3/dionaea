@@ -10,7 +10,7 @@ from dionaea.core import connection, g_dionaea, incident
 from dionaea.upload import incoming_file
 from dionaea.util import detect_shellshock
 from dionaea.exception import ServiceConfigError
-from dionaea.logtext import log_text
+from dionaea.logtext import PARSE_ERRORS, log_text, log_unreadable
 from collections import OrderedDict
 import logging
 import os
@@ -278,8 +278,8 @@ class httpreq:
             else:
                 logger.warning("max_num_fields is only supported with Python >= 3.8")
                 self.fields = urllib.parse.parse_qs(path_parsed.query)
-        except Exception:
-            logger.warning("Unable to parse query string", exc_info=True)
+        except Exception as e:
+            log_unreadable(logger, "Unable to parse query string", e)
 
         logger.debug("Extracted path %s", self.path)
         logger.debug("Found %d url value(s)", len(self.fields))
@@ -294,7 +294,7 @@ class httpreq:
                 header_line = header_line[:len(header_line)-1]
             header_name, _, header_value = header_line.partition(b":")
             if header_value is None:
-                logger.warning("Header without value '%s'", log_text(header_name))
+                logger.info("Header without value '%s'", log_text(header_name))
                 continue
             self.headers[header_name.lower()] = header_value.strip()
 
@@ -711,9 +711,9 @@ class httpd(connection):
                 try:
                     self.content_length = int(self.header.headers[b'content-length'].decode("utf-8"))
                     self.content_type = self.header.headers[b'content-type'].decode("utf-8")
-                except Exception:
-                    # ignore decode() errors
-                    logger.warning("Ignoring decode errors", exc_info=True)
+                except Exception as e:
+                    # a Content-Length or Content-Type of the client that can not be read (or none)
+                    log_unreadable(logger, "Ignoring decode errors", e, PARSE_ERRORS + (KeyError,))
                     self.handle_POST()
                     return len(data)
 
@@ -767,7 +767,7 @@ class httpd(connection):
             if self._check_max_request_size_reached():
                 return data_length
             if self.fp_tmp.tell() + data_length > self.content_length:
-                logger.warning("More data send as specified in the Content-Length header")
+                logger.info("More data send as specified in the Content-Length header")
                 self.fp_tmp.write(data[:self.content_length - self.fp_tmp.tell()])
                 self.handle_POST()
                 return data_length
@@ -863,7 +863,7 @@ class httpd(connection):
                     max_num_fields=self.get_max_num_fields
                 ))
             except ValueError as e:
-                logger.warning("Ignoring the POST data: %s", log_text(e))
+                logger.info("Ignoring the POST data: %s", log_text(e))
                 uploads = []
             except Exception:
                 logger.warning("Unable to parse the POST data", exc_info=True)

@@ -252,7 +252,8 @@ void emulate_thread(gpointer data, gpointer user_data)
 		{
 			if( hook->hook.win->fnhook == NULL )
 			{
-				g_critical("unhooked call to %s", hook->hook.win->fnname);
+				/* the emulated code of a client called a function without a hook */
+				g_info("unhooked call to %s", hook->hook.win->fnname);
 				break;
 			} else
 				if( ctx->state == waiting )
@@ -335,7 +336,8 @@ int run(struct emu *e, struct emu_env *env)
 
 			if( hook->hook.win->fnhook == NULL )
 			{
-				g_critical("unhooked call to %s", hook->hook.win->fnname);
+				/* the emulated code of a client called a function without a hook */
+				g_info("unhooked call to %s", hook->hook.win->fnname);
 				break;
 			}
 		} else

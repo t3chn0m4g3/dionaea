@@ -8,20 +8,22 @@
 # The binding in a running dionaea: dionaea.core.timer (logsql commits with it
 # once a second) and the connection wrappers of incidents.
 #
-# A second dionaea on the same network imports probes/binding_probe.py, which
-# makes one-shot and repeating timers, stops some inside their own callback,
-# drops the reference of one and lets one raise, then reads incident.con 200
-# times. The check expects from binding-probe.json: every timer called as often
-# as it should be, the two exceptions logged with their Traceback (and no other
-# Traceback in the container log), the reads of incident.con without objects in
-# reference cycles (at most 20 for all 200), and dionaea still running and
-# answering afterwards. An ihandler of the probe raises with a message of a client's kind
-# (an escape sequence, 1000 characters, 60 line breaks): dionaea-errors.log has its
-# Traceback with printable lines of at most 256 characters, at most 40 of them. Its stop()
-# raises with no handler of logging left: that record is in dionaea-errors.log the same way,
-# and nothing of it reaches the container log raw (the escape sequence of its text).
-# The errors log of the second dionaea takes critical (as config/dionaea.cfg; added if it lacks it):
-# the two records of the timer at Python's error level are in it, with their Traceback.
+# A second dionaea on the same network imports probes/binding_probe.py, which makes
+# one-shot and repeating timers, stops some inside their own callback, drops the
+# reference of one and lets one raise, then reads incident.con 200 times. The check
+# expects from binding-probe.json: every timer called as often as it should be, the two
+# exceptions logged with their Traceback (and no other Traceback in the container log),
+# the reads of incident.con without objects in reference cycles (at most 20 for all
+# 200), a closed connection as the value of an incident gives ReferenceError, and
+# dionaea still running and answering afterwards.
+# An ihandler of the probe raises with a message of a client's kind (an escape sequence,
+# 1000 characters, 60 line breaks): dionaea-errors.log has its Traceback with printable
+# lines of at most 256 characters, at most 40 of them. Its stop() raises with no handler
+# of logging left: that record is in dionaea-errors.log the same way, and nothing of it
+# reaches the container log raw (the escape sequence of its text).
+# The errors log of the second dionaea takes critical (as config/dionaea.cfg; added if
+# it lacks it): the two records of the timer at Python's error level are in it, with
+# their Traceback.
 
 set -Eeuo pipefail
 unset CDPATH
@@ -94,10 +96,13 @@ if errors != [("ValueError", "timer probe 1"), ("ValueError", "timer probe 2")]:
 if r.get("wrapper_gets") != 200 or r.get("wrapper_garbage", 1 << 30) > 20:
     sys.exit("incident.con: %s reads left %s objects in reference cycles (%s us a read; %s)" % (
         r.get("wrapper_gets"), r.get("wrapper_garbage"), r.get("wrapper_us"), r.get("wrapper_error")))
+if r.get("released_value") != "ReferenceError":
+    sys.exit("a closed connection as the value of an incident: %s (expected ReferenceError)" % r.get("released_value"))
 c = socket.create_connection((sys.argv[1], 21), timeout=10)
 if not c.recv(1024).startswith(b"220"):
     sys.exit("no FTP banner")
-print("timers as expected; incident.con: %d reads, %d objects in cycles, %s us a read; FTP answers" % (
+print("timers as expected; incident.con: %d reads, %d objects in cycles, %s us a read; "
+      "a closed connection is no incident value; FTP answers" % (
     r["wrapper_gets"], r["wrapper_garbage"], r["wrapper_us"]))
 ' "${probe}" | sed 's/^/    /' || { hc_fail "the binding did not behave"; rc=1; }
 

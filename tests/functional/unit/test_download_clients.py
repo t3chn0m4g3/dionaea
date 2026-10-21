@@ -26,6 +26,8 @@ import pytest
 
 REFUSED = []
 FAILED = []
+REPORTS = []
+CLOSED_TWICE = []
 
 
 class FakeTimeouts:
@@ -42,12 +44,21 @@ class FakeNode:
 
 
 class FakeConnection:
+    # connect() as connection_connect_next_addr() for a target the download target filter
+    # refuses: handle_error() before connect() returns, and the core closes the connection
+    # when it returns False (src/connection.c)
+    refuse_at_connect = False
+
     def __init__(self, proto="tcp"):
         self.timeouts = FakeTimeouts()
         self.remote = FakeNode()
         self.local = FakeNode("192.0.2.1", 0)
         self.sent = []
         self.closed = False
+        self.trans = proto
+        # the wrapper let go of its C connection (handle_disconnect_cb: thisptr = NULL)
+        self.released = False
+        self.refs = 0
 
     def bind(self, host, port, iface=""):
         self.local = FakeNode(host, port)
@@ -59,12 +70,37 @@ class FakeConnection:
     def connect(self, host, port, iface="", download=False):
         assert download, "a download client connects with download=True"
         self.remote = FakeNode(host, port)
+        if self.refuse_at_connect and not self.handle_error(FakeRefusedByFilter(connection=self)):
+            self._core_close()
 
     def send(self, data, local=None, remote=None):
         self.sent.append(data)
 
     def close(self):
+        if self.released:
+            raise ReferenceError("the object requested does not exist")
+        self._core_close()
+
+    def _core_close(self):
+        # connection_close(): a second close of a connection is "Invalid close on connection"
+        if self.closed:
+            CLOSED_TWICE.append(self)
+            return
         self.closed = True
+        # UDP: connection_udp_disconnect() calls handle_disconnect() at once, and the wrapper
+        # lets go of the connection (modelled with the refusal only: the other tests end a
+        # client more than once to see that it reports once)
+        if self.refuse_at_connect and self.trans == "udp" and not self.handle_disconnect():
+            self.released = True
+
+    def handle_disconnect(self):
+        return False
+
+    def ref(self):
+        self.refs += 1
+
+    def unref(self):
+        self.refs -= 1
 
 
 class FakeConnectionError(Exception):
@@ -96,6 +132,21 @@ def _src_root():
         Path(__file__).resolve().parents[3] / "modules" / "python" / "dionaea")
 
 
+class FakeIncident:
+    """dionaea.core.incident: a connection that let go of its C connection is no value."""
+
+    def __init__(self, origin):
+        object.__setattr__(self, "origin", origin)
+
+    def __setattr__(self, key, value):
+        if isinstance(value, FakeConnection) and value.released:
+            raise ReferenceError("the object requested does not exist")
+        object.__setattr__(self, key, value)
+
+    def report(self):
+        REPORTS.append(self)
+
+
 CORE = types.ModuleType("dionaea.core")
 
 
@@ -110,7 +161,7 @@ def _stand_ins():
     package.IHandlerLoader = type("IHandlerLoader", (), {})
     CORE.connection = FakeConnection
     CORE.ihandler = type("ihandler", (), {"__init__": lambda self, path: None})
-    CORE.incident = type("incident", (), {"__init__": lambda self, name: None, "report": lambda self: None})
+    CORE.incident = FakeIncident
     CORE.g_dionaea = None
     CORE.download_refused = lambda url: REFUSED.append(url)
     CORE.download_failed = lambda url, reason: FAILED.append((url, reason))
@@ -142,12 +193,12 @@ with _stand_ins():
 
 @pytest.fixture(autouse=True)
 def reports(tmp_path):
-    REFUSED.clear()
-    FAILED.clear()
+    for found in (REFUSED, FAILED, REPORTS, CLOSED_TWICE):
+        found.clear()
     tftp.g_dionaea = FakeConfig(tmp_path)
     yield
-    REFUSED.clear()
-    FAILED.clear()
+    for found in (REFUSED, FAILED, REPORTS, CLOSED_TWICE):
+        found.clear()
 
 
 TFTP_URL = "tftp://203.0.113.5/x.exe"
@@ -171,6 +222,34 @@ def test_tftp_refused_target_is_a_refusal_and_no_failure():
     client.handle_error(FakeRefusedByFilter(connection=client))
     assert REFUSED == [TFTP_URL]
     assert FAILED == []
+
+
+def test_tftp_target_refused_in_the_connect_is_no_link(monkeypatch):
+    # the core refuses the target inside connect() and closes the UDP connection before
+    # connect() returns: the client reports no dionaea.connection.link of it
+    monkeypatch.setattr(FakeConnection, "refuse_at_connect", True)
+    parent = FakeConnection()
+    client = tftp.TftpClient()
+    client.download(parent, "127.0.0.1", 69, "x.exe", TFTP_URL)
+    assert REFUSED == [TFTP_URL]
+    assert FAILED == []
+    assert client.closed and CLOSED_TWICE == []
+    assert [i.origin for i in REPORTS] == []
+
+
+def test_tftp_answer_whose_connect_fails_is_no_link(monkeypatch):
+    # the first answer of the server comes from its own port: the client connects to it, and
+    # when that connect fails the connection is closed before connect() returns
+    parent = FakeConnection()
+    client = tftp.TftpClient()
+    client.download(parent, "203.0.113.5", 69, "x.exe", TFTP_URL)
+    client.handle_established()
+    REPORTS.clear()
+    monkeypatch.setattr(FakeConnection, "refuse_at_connect", True)
+    client.remote = FakeNode("203.0.113.5", 40000)
+    client.handle_io_in(struct.pack("!HH", 3, 1) + b"data")
+    assert [i.origin for i in REPORTS if i.origin == "dionaea.connection.link"] == []
+    assert REFUSED == [TFTP_URL]
 
 
 def test_tftp_unreachable_target_is_a_failure_with_its_reason():
@@ -241,6 +320,34 @@ def test_ftp_refused_target_is_a_refusal_and_no_failure(tmp_path):
     ctrl.handle_disconnect()
     assert REFUSED == [FTP_URL]
     assert FAILED == []
+
+
+@pytest.mark.parametrize("error", [FakeRefusedByFilter, FakeUnreachable], ids=["refused", "unreachable"])
+def test_ftp_connect_that_fails_is_closed_once_by_the_core(error, tmp_path, monkeypatch):
+    # handle_error() returns False and the core closes the control connection itself:
+    # a close of the client before that makes the core's close one of a closed connection
+    if error is FakeRefusedByFilter:
+        monkeypatch.setattr(FakeConnection, "refuse_at_connect", True)
+        parent = FakeConnection()
+        client = ftp_download.FTPClient(download_dir=str(tmp_path), download_suffix=".tmp")
+        client.download(parent, "anonymous", "anonymous@", "127.0.0.1", 21, "/x.exe", "binary", FTP_URL)
+        ctrl = None
+    else:
+        parent = FakeConnection()
+        client = ftp_download.FTPClient(download_dir=str(tmp_path), download_suffix=".tmp")
+        client.download(parent, "anonymous", "anonymous@", "203.0.113.5", 21, "/x.exe", "binary", FTP_URL)
+        ctrl = client.ctrl
+        if not ctrl.handle_error(error(connection=ctrl)):
+            ctrl._core_close()
+    assert CLOSED_TWICE == []
+    assert client.ctrl is None
+    assert parent.refs == 0
+    if error is FakeRefusedByFilter:
+        assert REFUSED == [FTP_URL] and FAILED == []
+        assert [i.origin for i in REPORTS] == []
+    else:
+        assert ctrl.closed
+        assert FAILED == [(FTP_URL, "Could not connect to host(s): 203.0.113.5:21")]
 
 
 def test_ftp_unreachable_target_is_one_failure(tmp_path):

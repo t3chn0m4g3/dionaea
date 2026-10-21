@@ -8,6 +8,8 @@ import re
 import logging
 import time
 
+from dionaea.logtext import log_text
+
 try:
     from dionaea.sip import rfc2396, rfc4566
     from dionaea.sip.extras import int2bytes, ErrorWithResponse
@@ -552,7 +554,7 @@ class Message(object):
 
         for header in headers:
             if self.headers.get(header) is None:
-                logger.warning("Header missing: %r", header)
+                logger.info("Header missing: %s", log_text(header))
                 return False
 
         return True
@@ -587,7 +589,7 @@ class Message(object):
         try:
             h1, h2, h3 = headers_data[0].split(b" ", 2)
         except:
-            logger.warning("Can't parse first line of sip message: %s", repr(headers_data[0])[:128])
+            logger.info("Can't parse first line of sip message: %s", log_text(headers_data[0]))
             raise SipParsingError
 
         del headers_data[0]

@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 from dionaea.core import incident, connection
+from dionaea.logtext import log_text, log_unreadable
 
 import logging
 import tempfile
@@ -40,14 +41,14 @@ class mssqld(connection):
             p = None
             try:
                 if len(data) - l < 8:  # length of TDS_Header
-                    logger.warning("Incomplete TDS_Header")
+                    logger.info("Incomplete TDS_Header")
                     return l
 
                 p = TDS_Header(data[l:l+8])
                 p.show()
 
                 if p.Length == 0:
-                    logger.warning("Bad TDS Header, Length = 0")
+                    logger.info("Bad TDS Header, Length = 0")
                     return l
 
                 if len(data[l:]) < p.Length:
@@ -64,8 +65,8 @@ class mssqld(connection):
                     # Command spans multiple packets TDS_ things
                     # this is not the last packet
                     continue
-            except Exception:
-                logger.error("Unable to read the header of a TDS packet", exc_info=True)
+            except Exception as e:
+                log_unreadable(logger, "Unable to read the header of a TDS packet", e)
                 return l
 
             if self.pendingPacketType == TDS_TYPES_PRE_LOGIN:
@@ -227,7 +228,7 @@ class mssqld(connection):
             ]
 
         else:
-            logger.warning("UNKNOWN PACKET TYPE FOR MSSQL %s", PacketType)
+            logger.info("UNKNOWN PACKET TYPE FOR MSSQL %s", log_text(PacketType))
 
         return r
 

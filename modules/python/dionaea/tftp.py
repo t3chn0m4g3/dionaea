@@ -996,7 +996,7 @@ class TftpServerHandler(TftpSession):
                 logger.debug("Blocknumber rolled over to zero")
                 self.blocknumber = 0
         else:
-            logger.warning("Resending block number %d" % self.blocknumber)
+            logger.info("Resending block number %d", self.blocknumber)
         dat = TftpPacketDAT()
         dat.data = self.buffer
         dat.blocknumber = self.blocknumber
@@ -1112,6 +1112,8 @@ class TftpClient(TftpSession):
         self.url = None
         # the end of the download is logged once (download_failed / download_refused)
         self.reported = False
+        # handle_error() came: the core closes (or frees) the connection afterwards
+        self.connect_failed = False
 
     def __del__(self):
         if self.con != None:
@@ -1138,7 +1140,9 @@ class TftpClient(TftpSession):
             self.con.ref()
 
         self.connect(host, 0, download=True)
-        if con != None:
+        # a target the filter refuses ends in connect(): the core closed the connection
+        # before connect() returned, there is no connection to link any more
+        if con != None and not self.connect_failed:
             i = incident("dionaea.connection.link")
             i.parent = con
             i.child = self
@@ -1171,12 +1175,16 @@ class TftpClient(TftpSession):
                      (self.remote.host, self.remote.port))
 
         if self.remote.host != self.download_peer:
-            logger.warning("Ignoring TFTP packet from a different download host")
+            logger.info("Ignoring TFTP packet from a different download host")
             return len(data)
 
         if self.connected == False:
             self.connect(self.remote.host, self.remote.port, download=True)
             self.connected = True
+            # as in download(): a connect that failed closed the connection already, there is
+            # nothing to link and no packet to take any more
+            if self.connect_failed:
+                return len(data)
             if self.con != None:
                 i = incident("dionaea.connection.link")
                 i.parent = self.con
@@ -1237,7 +1245,7 @@ class TftpClient(TftpSession):
 
 
             elif recvpkt.blocknumber == self.curblock:
-                logger.warning("dropping duplicate block %d" % self.curblock)
+                logger.info("dropping duplicate block %d", self.curblock)
                 logger.debug(
                     "ACKing block %d again, just in case" % self.curblock)
                 ackpkt = TftpPacketACK()
@@ -1245,15 +1253,13 @@ class TftpClient(TftpSession):
                 self.send(ackpkt.encode().buffer)
 
             else:
-                msg = "Whoa! Received block %d but expected %d" % (recvpkt.blocknumber,
-                                                                   self.curblock+1)
-                logger.warning(msg)
+                logger.info("Whoa! Received block %d but expected %d", recvpkt.blocknumber, self.curblock + 1)
 
         # Check other packet types.
         elif isinstance(recvpkt, TftpPacketOACK):
             if not self.state.state == 'rrq':
                 self.errors += 1
-                logger.warning("Received OACK in state %s" % self.state.state)
+                logger.info("Received OACK in state %s", self.state.state)
 #                continue
             self.state.state = 'oack'
             logger.info("Received OACK from server.")
@@ -1304,6 +1310,7 @@ class TftpClient(TftpSession):
 
     def handle_error(self, err):
         # the connect of the download failed; the core closes the connection afterwards
+        self.connect_failed = True
         if isinstance(err, ConnectionRefusedByFilter):
             if not self.reported:
                 self.reported = True
@@ -1353,7 +1360,7 @@ class tftpdownloadhandler(ihandler):
             try:
                 url = url.decode(encoding="utf-8")
             except UnicodeDecodeError:
-                logger.warning("Invalid download URL encoding")
+                logger.info("Invalid download URL encoding")
                 return
 
         if url.startswith('tftp://'):

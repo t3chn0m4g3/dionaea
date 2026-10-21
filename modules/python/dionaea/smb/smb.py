@@ -23,7 +23,8 @@ from .include.packet import Raw
 from .ntlm import Exchange, filetime, legacy_password, negotiate_token, variant
 from .smb2 import SMB2, MAX_MESSAGE
 from dionaea.util import calculate_doublepulsar_opcode, xor
-from dionaea.logtext import log_text
+from dionaea.logtext import PARSE_ERRORS, log_text, log_unreadable
+from .include.asn1.asn1 import ASN1_Error
 from dionaea.upload import (
     DEFAULT_MAX_UPLOAD_SIZE,
     UploadError,
@@ -35,6 +36,9 @@ from dionaea.upload import (
 
 
 smblog = logging.getLogger('SMB')
+
+# what the parsers raise for bytes of a client they can not read (also BER / ASN.1 of NTLM)
+SMB_PARSE_ERRORS = PARSE_ERRORS + (ASN1_Error,)
 
 STATE_START = 0
 STATE_SESSIONSETUP = 1
@@ -255,8 +259,9 @@ class smbd(connection):
             if self.smb2.active:
                 raise ValueError("SMB1 message after SMB2 negotiation")
             return self.handle_smb1_message(data)
-        except (ValueError, IndexError, KeyError, AttributeError, TypeError, struct.error, UnicodeError) as e:
-            smblog.warning("Invalid SMB request: %s", log_text(e))
+        except SMB_PARSE_ERRORS + (KeyError, AttributeError, TypeError, NameError) as e:
+            # a parse error of the client's bytes is info; any other an error of dionaea, a warning
+            log_unreadable(smblog, "Invalid SMB request", e, SMB_PARSE_ERRORS)
             if self.smb2.active or data[4:8] != b"\xffSMB":
                 self.close()
                 return None
@@ -307,7 +312,7 @@ class smbd(connection):
 
         if p.haslayer(SMB_Header) and p[SMB_Header].Start != b'\xffSMB':
             # not really SMB Header -> bail out
-            smblog.error('=== not really SMB')
+            smblog.info('=== not really SMB')
             self.close()
             return None
 
@@ -354,7 +359,7 @@ class smbd(connection):
             #r.show2()
             self.send(r.build())
         elif not self.no_answer:
-            smblog.error('process() returned None.')
+            smblog.info('process() returned None.')
 
         # a rest that is not parsed (junk, or a failed dissection) is inside
         # the message, which ends where its length says
@@ -453,7 +458,7 @@ class smbd(connection):
                     # a TREE_CONNECT_ANDX chained behind it (the only chain dionaea answers)
                     chained = self.chained_tree_connect(setup, smbh, reply_uid)
             else:
-                smblog.warning("Unknown Session Setup Type used")
+                smblog.info("Unknown Session Setup Type used")
 
         elif Command == SMB_COM_TREE_CONNECT_ANDX:
             h = p.getlayer(SMB_Treeconnect_AndX_Request)
@@ -524,7 +529,7 @@ class smbd(connection):
 #				self.process_dcerpc_packet(p.getlayer(SMB_Write_AndX_Request).Data)
                 if len(self.buf) > MAX_DCERPC_BUFFER:
                     # not a DCERPC fragment, do not keep what the client sends without limit
-                    smblog.warning("dropping %i bytes written to a pipe", len(self.buf))
+                    smblog.info("dropping %i bytes written to a pipe", len(self.buf))
                     self.buf = b''
                 if len(self.buf) >= 10:
                     # we got the dcerpc header
@@ -554,7 +559,7 @@ class smbd(connection):
                 if self.state['stop']:
                     smblog.debug('drop dead!')
                 else:
-                    smblog.error('dcerpc processing failed. bailing out.')
+                    smblog.info('dcerpc processing failed. bailing out.')
                 return rp
 
             rdata = SMB_Data()
@@ -657,7 +662,7 @@ class smbd(connection):
                         if self.state['stop']:
                             smblog.debug('drop dead!')
                         else:
-                            smblog.error('dcerpc processing failed. bailing out.')
+                            smblog.info('dcerpc processing failed. bailing out.')
                         return rp
                     self.outbuf = outpacket.build()
                     dceplen = len(self.outbuf)
@@ -774,7 +779,7 @@ class smbd(connection):
             r = SMB_NT_Trans_Response()
             rstatus = 0x00000000  # STATUS_SUCCESS
         else:
-            smblog.error('...unknown SMB Command. bailing out.')
+            smblog.info('...unknown SMB Command 0x%02x. bailing out.', Command)
             p.show()
 
         if r:
@@ -846,15 +851,15 @@ class smbd(connection):
                         ctxitem.AckResult = 0
                         ctxitem.AckReason = 0
                     else:
-                        smblog.warning(
+                        smblog.info(
                             "Attempt to register %s failed, UUID does not exist or is not implemented",
-                            service_uuid
+                            log_text(service_uuid)
                         )
                 else:
-                    smblog.warning(
+                    smblog.info(
                         "Attempt to register %s failed, TransferSyntax %s is unknown",
-                        service_uuid,
-                        transfersyntax_uuid
+                        log_text(service_uuid),
+                        log_text(transfersyntax_uuid)
                     )
                 i = incident("dionaea.modules.python.smb.dcerpc.bind")
                 i.con = self
@@ -882,8 +887,8 @@ class smbd(connection):
                 self.state['stop'] = True
             outbuf = resp
         else:
-            # unknown DCERPC packet -> logcrit and bail out.
-            smblog.error('unknown DCERPC packet. bailing out.')
+            # unknown DCERPC packet -> bail out.
+            smblog.info('unknown DCERPC packet. bailing out.')
         return outbuf
 
     def handle_timeout_idle(self):
@@ -1069,8 +1074,8 @@ class epmapper(smbd):
     def handle_io_in(self,data):
         try:
             p = DCERPC_Header(data)
-        except Exception:
-            smblog.error("Unable to read the header of a DCERPC packet", exc_info=True)
+        except Exception as e:
+            log_unreadable(smblog, "Unable to read the header of a DCERPC packet", e, SMB_PARSE_ERRORS)
             return len(data)
 
         if len(data) < p.FragLen:
@@ -1086,7 +1091,7 @@ class epmapper(smbd):
             return len(data)
 
         if not r or r is None:
-            smblog.error('dcerpc processing failed. bailing out.')
+            smblog.info('dcerpc processing failed. bailing out.')
             return len(data)
 
         smblog.debug("response: %s" % r.summary())

@@ -73,7 +73,7 @@ class RPCService(object):
                     rpclog.debug("DCERPCValueError %s" % e)
                     return None
                 except EOFError as e:
-                    rpclog.warning("EOFError data %s", log_text(p.StubData))
+                    rpclog.info("EOFError data %s", log_text(p.StubData))
                     return None
 
                 if data is None:
@@ -3296,7 +3296,7 @@ class SRVSVC(RPCService):
                 #				self.MaxCount = len(self.Data)
                 #				self.__packer.pack_long(self.MaxCount)
 
-                rpclog.warning("%s", log_text(self.Data))
+                rpclog.debug("%s", log_text(self.Data))
 #				raise Exception()
 
                 for i in self.Data:
@@ -3604,8 +3604,7 @@ class SRVSVC(RPCService):
                 data = __shares__[NetName]
                 s.Data = {NetName:data}
             else:
-                rpclog.warning(
-                    "FIXME: this code has to be written, lame workaround for now")
+                rpclog.info("share %s is unknown, the answer has C$", log_text(NetName))
                 data = __shares__['C$']
                 s.Data = {NetName:data}
             s.pack()

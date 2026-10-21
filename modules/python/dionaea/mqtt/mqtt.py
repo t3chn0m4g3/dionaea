@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 from dionaea.core import *
+from dionaea.logtext import log_text, log_unreadable
 
 import datetime
 import logging
@@ -251,7 +252,7 @@ class mqttd(connection):
 			if length is None:
 				break
 			if length < 0:
-				logger.warning("Bad MQTT Packet, remaining length malformed")
+				logger.info("Bad MQTT Packet, remaining length malformed")
 				self.close()
 				return len(data)
 			if length > MAX_PACKET_SIZE:
@@ -294,10 +295,10 @@ class mqttd(connection):
 					logger.debug("MQTT Control Packet Type {}".format(self.pendingPacketType))
 
 				if len(data) == 0:
-					logger.warning("Bad MQTT Packet, Length = 0")
+					logger.info("Bad MQTT Packet, Length = 0")
 
-			except Exception:
-				logger.error("Unable to read the type of an MQTT packet", exc_info=True)
+			except Exception as e:
+				log_unreadable(logger, "Unable to read the type of an MQTT packet", e)
 				return l
 
 			if self.pendingPacketType == MQTT_CONTROLMESSAGE_TYPE_CONNECT:
@@ -351,7 +352,7 @@ class mqttd(connection):
 
 			self.buf = b''
 			if x is None:
-				logger.warning("Unknown Packet Type for MQTT {}".format(self.pendingPacketType))
+				logger.info("Unknown Packet Type for MQTT %s", log_text(self.pendingPacketType))
 				return len(data)
 			x.show()
 
@@ -453,7 +454,7 @@ class mqttd(connection):
 				r.PacketIdentifier = packetidentifier
 				r.HeaderFlags = MQTT_CONTROLMESSAGE_TYPE_PUBLISHCOM
 		else:
-			logger.warning("Unknown Packet Type for MQTT {}".format(PacketType))
+			logger.info("Unknown Packet Type for MQTT %s", log_text(PacketType))
 
 		return r
 

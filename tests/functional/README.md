@@ -87,10 +87,16 @@ above) so the startup can be checked.
 - `test_smb_auth.py`: SMB1/SMB2 authentication and metadata, malformed frames,
   and 1001 SMB1 logins on one connection. JSON retains the first 1000 logins,
   SQLite retains all 1001, and the connection continues to answer.
+- `unit/test_unreadable_messages.py`: a message of a client that SMB, epmapper, MQTT or MSSQL
+  can not read is info when the parser raised (its traceback at debug), a warning with the
+  traceback for any other exception.
 - `unit/test_log_json_credentials.py`: credential limits for SMB, FTP, MySQL
   and MSSQL, both JSON output forms, and independent connection records.
 - `test_errors_log_live.py`: `dionaea-errors.log` (`warning,error,critical`) is written per line: the
-  warning of an SMB1 message shorter than its header is in it within 1 s while dionaea runs.
+  warning of an SMB1 write beyond `max_upload_size` (the upload is dropped) is in it within 1 s while
+  dionaea runs. An SMB1 message shorter than its header and a POST with more parts than
+  `max_num_fields` are info, no line of it. After the stop, `run.sh` allows no critical line in it
+  (other than `OWN_CRITICAL`) and prints the warnings left, per message, as information.
 - `test_smoke.py`: service ports, FTP login in `dionaea.json`, HTTP upload. The
   multipart tests (`test_http_multipart_*`: a file part is stored, a part with a
   Content-Transfer-Encoding is stored as sent, a line that starts with the boundary inside the

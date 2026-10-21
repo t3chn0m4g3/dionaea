@@ -46,18 +46,27 @@ jobs:
           KEEP_ARTIFACTS: "1"
           TMPDIR: ${{ runner.temp }}
       -
-        name: Make the files of dionaea readable for the upload
-        # dionaea writes them as uid 2000 (binaries 0440): chmod as root in the client image
+        name: Pack the files of dionaea for the upload
+        # dionaea writes them as uid 2000 (binaries 0440): packed as root in the client image.
+        # One archive, as upload-artifact takes no file name with a colon (the bistreams have
+        # the time in their names)
         if: failure() || cancelled()
         run: |
+          # a failure is said in the log and as a warning, the upload below goes on without it
           docker run --rm -v "${RUNNER_TEMP}:/artifacts" --entrypoint sh dionaea-func-client:local \
-            -c 'chmod -R a+rX /artifacts/dionaea-func.* || true'
+            -c 'cd /artifacts || exit 1
+                if ! ls -d dionaea-func.* >/dev/null 2>&1; then
+                  echo "no folder of run.sh (dionaea-func.*) to pack"; exit 0
+                fi
+                tar -czf functional-tests.tar.gz dionaea-func.* && chmod a+r functional-tests.tar.gz ||
+                  { rm -f functional-tests.tar.gz; exit 1; }' \
+            || echo "::warning::could not pack the files of the functional tests (tar failed), nothing is uploaded"
       -
         name: Upload the logs and data of a failed run
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: functional-tests
-          path: ${{ runner.temp }}/dionaea-func.*
+          path: ${{ runner.temp }}/functional-tests.tar.gz
           if-no-files-found: ignore
           retention-days: 14

@@ -27,6 +27,10 @@ after the start:
                       every time, which parsed the text signature of the Cython __init__
                       and left a class (RewriteSymbolics) in a cycle per read
     wrapper_us        microseconds per read
+    released_value    a closed connection as the value of an incident gives ReferenceError:
+                      a UDP connection that was bound and closed (its wrapper let go of the
+                      connection in handle_disconnect), as for every other use of such a
+                      wrapper
     raised            an ihandler whose handle_incident raises (with a text of 1000 characters,
                       an escape sequence and 60 line breaks in its message) got its incident: the
                       exception leaves the binding to the C code of the python module
@@ -117,11 +121,32 @@ def _wrappers():
     con.close()
 
 
+def _released_value():
+    from dionaea.core import connection, incident
+    con = connection("udp")
+    if not con.bind("127.0.0.1", 0):
+        return "bind failed"
+    con.close()   # UDP: handle_disconnect() at once, the wrapper lets go of the connection
+    i = incident("dionaea.binding_probe.released")
+    try:
+        i.child = con
+    except ReferenceError:
+        return "ReferenceError"
+    try:
+        return "held, read: %s" % str(i.child)
+    except Exception as e:
+        return "held, read: %s" % type(e).__name__
+
+
 def _report():
     try:
         _wrappers()
     except Exception as e:   # the probe must not stop dionaea
         wrappers["wrapper_error"] = repr(e)
+    try:
+        wrappers["released_value"] = _released_value()
+    except Exception as e:
+        wrappers["released_value"] = repr(e)
     try:
         from dionaea.core import incident
         incident(RAISE_ORIGIN).report()

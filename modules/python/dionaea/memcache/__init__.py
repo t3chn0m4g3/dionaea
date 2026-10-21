@@ -157,7 +157,7 @@ class Memcache(connection):
             # End of Line
             processed_bytes = eoc + 2
             if self.command is None:
-                logger.warning("Unable to detect command or unsupported command")
+                logger.info("Unable to detect command or unsupported command")
                 self._send_line("ERROR")
                 return processed_bytes
             logger.debug("Using command class to process data '%r'", self.command)

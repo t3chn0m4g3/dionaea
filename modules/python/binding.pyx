@@ -1282,6 +1282,10 @@ cdef class incident:
 
 		if isinstance(value, connection) :
 			con = <connection>value
+			# a wrapper that let go of its connection (handle_disconnect_cb) is no value of an
+			# incident: the incident would hold NULL, and a read of it a wrapper without one
+			if con.thisptr == NULL:
+				raise ReferenceError(u'the object requested does not exist')
 			c_incident_value_con_set(self.thisptr, key, con.thisptr)
 		elif isinstance(value, int) :
 			c_incident_value_int_set(self.thisptr, key, value)

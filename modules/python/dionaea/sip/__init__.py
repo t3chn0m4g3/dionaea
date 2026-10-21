@@ -17,6 +17,7 @@ import datetime
 import tempfile
 
 from dionaea.core import connection, g_dionaea, incident
+from dionaea.logtext import log_text
 from dionaea import Timer, ServiceLoader
 
 from dionaea.sip.extras import msg_to_icd, SipConfig, ErrorWithResponse
@@ -42,7 +43,7 @@ g_call_ids = {}
 
 
 def cleanup(*args):
-    logger.warning("Cleanup")
+    logger.debug("Cleanup")
 
     # remove closed calls
     for key in list(g_call_ids.keys()):
@@ -75,7 +76,7 @@ class SIPService(ServiceLoader):
         if len(daemons) > 0:
             global g_timer_cleanup
             if g_timer_cleanup is None:
-                logger.warning("Starting cleanup loop")
+                logger.debug("Starting cleanup loop")
                 g_timer_cleanup = Timer(
                     60,
                     cleanup,
@@ -681,7 +682,7 @@ class SipSession(connection):
 
     def handle_unknown(self, msg):
         logger.debug("{!s} unknown".format(self))
-        logger.warning("Unknown SIP header: {}".format(repr(msg.method)[:128]))
+        logger.info("Unknown SIP header: %s", log_text(msg.method))
 
         icd = incident("dionaea.modules.python.sip.command")
         icd.con = self
@@ -706,7 +707,7 @@ class SipSession(connection):
 
         # Find SipSession and delete it
         if call_id not in g_call_ids or g_call_ids[call_id] is None:
-            logger.warning("{!s} request does not match any existing SIP session".format(handler_name))
+            logger.info("%s request does not match any existing SIP session", handler_name)
             icd = incident("dionaea.modules.python.sip.command")
             icd.con = self
             msg_to_icd(msg,d=icd)
@@ -717,7 +718,7 @@ class SipSession(connection):
         try:
             g_call_ids[call_id].handle_msg_in(msg)
         except AuthenticationError:
-            logger.warning("Authentication failed for {!s} request".format(handler_name))
+            logger.info("Authentication failed for %s request", handler_name)
 
 
     def handle_INVITE(self, msg):
@@ -734,7 +735,7 @@ class SipSession(connection):
         call_id = msg.headers.get(b"call-id").value
 
         if call_id in g_call_ids and g_call_ids[call_id] is None:
-            logger.warning("SIP session with Call-ID {} already exists".format(call_id[:128]))
+            logger.info("SIP session with Call-ID %s already exists", log_text(call_id))
             # ToDo: error
             return
 
@@ -757,7 +758,7 @@ class SipSession(connection):
         try:
             new_call.handle_msg_in(msg)
         except AuthenticationError:
-            logger.warning("Authentication failed, not creating SIP session")
+            logger.info("Authentication failed, not creating SIP session")
             new_call.close()
             del new_call
 
@@ -787,7 +788,7 @@ class SipSession(connection):
 
         # ToDo: check for request-uri?
         if not msg.headers_exist([b"to", b"from", b"call-id", b"cseq"]):
-            logger.warning("REGISTER, header missing")
+            logger.info("REGISTER, header missing")
             # ToDo: return error
             return
 

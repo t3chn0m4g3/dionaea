@@ -507,7 +507,7 @@ int32_t ll_win_hook_accept(struct emu_env *env, struct emu_env_hook *hook)
 	struct connection *con;
 	if( (con = g_hash_table_lookup(ctx->sockets, &s)) == NULL )
 	{
-		g_warning("invalid socket requested %i", s);
+		g_info("invalid socket requested %i", s);
 		ctx->state = failed;
 		return 0;
 	}
@@ -552,7 +552,7 @@ uint32_t user_hook_bind(struct emu_env *env, struct emu_env_hook *hook, ...)
 	struct connection *con;
 	if( (con = g_hash_table_lookup(ctx->sockets, &s)) == NULL )
 	{
-		g_warning("invalid socket requested %i", s);
+		g_info("invalid socket requested %i", s);
 		ctx->state = failed;
 		return 0;
 	}
@@ -638,7 +638,7 @@ uint32_t user_hook_connect(struct emu_env *env, struct emu_env_hook *hook, ...)
 	struct connection *con;
 	if( (con = g_hash_table_lookup(ctx->sockets, &s)) == NULL )
 	{
-		g_warning("invalid socket requested %i", s);
+		g_info("invalid socket requested %i", s);
 		ctx->state = failed;
 		return -1;
 	}
@@ -693,7 +693,7 @@ uint32_t user_hook_close(struct emu_env *env, struct emu_env_hook *hook, ...)
 	struct connection *con;
 	if( (con = g_hash_table_lookup(ctx->sockets, &s)) == NULL )
 	{
-		g_warning("invalid socket requested %i", s);
+		g_info("invalid socket requested %i", s);
 		ctx->state = failed;
 		return -1;
 	}
@@ -762,7 +762,7 @@ uint32_t user_hook_listen(struct emu_env *env, struct emu_env_hook *hook, ...)
 	struct connection *con;
 	if( (con = g_hash_table_lookup(ctx->sockets, &s)) == NULL )
 	{
-		g_warning("invalid socket requested %i", s);
+		g_info("invalid socket requested %i", s);
 		ctx->state = failed;
 		return 0;
 	}
@@ -778,7 +778,7 @@ uint32_t user_hook_listen(struct emu_env *env, struct emu_env_hook *hook, ...)
 
 		if( bind_local(con) != true )
 		{
-			g_warning("Could not bind %s:%i (%s)", con->local.hostname, ntohs(con->local.port), strerror(errno));
+			g_info("Could not bind %s:%i (%s)", con->local.hostname, ntohs(con->local.port), strerror(errno));
 			ctx->state = failed;
 			return 0;
 		}
@@ -788,7 +788,7 @@ uint32_t user_hook_listen(struct emu_env *env, struct emu_env_hook *hook, ...)
 		{
 			close(con->socket);
 			con->socket = -1;
-			g_warning("Could not listen %s:%i (%s)", con->local.hostname, ntohs(con->local.port), strerror(errno));
+			g_info("Could not listen %s:%i (%s)", con->local.hostname, ntohs(con->local.port), strerror(errno));
 			ctx->state = failed;
 			return 0;
 		}
@@ -836,8 +836,8 @@ void async_connection_io_in(void *data)
 	case connection_transport_tcp:
 		ev_io_init(&con->events.io_in, connection_tcp_io_in_cb, con->socket, EV_READ);
 		ev_io_start(CL, &con->events.io_in);
-		g_warning("at %f", con->events.sustain_timeout.at);
-		g_warning("repeat %f", con->events.sustain_timeout.repeat);
+		g_debug("at %f", con->events.sustain_timeout.at);
+		g_debug("repeat %f", con->events.sustain_timeout.repeat);
 
 		if( con->events.sustain_timeout.repeat == 0. )
 			connection_sustain_timeout_set(con, conf->limits.sustain);
@@ -915,7 +915,7 @@ int recv(
 	struct connection *con;
 	if( (con = g_hash_table_lookup(ctx->sockets, &s)) == NULL )
 	{
-		g_warning("invalid socket requested %i", s);
+		g_info("invalid socket requested %i", s);
 		ctx->state = failed;
 		return 0;
 	}
@@ -1036,7 +1036,7 @@ uint32_t user_hook_send(struct emu_env *env, struct emu_env_hook *hook, ...)
 	struct connection *con;
 	if( (con = g_hash_table_lookup(ctx->sockets, &s)) == NULL )
 	{
-		g_warning("invalid socket requested %i", s);
+		g_info("invalid socket requested %i", s);
 		ctx->state = failed;
 		return 0;
 	}
@@ -1093,7 +1093,7 @@ uint32_t user_hook_socket(struct emu_env *env, struct emu_env_hook *hook, ...)
 
 	if( g_hash_table_size(ctx->sockets) > conf->limits.sockets )
 	{
-		g_warning("Too many open sockets (%i)", g_hash_table_size(ctx->sockets));
+		g_info("Too many open sockets (%i)", g_hash_table_size(ctx->sockets));
 		ctx->state = failed;
 		return -1;
 	}
@@ -1161,7 +1161,7 @@ HANDLE CreateFile(
 
 	if( g_hash_table_size(ctx->files) > conf->limits.files )
 	{
-		g_warning("Too many open files (%i)", g_hash_table_size(ctx->files));
+		g_info("Too many open files (%i)", g_hash_table_size(ctx->files));
 		ctx->state = failed;
 		return -1;
 	}
@@ -1217,7 +1217,7 @@ BOOL WriteFile(
 	struct tempfile *tf = NULL;
 	if( (tf = g_hash_table_lookup(ctx->files, &hFile)) == NULL )
 	{
-		g_warning("invalid file requested %i", hFile);
+		g_info("invalid file requested %i", hFile);
 		ctx->state = failed;
 		return 0;
 	}
@@ -1231,7 +1231,7 @@ BOOL WriteFile(
 		long size;
 		if( (size = ftell(tf->fh)) >  conf->limits.filesize )
 		{
-			g_warning("File too large");
+			g_info("File too large");
 			ctx->state = failed;
 		}
 	}
@@ -1323,7 +1323,7 @@ uint32_t user_hook_CreateProcess(struct emu_env *env, struct emu_env_hook *hook,
 		struct connection *con = NULL;
 		if( (con = g_hash_table_lookup(ctx->sockets, &psiStartInfo->hStdInput)) == NULL )
 		{
-			g_warning("invalid socket requested %i", psiStartInfo->hStdInput);
+			g_info("invalid socket requested %i", psiStartInfo->hStdInput);
 			//		g_hash_table_foreach(ctx->sockets, dump_sockets, NULL);
 			return 0;
 		}
@@ -1446,7 +1446,7 @@ uint32_t user_hook__lcreat(struct emu_env *env, struct emu_env_hook *hook, ...)
 
 	if( g_hash_table_size(ctx->files) > conf->limits.files )
 	{
-		g_warning("Too many open files (%i)", g_hash_table_size(ctx->files));
+		g_info("Too many open files (%i)", g_hash_table_size(ctx->files));
 		ctx->state = failed;
 		return -1;
 	}
@@ -1491,7 +1491,7 @@ uint32_t user_hook__lwrite(struct emu_env *env, struct emu_env_hook *hook, ...)
 	struct tempfile *tf = NULL;
 	if( (tf = g_hash_table_lookup(ctx->files, &hFile)) == NULL )
 	{
-		g_warning("invalid file requested %i", hFile);
+		g_info("invalid file requested %i", hFile);
 		ctx->state = failed;
 		return 0;
 	}
@@ -1505,7 +1505,7 @@ uint32_t user_hook__lwrite(struct emu_env *env, struct emu_env_hook *hook, ...)
 		long size;
 		if( (size = ftell(tf->fh)) >  conf->limits.filesize )
 		{
-			g_warning("File too large");
+			g_info("File too large");
 			ctx->state = failed;
 		}
 	}

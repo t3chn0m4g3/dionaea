@@ -44,7 +44,7 @@ class pptpd(connection):
                 self.send(r.build())
                 return len(data)
             else:
-                logger.warning("Unexpected control message type %d", message_type)
+                logger.info("Unexpected control message type %d", message_type)
         return len(data)
 
     def apply_config(self, config):
@@ -64,7 +64,7 @@ class pptpd(connection):
             p = packets.PPTP_StartControlConnection_Request(data)
             p.show()
             if p.Length == 0:
-                logger.warning("Bad PPTP Packet, Length = 0")
+                logger.info("Bad PPTP Packet, Length = 0")
                 return len(data)
 
             i = incident("dionaea.modules.python.pptp.connect")
@@ -89,7 +89,7 @@ class pptpd(connection):
             if p.MessageType == 0x01:
                 return self._handle_controll_message(p.ControlMessageType, data)
 
-            logger.warning("Wrong message type %d", p.MessageType)
+            logger.info("Wrong message type %d", p.MessageType)
             return len(data)
 
         return len(data)

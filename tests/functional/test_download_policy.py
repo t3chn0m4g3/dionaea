@@ -62,8 +62,11 @@ def test_http_redirect_does_not_reach_honeypot(target, mysql, dionaea_ip, my_ip,
 
 
 @pytest.mark.parametrize('protocol, name', [('ftp', 'functional-list.txt'), ('tftp', 'functional-test.txt')])
-def test_native_download_clients_reject_local_targets(protocol, name, dionaea_host, query_db):
+def test_native_download_clients_reject_local_targets(protocol, name, dionaea_host, query_db, data_dir):
     from test_emu import winexec_shellcode
+
+    errors_log = data_dir / "dionaea-errors.log"
+    errors_before = errors_log.stat().st_size if errors_log.exists() else 0
 
     command = ('cmd.exe /c tftp -i 127.0.0.1 GET ' + name if protocol == 'tftp'
                else 'cmd.exe /c ftp -s:ftp.txt 127.0.0.1')
@@ -83,3 +86,10 @@ def test_native_download_clients_reject_local_targets(protocol, name, dionaea_ho
     time.sleep(0.5)
     for row in rows:
         assert not query_db('SELECT download_url FROM downloads WHERE download_url = ?', (row['offer_url'],))
+    # a refused target is an info line of dionaea.log (download_log.c), nothing for the
+    # errors log of T-Pot (errors.levels=warning,error,critical): the client neither closes
+    # the connection the core closes nor links a connection that is gone
+    with errors_log.open('rb') as f:
+        f.seek(errors_before)
+        new_lines = f.read().decode(errors='replace')
+    assert 'critical' not in new_lines and 'Traceback' not in new_lines, new_lines

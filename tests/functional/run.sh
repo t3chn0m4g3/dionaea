@@ -267,9 +267,13 @@ if [[ ${RC} -eq 0 ]]; then
   docker stop -t 30 "${DIONAEA_CONTAINER}" >/dev/null
   # dionaea exits with status 255 after SIGINT (as the 24.04.1 image), so the
   # status is not checked
+  errors_log="${TMP_ROOT}/var-dionaea/dionaea-errors.log"
   for log in dionaea.log dionaea-errors.log; do
     if [[ ! -f "${TMP_ROOT}/var-dionaea/${log}" ]]; then
       echo "${log} is missing" >&2
+      RC=1
+    elif [[ ! -r "${TMP_ROOT}/var-dionaea/${log}" ]]; then
+      echo "${log} can not be read" >&2
       RC=1
     elif grep -nE 'Traceback|LoaderError|Error loading module|Unable to start service' "${TMP_ROOT}/var-dionaea/${log}" >&2; then
       echo "${log}: errors while loading modules or services (see above)" >&2
@@ -278,6 +282,24 @@ if [[ ${RC} -eq 0 ]]; then
   done
   if ! grep -q 'Starting services' "${TMP_ROOT}/var-dionaea/dionaea.log" 2>/dev/null; then
     echo "dionaea.log has no 'Starting services' line" >&2
+    RC=1
+  fi
+  # A critical line (a record of Python's logging at error, or g_critical) is one of dionaea's
+  # own problems; what the clients of the tests send is info or debug. OWN_CRITICAL lists the
+  # lines of dionaea's own failures the tests make on purpose (ERE), none at present.
+  # A line of the log file: "[date time] domain[ file:line]-level: message" (file:line in a
+  # build with DEBUG)
+  OWN_CRITICAL=()
+  critical_lines=""
+  if [[ -f "${errors_log}" && -r "${errors_log}" ]]; then
+    critical_lines="$(grep -E '^\[[0-9]{8} [0-9:]{8}\] [^ ]+( [^ ]+)?-critical: ' "${errors_log}" || true)"
+  fi
+  for pattern in ${OWN_CRITICAL[@]+"${OWN_CRITICAL[@]}"}; do
+    critical_lines="$(printf '%s\n' "${critical_lines}" | grep -vE -- "${pattern}" || true)"
+  done
+  if [[ -n "${critical_lines}" ]]; then
+    printf '%s\n' "${critical_lines}" | cut -c1-200 >&2
+    echo "dionaea-errors.log: $(printf '%s\n' "${critical_lines}" | wc -l | tr -d ' ') critical line(s) (see above), none is in OWN_CRITICAL" >&2
     RC=1
   fi
   # lines the host checks expect in the logs (hc_expect_log): FILE<TAB>ERE
@@ -291,6 +313,21 @@ if [[ ${RC} -eq 0 ]]; then
         RC=1
       fi
     done < "${OUT_DIR}/expect-log"
+  fi
+  # the warnings left in the errors log, per message (numbers as N, addresses as ADDR): information,
+  # no check. A message a client causes is info; a warning is a capture that was lost or cut,
+  # or a problem of dionaea.
+  warning_counts=""
+  if [[ -f "${errors_log}" && -r "${errors_log}" ]]; then
+    warning_counts="$(grep -E '^\[[0-9]{8} [0-9:]{8}\] [^ ]+( [^ ]+)?-warning: ' "${errors_log}" \
+    | sed -E 's/^\[[^]]*\] ([^ ]+)( [^ ]+)?-warning: /\1: /; s/0x[0-9a-fA-F]+/ADDR/g; s/\.incoming\/[^ :]+/.incoming\/FILE/g; s/(^|[^A-Za-z0-9_])[0-9]+/\1N/g' \
+    | sort | uniq -c | sort -rn || true)"
+  fi
+  if [[ -n "${warning_counts}" ]]; then
+    say "warnings in dionaea-errors.log, per message (information only):"
+    printf '%s\n' "${warning_counts}" | cut -c1-200
+  else
+    say "no warnings in dionaea-errors.log"
   fi
 fi
 

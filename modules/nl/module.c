@@ -255,7 +255,7 @@ static int nl_event_input(struct nl_msg *msg, void *arg)
 
 static void cache_lookup_cb(struct nl_object *obj, void *arg)
 {
-	g_critical("%s obj %p arg %p", __PRETTY_FUNCTION__, obj, arg);
+	g_debug("%s obj %p arg %p", __PRETTY_FUNCTION__, obj, arg);
 	uintptr_t *a = arg;
 	*a = (uintptr_t)obj;
 }
@@ -291,7 +291,7 @@ static void nl_ihandler_cb(struct incident *i, void *ctx)
 		struct rtnl_addr *res = NULL;
 		nl_cache_foreach_filter(nl_runtime.addr_cache, OBJ_CAST(addr), cache_lookup_cb, &res);
 
-		g_critical("LOCAL RTNL_ADDR %p", res);
+		g_debug("LOCAL RTNL_ADDR %p", res);
 
 	/*	struct nl_dump_params params = {
 			.dp_type = NL_DUMP_LINE,
@@ -318,11 +318,11 @@ static void nl_ihandler_cb(struct incident *i, void *ctx)
 
 	if( res )
 	{
-		g_critical("GOT NEIGH %p", res);
+		g_debug("GOT NEIGH %p", res);
 		struct nl_addr *lladdr = rtnl_neigh_get_lladdr(res);
 		char buf[123];
 		nl_addr2str(lladdr, buf, sizeof(buf));
-		g_critical("GOT NEIGH %s", buf);
+		g_debug("GOT NEIGH %s", buf);
 
 		struct incident *i = incident_new("dionaea.module.nl.connection.info.mac");
 		incident_value_string_set(i, "mac", g_string_new(buf));

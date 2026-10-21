@@ -19,6 +19,7 @@ except ImportError:
     bson = None
 
 from dionaea.core import incident, connection, g_dionaea
+from dionaea.logtext import log_text
 from . import packets
 from dionaea.smb.include.packet import Raw
 
@@ -63,7 +64,7 @@ class mongod(connection):
             result = self._handle_command_db_test(command_name, metadata, command_args, input_docs)
 
         if result is None:
-            logger.error("not found")
+            logger.info("not found: %s.%s", log_text(database), log_text(command_name))
             # We need at least two documents(metadata and commandReply)
             return [{}, {}]
         return result

@@ -27,6 +27,21 @@ Changelog
 * The errors log of the sample configuration (``conf/dionaea.cfg.cmake``) has
   ``errors.levels=warning,error,critical``: a record of Python's logging at error is a
   critical one. It is still written line by line.
+* A TFTP or FTP download whose target the filter refuses, or whose connect fails, adds
+  nothing to the errors log: the client leaves the close of the connection to the core
+  and reports no link of a connection that is closed already. A connection that was
+  closed is no value of an incident (``ReferenceError``).
+* What a client sends is logged at info or debug, not at warning or critical: SMB, MQTT,
+  MSSQL (TDS), DCERPC, PPTP, SIP, memcache, printer (PJL) and TFTP messages that can not be
+  read, are unknown or are not answered, a POST or a query string whose data is ignored, a
+  MongoDB command that is not handled, a hex string of MySQL that can not be decoded, what
+  the emulated code of a client asks for (sockets, files, a port to bind, a function
+  without a hook), and the neighbour lookups of the nl module for a connection. A parse
+  error of a client's bytes is info, its traceback at debug; any other exception there is
+  an error of dionaea, a warning with its traceback. The errors log keeps warnings for a
+  capture that was lost or cut (an upload that is dropped, an emu scan that stops at its
+  limit, a print job that is cut, an MQTT packet above its limit) and dionaea's own
+  problems.
 
 **services**
 

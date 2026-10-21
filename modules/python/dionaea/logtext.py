@@ -14,6 +14,7 @@ This module imports nothing of dionaea (tests/functional/unit).
 """
 
 import logging
+import struct
 import traceback
 
 LIMIT = 256
@@ -45,6 +46,24 @@ def log_traceback(text, lines=TRACEBACK_LINES, limit=LIMIT):
         tail = lines - 1 - head
         rows = rows[:head] + ["... %d lines left out" % (len(rows) - head - tail)] + rows[len(rows) - tail:]
     return "\n".join(log_text(row, limit) for row in rows)
+
+
+PARSE_ERRORS = (ValueError, IndexError, struct.error, UnicodeError, EOFError)
+
+
+def log_unreadable(logger, message, exc, parse_errors=PARSE_ERRORS):
+    """exc came up while dionaea read a message of a client: message and the text of exc.
+
+    A parse error of the client's bytes (an instance of parse_errors) is info, with its
+    traceback at debug; True is returned. Any other exception (AttributeError, TypeError,
+    NameError, KeyError, ...) is an error of dionaea: a warning with its traceback, False.
+    """
+    if isinstance(exc, parse_errors):
+        logger.info("%s: %s", message, log_text(exc))
+        logger.debug("%s", message, exc_info=exc)
+        return True
+    logger.warning("%s, an error of dionaea: %s", message, log_text(exc), exc_info=exc)
+    return False
 
 
 class LogTextFormatter(logging.Formatter):

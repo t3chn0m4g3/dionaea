@@ -468,7 +468,7 @@ class Printerd(connection):
             self.pjl_FSQUERY(arguments)
             return
 
-        logger.warning("unable to find command for '%s'", log_text(line))
+        logger.info("unable to find command for '%s'", log_text(line))
         self.reply("?")
 
     def pjl_ECHO(self, command):
