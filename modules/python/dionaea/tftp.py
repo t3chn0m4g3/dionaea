@@ -756,10 +756,12 @@ class TftpPacketFactory(object):
 
 class TftpServerHandler(TftpSession):
     def __init__ (self, state=None, root=None, localhost=None, remotehost=None, remoteport=None, packet=None,
-                  session_source=None):
+                  session_source=None, service_port=None):
         # the place of the session in SESSIONS (claimed by TftpServer): set before bind,
         # whose error callback can come first, and given back once
         self.session_source = session_source
+        # the port of the TFTP service (69) the events of the session name, see handle_established
+        self.service_port = service_port
         # the source its ERROR replies are counted for in ERRORS (kept after the place is back)
         self.error_source = session_source if session_source is not None else source_key(remotehost)
         self.fileobj = None
@@ -783,6 +785,16 @@ class TftpServerHandler(TftpSession):
         self.buffer = None
         self.timeouts.idle = 3
         self.timeouts.sustain = 120
+
+    def handle_established(self):
+        """The session socket is bound and connected; the core reports the connection
+        (dionaea.connection.udp.connect) right after this. Its local port becomes the port of
+        the service, so the events of the session name 69 as the port the client sent its
+        request to (dst_port of dionaea.json, local_port of the connections table). Only the
+        record changes: the socket keeps its own port, the replies come from it (RFC 1350),
+        and sending takes no more than the address from the record."""
+        if self.service_port:
+            self.local.port = self.service_port
 
     def senderror(self, errorcode):
         """An ERROR reply of the session (file missing, path outside the root, mode, packet):
@@ -1050,7 +1062,8 @@ class TftpServer(TftpSession):
             # the handler gives the place back (also when its constructor fails)
             try:
                 t = TftpServerHandler(state, self.root, self.local.host, self.remote.host,
-                                      self.remote.port, self.packet, session_source=source)
+                                      self.remote.port, self.packet, session_source=source,
+                                      service_port=self.local.port)
             except Exception:
                 # as below: an exception here would close the server socket
                 logger.error("Unable to make the TFTP session of %s:%i", source, self.remote.port, exc_info=True)

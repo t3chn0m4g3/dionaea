@@ -1,0 +1,19 @@
+# This file is part of the dionaea honeypot
+# SPDX-FileCopyrightText: none
+# SPDX-License-Identifier: CC0-1.0
+# tokens of SMB1, SMB2, NTLMSSP and DCERPC
+"\xffSMB"
+"\xfeSMB"
+"NTLMSSP\x00"
+"NT LM 0.12\x00"
+"SMB 2.002\x00"
+"SMB 2.???\x00"
+"\x02NT LM 0.12\x00"
+"IPC$\x00"
+"\\\\PIPE\\"
+"\\srvsvc"
+"\x05\x00\x0b\x03"
+"\x05\x00\x00\x03"
+"\x60\x82"
+"\xa1\x82"
+"\x2b\x06\x01\x04\x01\x82\x37\x02\x02\x0a"

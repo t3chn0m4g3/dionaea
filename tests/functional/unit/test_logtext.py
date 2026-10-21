@@ -41,3 +41,157 @@ def test_none_and_other_objects():
     assert logtext.log_text(None) == "None"
     assert logtext.log_text(None, none="(no url)") == "(no url)"
     assert logtext.log_text(OSError(28, "No space\nleft")) == "[Errno 28] No space?left"
+
+
+# ---- tracebacks: every line as above, at most 40 lines ----
+
+def test_a_traceback_keeps_its_lines_and_each_is_cleaned():
+    text = 'Traceback (most recent call last):\n  File "x.py", line 1, in f\nValueError: a\x1b[31m' + "b" * 300
+    lines = logtext.log_traceback(text).split("\n")
+    assert lines[:2] == ['Traceback (most recent call last):', '  File "x.py", line 1, in f']
+    want = "ValueError: a?[31m" + "b" * 300
+    assert lines[2] == want[:256] + "..."
+    assert len(lines) == 3
+
+
+def test_a_long_traceback_keeps_its_first_and_last_lines():
+    lines = logtext.log_traceback("\n".join("line %d" % i for i in range(1000))).split("\n")
+    assert len(lines) == logtext.TRACEBACK_LINES == 40
+    assert lines[:19] == ["line %d" % i for i in range(19)]
+    assert lines[19] == "... 961 lines left out"
+    assert lines[20:] == ["line %d" % i for i in range(980, 1000)]
+
+
+def test_a_traceback_of_40_lines_stays_whole():
+    text = "\n".join("line %d" % i for i in range(40))
+    assert logtext.log_traceback(text) == text
+
+
+def _record(exc_info=None, stack_info=None):
+    import logging
+    return logging.LogRecord("t", logging.ERROR, __file__, 1, "There was an error", None, exc_info,
+                             sinfo=stack_info)
+
+
+def _raised(message):
+    import sys
+    try:
+        raise ValueError(message)
+    except ValueError:
+        return sys.exc_info()
+
+
+def _printable(lines):
+    return all(0x20 <= ord(c) <= 0x7e for line in lines for c in line)
+
+
+def test_the_formatter_cleans_the_exception_of_a_record():
+    record = _record(_raised("text of a client\n\x1b[2J" + "x" * 1000 + "\n" * 100 + "end"))
+    lines = logtext.LogTextFormatter().format(record).split("\n")
+    assert lines[0] == "There was an error"
+    assert lines[1] == "Traceback (most recent call last):"
+    assert "ValueError: text of a client" in lines
+    assert "?[2J" + "x" * 252 + "..." in lines
+    assert lines[-1] == "end"
+    assert len(lines) == 1 + logtext.TRACEBACK_LINES
+    assert _printable(lines)
+    assert max(len(line) for line in lines) <= logtext.LIMIT + 3
+    # the record keeps what it had, for other handlers
+    assert record.exc_text is None
+
+
+def test_the_formatter_cleans_a_stack_and_a_text_of_an_exception():
+    record = _record(stack_info="Stack (most recent call last):\n  \x00" + "s" * 400)
+    lines = logtext.LogTextFormatter().format(record).split("\n")
+    assert lines == ["There was an error", "Stack (most recent call last):", "  ?" + "s" * 253 + "..."]
+    record = _record()
+    record.exc_text = "Traceback\n\x07bell"
+    assert logtext.LogTextFormatter().format(record).split("\n") == ["There was an error", "Traceback", "?bell"]
+    assert record.exc_text == "Traceback\n\x07bell"
+
+
+def test_the_log_handler_of_dionaea_formats_with_it():
+    """log.py: what goes to the log of the core (dlhfn) has the exception cleaned."""
+    import importlib.util as util
+    import logging
+    import sys
+    import types
+
+    names = [name for name in sys.modules if name == "dionaea" or name.startswith("dionaea.")]
+    saved = {name: sys.modules.pop(name) for name in names}
+    calls = []
+    package = types.ModuleType("dionaea")
+    package.__path__ = [str(ROOT)]
+    core = types.ModuleType("dionaea.core")
+    core.dlhfn = lambda *args: calls.append(args)
+    sys.modules.update({"dionaea": package, "dionaea.core": core})
+    try:
+        log_spec = util.spec_from_file_location("dionaea.log", ROOT / "log.py")
+        log = util.module_from_spec(log_spec)
+        log_spec.loader.exec_module(log)
+        log.new()
+        try:
+            logging.getLogger("unit").error("There was an error", exc_info=_raised("\x1b]0;title\x07" + "y" * 600))
+        finally:
+            log.stop()
+    finally:
+        for name in [n for n in sys.modules if n == "dionaea" or n.startswith("dionaea.")]:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
+    name, level, _path, _line, msg = calls[-1]
+    assert (name, level) == ("unit", logging.ERROR)
+    lines = msg.split("\n")
+    assert lines[0] == "There was an error"
+    assert lines[-1] == ("ValueError: ?]0;title?" + "y" * 600)[:256] + "..."
+    assert _printable(lines)
+
+
+def test_no_service_logs_a_traceback_as_its_message():
+    """A traceback goes to the log as the exception of a record (exc_info), which the formatter
+    cleans, never as the text of a message (traceback.format_exc() / print_exc()). logtext.py is
+    the formatter: it formats a traceback itself for log_exception."""
+    import ast
+
+    found = []
+    for path in sorted(ROOT.rglob("*.py")):
+        if path == ROOT / "logtext.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "traceback"
+                    and node.func.attr in ("format_exc", "print_exc", "format_exception", "print_exception")):
+                found.append("%s:%d" % (path.relative_to(ROOT), node.lineno))
+    assert found == []
+
+
+# ---- an exception of the C code of the python module (module.c traceback()) ----
+
+def test_an_exception_goes_to_the_logger_when_it_has_a_handler(caplog):
+    import logging
+    exc = _raised("handled \x1b[1m")[1]
+    with caplog.at_level(logging.DEBUG, logger="python"):
+        assert logtext.log_exception(exc) is None
+    (record,) = [r for r in caplog.records if r.name == "python"]
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == "There was an error in the Python code"
+    assert record.exc_info[1] is exc
+
+
+def test_without_a_handler_the_text_is_returned_cleaned(monkeypatch, capsys):
+    # before log.new() and after log.stop() no handler takes the record: logging would write it
+    # raw to stderr (lastResort); the text comes back for g_warning of the core instead
+    import logging
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(logging.getLogger("python"), "handlers", [])
+    exc = _raised("at stop\x1b[2J" + "s" * 900 + "\n" * 80 + "last line")[1]
+    text = logtext.log_exception(exc)
+    lines = text.split("\n")
+    assert lines[0] == "There was an error in the Python code"
+    assert lines[1] == "Traceback (most recent call last):"
+    assert lines[-1] == "last line"
+    assert len(lines) == 1 + logtext.TRACEBACK_LINES
+    assert _printable(lines)
+    assert max(len(line) for line in lines) <= logtext.LIMIT + 3
+    assert capsys.readouterr().err == ""

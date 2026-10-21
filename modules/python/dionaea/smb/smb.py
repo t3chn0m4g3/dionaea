@@ -177,7 +177,7 @@ class smbd(connection):
         self.uids = {}
         self.smb_message = None
         self.next_tid = 0x0800
-        self.printer = b'' # spoolss file "queue"
+        self.printer = bytearray() # spoolss file "queue"
 
         self.config = None
         self.server_guid = uuid4().bytes_le
@@ -1069,9 +1069,8 @@ class epmapper(smbd):
     def handle_io_in(self,data):
         try:
             p = DCERPC_Header(data)
-        except:
-            t = traceback.format_exc()
-            smblog.error(t)
+        except Exception:
+            smblog.error("Unable to read the header of a DCERPC packet", exc_info=True)
             return len(data)
 
         if len(data) < p.FragLen:

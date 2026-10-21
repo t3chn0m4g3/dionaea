@@ -553,3 +553,33 @@ def test_a_suback_of_many_filters_has_a_long_remaining_length():
     packet = suback(con)
     assert packet[1:3] == varint(2 + 200)
     assert packet[5:] == bytes(i % 3 for i in range(200))
+
+
+# a packet whose body ends before the fields of its type: CONNECT (its remaining length in two bytes,
+# 0x80 0x00), PUBLISH (QoS 0, 1, 2), PUBREL, SUBSCRIBE (with the flags of 3.1.1 and without)
+@pytest.mark.parametrize("packet", [b"\x10\x80\x00", b"\x30\x01\x00", b"\x32\x01\x00", b"\x34\x01\x00",
+                                    b"\x62\x01\x00", b"\x82\x01\x00", b"\x80\x01\x00"],
+                         ids=["connect", "publish", "publish-qos1", "publish-qos2", "pubrel", "subscribe",
+                              "subscribe-no-flags"])
+def test_a_packet_the_parser_can_not_read_closes_with_one_info_line(packet, caplog):
+    # MQTT 3.1.1 4.8 and 5.0 4.13: a malformed packet closes the network connection; nothing escapes
+    # handle_io_in, the line names the packet type and the client, none of the bytes
+    con = mqtt.mqttd()
+    with caplog.at_level(logging.INFO, logger="mqtt"):
+        rest = feed(con, [packet + PINGREQ])
+    assert rest == b""
+    assert con.closed
+    assert con.sent == []
+    lines = [r for r in caplog.records if r.name == "mqtt" and r.levelno >= logging.INFO]
+    assert len(lines) == 1, [r.getMessage() for r in lines]
+    assert lines[0].levelno == logging.INFO
+    assert "malformed MQTT packet (type %d)" % (packet[0] >> 4) in lines[0].getMessage()
+    assert "198.51.100.9:50123" in lines[0].getMessage()
+
+
+def test_a_packet_the_parser_can_not_read_ends_the_packets_after_it():
+    con = mqtt.mqttd()
+    rest = feed(con, [connect_packet() + b"\x30\x01\x00" + publish_packet()])
+    assert rest == b""
+    assert con.closed
+    assert names() == ["connect"]

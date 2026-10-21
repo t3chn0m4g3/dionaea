@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: none
+# SPDX-License-Identifier: CC0-1.0
+#
+# A short run of every fuzz target (tests/fuzz/README.md), 5 minutes each, by hand
+# or once a week; no check of a pull request. The corpus of a run and its failing
+# inputs are kept as an artifact.
+name: "Fuzz"
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { stage: c, target: bistream }
+          - { stage: c, target: processor }
+          - { stage: c, target: profile }
+          - { stage: c, target: shellcode }
+          - { stage: python, target: smb }
+          - { stage: python, target: mqtt }
+          - { stage: python, target: mongo }
+          - { stage: python, target: http_multipart }
+          - { stage: python, target: emu_scripts }
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build the environment
+        run: docker build --target ${{ matrix.stage }} -t dionaea-fuzz-${{ matrix.stage }} tests/fuzz
+
+      - name: Build the C targets
+        if: matrix.stage == 'c'
+        run: |
+          mkdir -p build-fuzz
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/build-fuzz":/out dionaea-fuzz-c /src/tests/fuzz/c/build.sh
+
+      - name: Run ${{ matrix.target }} for 5 minutes
+        run: |
+          mkdir -p build-fuzz
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/build-fuzz":/out dionaea-fuzz-${{ matrix.stage }} \
+            /src/tests/fuzz/${{ matrix.stage }}/run.sh ${{ matrix.target }} 300 /out
+
+      - name: Failing inputs
+        run: |
+          found=$(find build-fuzz/artifacts build-fuzz/failures -type f 2>/dev/null | grep -v '\.log$' || true)
+          if [ -n "$found" ]; then
+            echo "$found"
+            exit 1
+          fi
+
+      - name: Keep the corpus and the failing inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            build-fuzz/corpus
+            build-fuzz/artifacts
+            build-fuzz/failures
+          if-no-files-found: ignore

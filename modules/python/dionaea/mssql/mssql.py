@@ -6,7 +6,6 @@
 
 from dionaea.core import incident, connection
 
-import traceback
 import logging
 import tempfile
 
@@ -65,9 +64,8 @@ class mssqld(connection):
                     # Command spans multiple packets TDS_ things
                     # this is not the last packet
                     continue
-            except:
-                t = traceback.format_exc()
-                logger.error(t)
+            except Exception:
+                logger.error("Unable to read the header of a TDS packet", exc_info=True)
                 return l
 
             if self.pendingPacketType == TDS_TYPES_PRE_LOGIN:

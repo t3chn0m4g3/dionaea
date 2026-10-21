@@ -330,13 +330,6 @@ int32_t	env_w32_hook_listen(struct emu_env *env, struct emu_env_hook *hook)
 	return 0;
 }
 
-#define emu_assert(emu, x) \
-if (x) \
-{ \
-	printf("Insane value at %s:%i\n", __FILE__, __LINE__); \
-}
-
-
 int32_t	env_w32_hook_recv(struct emu_env *env, struct emu_env_hook *hook)
 {
 	logDebug(env->emu, "Hook me Captain Cook!\n");
@@ -368,15 +361,8 @@ int recv(
 	uint32_t flags;
 	POP_DWORD(c, &flags);
 
-	uint32_t xlen = len;
-	if (xlen < 0 || xlen > 4096)
-	{
-
-		printf("BUG\n");
-		xlen = 4096;
-	}
-
-	emu_assert(env->emu, xlen < 0 || xlen > 4096);
+	/* the emulated program gets at most 4096 bytes */
+	uint32_t xlen = len > 4096 ? 4096 : len;
 
 	char *buffer = (char *)calloc(1, (size_t)xlen + 1);
 
@@ -403,9 +389,9 @@ int recv(
 
 	
 	logDebug(env->emu, "recv(%i, 0x%08x, %i) == %i \n", s, buf, xlen, (int32_t)len);
-	/* the buffer holds xlen bytes, at most 4096 */
+	/* the bytes the hook returned, at most the xlen bytes of the buffer */
 	if ((int32_t)returnvalue > 0)
-		emu_memory_write_block(emu_memory_get(env->emu), buf, buffer, xlen);
+		emu_memory_write_block(emu_memory_get(env->emu), buf, buffer, returnvalue < xlen ? returnvalue : xlen);
 	free(buffer);
 
 	if (env->profile != NULL)

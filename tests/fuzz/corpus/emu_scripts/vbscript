@@ -1,0 +1,5 @@
+Set http = CreateObject("Msxml2.XMLHTTP")
+u = "http://example.org/x.bin"
+http.Open "GET", u, False
+' http.Open "GET", "http://example.org/no"
+rem x

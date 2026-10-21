@@ -8,8 +8,73 @@
 Changelog
 =========
 
-0.12.1 - (`master`_)
+0.12.2 - (`master`_)
 --------------------
+
+**logs**
+
+* A traceback in the logs has printable lines: every byte outside 0x20..0x7e is a ``?``,
+  a line has at most 256 characters, and a traceback keeps at most 40 lines (its first 19,
+  one line with the number left out, its last 20). This holds for every exception the
+  services and the binding log, and for an exception the Python code leaves to the core,
+  which is logged at warning through the same formatter, also when no handler of logging
+  is left (at the stop of dionaea).
+* The info line of an FTP script of the emulated shell names user, host, port, path and
+  file; the download offer has the full url.
+* An FTP script of the emulated shell takes the host and the port from the line after a
+  lone ``open``. A port that is no number of 1 to 65535 gives one more info line and no
+  download offer.
+* The errors log of the sample configuration (``conf/dionaea.cfg.cmake``) has
+  ``errors.levels=warning,error,critical``: a record of Python's logging at error is a
+  critical one. It is still written line by line.
+
+**services**
+
+* MQTT: a packet whose fields the packet classes can not read closes the connection with
+  one info line, which names the packet type and the client.
+* SMB: the fragments of a print job are kept for that job only. A print job above
+  ``max_upload_size`` is dropped with one warning; its other fragments are ignored until
+  the next job. A fragment is added in the time of its own length. NetrShareEnum of a
+  level other than 0, 1 and 502 gets no answer.
+* HTTP: a part of a multipart POST whose headers can not be read is left out with one
+  info line; the other files of the POST are stored. A Content-Type of the request whose
+  parameters can not be read gives no files and one info line.
+* FTP: the data connection reads and leaves the data that comes after a dropped upload,
+  until it closes, and on the connection of a LIST or RETR.
+* TFTP: the connection of a TFTP session has the port of the service, 69, as its local
+  port: ``dst_port`` in ``dionaea.json`` and ``local_port`` in the ``connections`` table.
+  The answers still come from the port of the session.
+
+**emu and libemu**
+
+* In the JSON of a profile, a byte of a string argument that is not part of a valid
+  UTF-8 sequence is written as ``\u00NN``; valid UTF-8 stays as it is. A byte argument
+  keeps the bytes 0x20..0x7e as they are in every locale.
+* The byte arguments of one profile hold at most 8 MiB together; an argument that does
+  not fit what is left is recorded with 0 bytes. The emulated calls are not changed.
+* The emulated ROL, ROR, RCL and RCR give the rotation of x86 for every count and set
+  CF and OF as x86 does; SF, ZF, AF and PF stay.
+* The emulated recv writes the bytes its hook returned, at most 4096, and prints nothing;
+  _lwrite copies up to 1 MiB per call, as fwrite and WriteFile.
+
+**core**
+
+* The streamdumper writes a read of any size through a buffer of 4 KiB; the dump is the
+  same. It keeps the bytes 0x20..0x7e (other than ``'`` and ``\``) as they are in every
+  locale.
+
+**tests**
+
+* ``tests/fuzz``: libFuzzer targets of bistream, the processor entry, the profile JSON and
+  the shellcode scan, and atheris targets of the SMB, MQTT, MongoDB and HTTP multipart
+  parsers and the emu_scripts patterns, with seeds, a replay without atheris and coverage
+  builds; ``.github/workflows/fuzz.yml`` runs each target for 5 minutes, weekly and by hand.
+* ``tests/libemu/test_rotate.c`` checks the rotations and their flags on registers and
+  memory; ``test_w32_hooks.c`` the byte budget of a profile, recv and _lwrite.
+* The host check ``45-binding`` checks the traceback of an exception that reaches the core.
+
+0.12.1 - (2026-10-20)
+---------------------
 
 **libemu**
 

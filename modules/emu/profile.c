@@ -7,7 +7,6 @@
  */
 
 #include <stdint.h>
-#include <ctype.h>
 
 #include <emu/emu.h>
 #include <emu/emu_memory.h>
@@ -88,7 +87,15 @@ static int json_escape_str(GString *target, char *str)
 			start_offset = ++pos;
 			break;
 		default:
-			if( c < ' ' )
+			/* a valid UTF-8 sequence as it is; the Python ihandlers read the JSON as UTF-8 */
+			if( c >= 0x80 && g_utf8_skip[c] > 1 && g_utf8_skip[c] <= 4 &&
+				g_utf8_validate(str + pos, g_utf8_skip[c], NULL) )
+			{
+				pos += g_utf8_skip[c];
+				break;
+			}
+			/* a control character, or a byte of no valid sequence: \u00NN */
+			if( c < ' ' || c >= 0x80 )
 			{
 				if( pos - start_offset > 0 )
 					g_string_append_len(target, str + start_offset, pos - start_offset);
@@ -103,9 +110,10 @@ static int json_escape_str(GString *target, char *str)
 	return 0;
 }
 
-/* the size bytes of str, nothing for size 0: a printable byte other than '"'
- * and '\' as it is, every other byte as \\xNN, which a JSON reader takes as
- * the text \xNN (NN: two hex digits) */
+/* the size bytes of str, nothing for size 0: a byte of 0x20..0x7e other than
+ * '"' and '\' as it is, every other byte as \\xNN, which a JSON reader takes
+ * as the text \xNN (NN: two hex digits); in every locale (isprint() of a
+ * locale of one byte per character takes bytes above 0x7e as well) */
 static int json_escape_bytea(GString *target, const unsigned char *str, size_t size)
 {
 	size_t start_offset = 0;
@@ -113,7 +121,7 @@ static int json_escape_bytea(GString *target, const unsigned char *str, size_t s
 	{
 		unsigned char c = str[pos];
 
-		if( isprint(c) && c != '"' && c != '\\')
+		if( c >= 0x20 && c <= 0x7e && c != '"' && c != '\\' )
 			continue;
 
 		if( pos > start_offset )

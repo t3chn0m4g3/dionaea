@@ -142,6 +142,27 @@ def test_http_multipart_bare_lf_body_is_stored(dionaea_host, binaries_dir):
     assert _wait_for_binary(binaries_dir, md5).read_bytes() == payload
 
 
+def test_http_multipart_part_with_bad_headers_is_skipped(dionaea_host, binaries_dir, data_dir):
+    # a part whose headers the email package can not read: the other files of the POST are stored
+    token = uuid.uuid4().hex
+    first, second = ("MZ before the bad part %s" % token).encode(), ("MZ after the bad part %s" % token).encode()
+    boundary = "smoke" + token
+    body = (
+        _file_part(boundary, first)
+        + ("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename*\r\n\r\n" % boundary).encode()
+        + b"MZ not stored " + token.encode() + b"\r\n"
+        + _file_part(boundary, second)
+        + ("--%s--\r\n" % boundary).encode()
+    )
+    response, _ = _post_multipart(dionaea_host, body, boundary)
+    assert response.startswith(b"HTTP/1."), response[:100]
+    for content in (first, second):
+        assert _wait_for_binary(binaries_dir, hashlib.md5(content).hexdigest()).read_bytes() == content
+    # one info line, no warning (dionaea-errors.log is written per line)
+    errors = (data_dir / "dionaea-errors.log").read_text(errors="replace")
+    assert "Unable to parse the POST data" not in errors
+
+
 def test_http_multipart_nested_mixed_files_are_stored(dionaea_host, binaries_dir):
     # several files of one field in a multipart/mixed part
     token = uuid.uuid4().hex

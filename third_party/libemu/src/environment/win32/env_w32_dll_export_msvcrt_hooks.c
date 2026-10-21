@@ -228,8 +228,8 @@ size_t fwrite( const void *buffer, size_t size, size_t count, FILE *stream );
 	uint32_t count;
 	MEM_DWORD_READ(c, (c->reg[esp]+8), &count);
 
-	/* size * count in 64 bits, at most 1 MiB per call as for _lwrite: a
-	 * longer write writes nothing and returns 0 */
+	/* size * count in 64 bits, at most 1 MiB per call, as WriteFile and
+	 * _lwrite: a longer write writes nothing and returns 0 */
 	uint64_t total = (uint64_t)size * count;
 	uint32_t len = total <= 1*1024*1024 ? (uint32_t)total : 0;
 	unsigned char *buffer = calloc(1, (size_t)len + 1);

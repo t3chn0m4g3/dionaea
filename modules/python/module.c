@@ -9,7 +9,6 @@
 #include "config.h"
 
 #include <Python.h>
-#include <frameobject.h> // PyFrame_GetCode, PyFrame_GetLineNumber
 #include <errcode.h> // E_EOF, not part of Python.h
 #include <glib.h>
 #include <stdio.h>
@@ -80,11 +79,6 @@ static struct python_runtime
 	struct termios read_termios;
 	struct termios poll_termios;
 	struct ihandler *mkshell_ihandler;
-	struct
-	{
-		PyObject *linecache;
-		PyObject *getline;
-	}traceback;
 
 	struct
 	{
@@ -429,12 +423,6 @@ static bool new(struct dionaea *dionaea)
 	PyGILState_STATE gil_state = PyGILState_Ensure();
 
 	runtime.sys_path = g_string_new(DIONAEA_PYTHON_SITELIBDIR);
-
-	runtime.traceback.linecache = PyImport_ImportModule("linecache");
-	if( runtime.traceback.linecache != NULL )
-		runtime.traceback.getline = PyObject_GetAttrString(runtime.traceback.linecache, "getline");
-	if( runtime.traceback.getline == NULL )
-		PyErr_Clear();
 
 	PyRun_SimpleString("import sys");
 	char relpath[1024];
@@ -1139,64 +1127,15 @@ void python_processor_bistream_free(void *data)
 {
 }
 
-static char *pyobjectstring(PyObject *obj)
-{
-	PyObject *pyobjectstr;
-	PyGILState_STATE gil_state = PyGILState_Ensure();
-
-	if( obj == NULL ) {
-	PyGILState_Release(gil_state);
-		return g_strdup("<null>");
-	}
-
-	if( obj == Py_None ) {
-	PyGILState_Release(gil_state);
-		return g_strdup("None");
-	}
-
-	if( PyType_Check(obj) ) {
-	PyGILState_Release(gil_state);
-		return g_strdup(((PyTypeObject* ) obj)->tp_name);
-	}
-
-	if( PyUnicode_Check(obj) ) {
-		pyobjectstr = obj;
-	} else {
-		if( (pyobjectstr = PyObject_Repr(obj)) != NULL ) {
-			if( PyUnicode_Check(pyobjectstr) == 0 ) {
-				Py_XDECREF(pyobjectstr);
-				PyGILState_Release(gil_state);
-				return g_strdup("<!utf8>");
-			}
-		} else {
-		PyGILState_Release(gil_state);
-			return g_strdup("<!repr>");
-		}
-	}
-
-	Py_ssize_t pysize;
-	wchar_t *str = PyUnicode_AsWideCharString(pyobjectstr, &pysize);
-
-	if( pyobjectstr != obj )
-		Py_DECREF(pyobjectstr);
-
-	// measure size
-	size_t csize = wcstombs(0, str, 0);
-	if( csize == (size_t) -1 ) {
-	PyGILState_Release(gil_state);
-		return g_strdup("<!wcstombs>");
-	}
-
-	char *cstr = (char *) g_malloc(csize + 1);
-
-	// convert
-	wcstombs(cstr, str, csize + 1);
-	PyMem_Free(str);
-	PyGILState_Release(gil_state);
-	return cstr;
-}
-
-
+/*
+ * An exception the Python code left behind (a callback of the binding, new(), start(), stop(),
+ * a module of the configuration) goes to dionaea.logtext.log_exception: with a handler of
+ * logging it is logged there at warning with its traceback (exc_info), so the formatter of the
+ * log handler of dionaea (dionaea/log.py, dionaea/logtext.py) writes it as printable lines of
+ * at most 256 characters, at most 40 of them. Without a handler (before dionaea.log new(),
+ * after its stop()) log_exception returns that text and it goes to g_warning here, never raw
+ * to stderr. The exception is cleared.
+ */
 void traceback(void)
 {
 	PyGILState_STATE gil_state = PyGILState_Ensure();
@@ -1206,115 +1145,46 @@ void traceback(void)
 		return;
 	}
 
-	PyObject *type;
-	PyObject *value;
-	PyObject *traceback;
-	PyErr_Fetch(&type, &value, &traceback);
-
-	char *type_string = NULL;
-	char *value_string = NULL;
-
-	if( type != NULL )
-		type_string = pyobjectstring(type);
-	else
-		type_string	= g_strdup("unknown type");
-
-	if( value != NULL )
-		value_string = pyobjectstring(value);
-	else
-		value_string = g_strdup("unknown value");
-
-	g_warning("%s at %s", type_string, value_string);
-
-	g_free(type_string);
-	g_free(value_string);
-
-	if( traceback == NULL )
-	{
-		Py_XDECREF(type);
-		Py_XDECREF(value);
-		PyGILState_Release(gil_state);
-		g_warning("traceback is NULL, good luck!");
-		return;
-	}
-
-	/*
-	 * Walk the traceback objects (tb_frame, tb_lineno, tb_next) and log
-	 * the innermost frame first, as before. traceback.extract_tb() returns
-	 * FrameSummary objects, not tuples, so they must not be read with
-	 * PyTuple_GET_ITEM.
-	 */
-	GPtrArray *lines = g_ptr_array_new_with_free_func(g_free);
-	PyObject *tb = traceback;
-	Py_INCREF(tb);
-	while( tb != NULL && tb != Py_None && lines->len < 2 * 256 )
-	{
-		PyObject *frame = PyObject_GetAttrString(tb, "tb_frame");
-		if( frame == NULL || !PyFrame_Check(frame) )
-		{
-			Py_XDECREF(frame);
-			PyErr_Clear();
-			break;
-		}
-
-		int line_no = -1;
-		PyObject *tb_lineno = PyObject_GetAttrString(tb, "tb_lineno");
-		if( tb_lineno != NULL && PyLong_Check(tb_lineno) )
-			line_no = (int)PyLong_AsLong(tb_lineno);
-		Py_XDECREF(tb_lineno);
-		PyErr_Clear();
-		if( line_no < 0 )
-			line_no = PyFrame_GetLineNumber((PyFrameObject *)frame);
-
-		PyCodeObject *code = PyFrame_GetCode((PyFrameObject *)frame);
-		PyObject *filename = PyObject_GetAttrString((PyObject *)code, "co_filename");
-		PyObject *function_name = PyObject_GetAttrString((PyObject *)code, "co_name");
-		PyErr_Clear();
-
-		char *filename_string = pyobjectstring(filename);
-		char *function_string = pyobjectstring(function_name);
-		char *text = NULL;
-		if( runtime.traceback.getline != NULL && filename != NULL )
-		{
-			PyObject *line = PyObject_CallFunction(runtime.traceback.getline, "Oi", filename, line_no);
-			if( line != NULL && PyUnicode_Check(line) )
-			{
-				const char *utf8 = PyUnicode_AsUTF8(line);
-				if( utf8 != NULL )
-					text = g_strstrip(g_strdup(utf8));
-			}
-			Py_XDECREF(line);
-			PyErr_Clear();
-		}
-
-		g_ptr_array_add(lines, g_strdup_printf("%s:%i in %s", filename_string, line_no, function_string));
-		g_ptr_array_add(lines, g_strdup_printf("\t %s", text != NULL ? text : ""));
-
-		g_free(filename_string);
-		g_free(function_string);
-		g_free(text);
-		Py_XDECREF(filename);
-		Py_XDECREF(function_name);
-		Py_DECREF(code);
-		Py_DECREF(frame);
-
-		PyObject *next = PyObject_GetAttrString(tb, "tb_next");
-		PyErr_Clear();
-		Py_DECREF(tb);
-		tb = next;
-	}
-	Py_XDECREF(tb);
-
-	for( guint k = lines->len; k >= 2; k -= 2 )
-	{
-		g_warning("%s", (char *)g_ptr_array_index(lines, k-2));
-		g_warning("%s", (char *)g_ptr_array_index(lines, k-1));
-	}
-	g_ptr_array_free(lines, TRUE);
-
+#if PY_VERSION_HEX >= 0x030C0000
+	PyObject *exc = PyErr_GetRaisedException();
+#else
+	PyObject *type = NULL;
+	PyObject *exc = NULL;
+	PyObject *tb = NULL;
+	PyErr_Fetch(&type, &exc, &tb);
+	PyErr_NormalizeException(&type, &exc, &tb);
+	if( exc != NULL && tb != NULL )
+		PyException_SetTraceback(exc, tb);
 	Py_XDECREF(type);
-	Py_XDECREF(value);
-	Py_XDECREF(traceback);
+	Py_XDECREF(tb);
+#endif
+
+	bool written = false;
+	PyObject *logtext = exc != NULL ? PyImport_ImportModule("dionaea.logtext") : NULL;
+	PyObject *text = logtext != NULL ? PyObject_CallMethod(logtext, "log_exception", "O", exc) : NULL;
+	if( text != NULL && !PyErr_Occurred() )
+	{
+		if( text == Py_None )
+			written = true;
+		else if( PyUnicode_Check(text) )
+		{
+			const char *utf8 = PyUnicode_AsUTF8(text);
+			if( utf8 != NULL )
+			{
+				/* printable ASCII and line breaks only (log_traceback) */
+				g_warning("%s", utf8);
+				written = true;
+			}
+		}
+	}
+	Py_XDECREF(text);
+	Py_XDECREF(logtext);
+	if( PyErr_Occurred() )
+		PyErr_Clear();
+	if( !written )
+		g_warning("There was an error in the Python code, it could not be written");
+
+	Py_XDECREF(exc);
 	PyGILState_Release(gil_state);
 }
 

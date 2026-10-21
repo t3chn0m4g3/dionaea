@@ -7,7 +7,9 @@
  * The buffering of the log files (src/log.c). A file whose levels have neither debug nor
  * info (T-Pot's errors.levels=warning,error) gets few lines and is written per line, so
  * a warning is in the file at once, not at the stop; a file with info or debug keeps the
- * buffer of stdio.
+ * buffer of stdio. A record of Python's logging at error is a glib critical (log_wrap of
+ * modules/python/module.c): a file of warning,error,critical gets it at once, one of
+ * warning,error does not get it.
  */
 #include <glib.h>
 #include <glib/gstdio.h>
@@ -88,6 +90,20 @@ static void after_a_hup_too(void)
 	close_log(o);
 }
 
+static void a_critical_is_written_at_once(void)
+{
+	struct opened *o = open_log("warning,error,critical");
+	logger_file_log("python /dionaea/binding.pyx:1", G_LOG_LEVEL_CRITICAL, "There was an error", o->data);
+	g_assert_cmpint(size_on_disk(o), >, 0);
+	close_log(o);
+
+	o = open_log("warning,error");
+	logger_file_log("python /dionaea/binding.pyx:1", G_LOG_LEVEL_CRITICAL, "There was an error", o->data);
+	g_assert_true(logger_file_flush(o->logger, o->data));
+	g_assert_cmpint(size_on_disk(o), ==, 0);
+	close_log(o);
+}
+
 static void a_file_with_info_keeps_its_buffer(void)
 {
 	const char *levels[] = { "info,warning,error", "all", "debug,warning", "all,-debug" };
@@ -107,5 +123,6 @@ int main(int argc, char **argv)
 	g_test_add_func("/log/warning-at-once", a_warning_is_written_at_once);
 	g_test_add_func("/log/warning-at-once-after-hup", after_a_hup_too);
 	g_test_add_func("/log/info-keeps-buffer", a_file_with_info_keeps_its_buffer);
+	g_test_add_func("/log/critical-at-once", a_critical_is_written_at_once);
 	return g_test_run();
 }

@@ -4,7 +4,7 @@
 #
 # SPDX-License-Identifier: CC0-1.0
 
-"""dionaea-errors.log (errors.levels=warning,error, the log file of T-Pot) is written per
+"""dionaea-errors.log (errors.levels=warning,error,critical, the log file of T-Pot) is written per
 line: a warning is in the file within a second while dionaea runs, not only at the stop.
 dionaea.log (info and above) keeps the buffer of stdio."""
 

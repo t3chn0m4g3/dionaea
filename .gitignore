@@ -141,3 +141,7 @@ cython_debug/
 ### Doc
 /doc/build/
 /doc/api/build/
+
+### fuzz targets (tests/fuzz/README.md)
+build-fuzz/
+build-cov/

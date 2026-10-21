@@ -60,3 +60,30 @@ def test_tftp_still_answers_after_requests(dionaea_ip):
     # the server socket keeps working after the handlers of earlier requests
     reply, _ = _request(dionaea_ip, _rrq(b"functional-test.txt"))
     assert struct.unpack("!HH", reply[:4]) == (3, 1)
+
+
+def test_tftp_rrq_is_logged_with_the_port_of_the_service(dionaea_ip, my_ip, wait_for_event, wait_for_rows):
+    # the session answers from a port of its own (RFC 1350), its events name the service port 69:
+    # dst_port of dionaea.json and local_port of the connections table
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(10)
+        sock.bind(("", 0))
+        src_port = sock.getsockname()[1]
+        sock.sendto(_rrq(b"functional-test.txt"), (dionaea_ip, 69))
+        reply, peer = sock.recvfrom(4096)
+        assert struct.unpack("!HH", reply[:4]) == (3, 1), reply
+        assert peer[1] != 69
+        # the last block: the session ends with this ACK (dionaea.json writes the event then)
+        sock.sendto(struct.pack("!HH", 4, 1), peer)
+
+    event = wait_for_event(lambda e: e.get("connection", {}).get("protocol") == "TftpServerHandler"
+                           and e.get("src_port") == src_port)
+    assert event["dst_port"] == 69, event
+    assert event["dst_ip"] == dionaea_ip, event
+    assert event["src_ip"] == my_ip, event
+    assert event["connection"]["transport"] == "udp", event
+    assert isinstance(event["dst_port"], int)
+
+    rows = wait_for_rows("SELECT local_host, local_port, remote_host FROM connections "
+                         "WHERE connection_protocol = 'TftpServerHandler' AND remote_port = ?", (src_port,))
+    assert [(r["local_host"], r["local_port"], r["remote_host"]) for r in rows] == [(dionaea_ip, 69, my_ip)]

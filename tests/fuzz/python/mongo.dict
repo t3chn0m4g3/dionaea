@@ -1,0 +1,21 @@
+# This file is part of the dionaea honeypot
+# SPDX-FileCopyrightText: none
+# SPDX-License-Identifier: CC0-1.0
+# tokens of the MongoDB wire protocol and BSON
+"\xd4\x07\x00\x00"
+"\xda\x07\x00\x00"
+"admin.$cmd\x00"
+"admin\x00"
+"test\x00"
+"isMaster\x00"
+"buildinfo\x00"
+"buildInfo\x00"
+"getLog\x00"
+"whatsmyuri\x00"
+"replSetGetStatus\x00"
+"\x10"
+"\x02"
+"\x03"
+"\x04"
+"\x09"
+"\x13"

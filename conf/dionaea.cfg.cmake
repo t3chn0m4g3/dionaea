@@ -40,7 +40,8 @@ default.levels=all
 default.domains=*
 
 errors.filename=@DIONAEA_LOGDIR@/dionaea-errors.log
-errors.levels=warning,error
+# critical: a record of Python's logging at error (the services, the binding)
+errors.levels=warning,error,critical
 errors.domains=*
 
 [processor.filter_emu]

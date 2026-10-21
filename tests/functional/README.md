@@ -89,13 +89,14 @@ above) so the startup can be checked.
   SQLite retains all 1001, and the connection continues to answer.
 - `unit/test_log_json_credentials.py`: credential limits for SMB, FTP, MySQL
   and MSSQL, both JSON output forms, and independent connection records.
-- `test_errors_log_live.py`: `dionaea-errors.log` (`warning,error`) is written per line: the
+- `test_errors_log_live.py`: `dionaea-errors.log` (`warning,error,critical`) is written per line: the
   warning of an SMB1 message shorter than its header is in it within 1 s while dionaea runs.
 - `test_smoke.py`: service ports, FTP login in `dionaea.json`, HTTP upload. The
   multipart tests (`test_http_multipart_*`: a file part is stored, a part with a
   Content-Transfer-Encoding is stored as sent, a line that starts with the boundary inside the
   data keeps the sample whole, a bare-LF body and the files of a nested multipart/mixed part
-  are stored, 900,000 empty parts, bare-LF or nested, are refused fast, a request over 32 MiB
+  are stored, a part whose headers can not be read is left out and the other files of the
+  POST are stored without a warning, 900,000 empty parts, bare-LF or nested, are refused fast, a request over 32 MiB
   gets 413 and leaves no sample and no temporary file, nor does a client that leaves in the
   middle of its body) need an HTTP service
   that answers; `-k "not multipart"` leaves them all out (not only the upload test), e.g.
@@ -114,7 +115,9 @@ above) so the startup can be checked.
   whose `messageLength` is below its own 16 bytes or above 64 KiB, and a query whose
   document is no BSON, end the connection (info) and the service goes on.
 - `test_tftp.py`: TFTP read request for a file in `roots/tftp` (DATA), for a
-  missing file and for a path outside the root (ERROR). run.sh puts the file there.
+  missing file and for a path outside the root (ERROR). run.sh puts the file there. The
+  DATA comes from the port of the session, its connection is in `dionaea.json` (`dst_port`)
+  and in the `connections` table (`local_port`) with port 69.
 - `test_ftp.py`: data connections in active (`PORT` + `LIST`) and passive mode
   (`LIST`, `RETR`, `STOR` one after the other), transfer commands without a data
   connection (425), malformed commands (`PORT x`, `USER` without argument: 501, the
@@ -213,7 +216,10 @@ above) so the startup can be checked.
     raised).
   - `test_http_multipart.py`: the multipart parser on raw bytes: delimiters only as whole
     lines, CRLF and bare-LF bodies, nested multipart/mixed parts up to three levels, the
-    field limit over all levels, linear time.
+    field limit over all levels, a body read in the time of its own length; a part whose
+    headers the email package can not read is left out with one info line (also in a nested
+    part), a Content-Type of the request whose parameters it can not read gives no files and
+    one info line.
   - `test_http_post_framing.py`: `http.py` with stand-ins of the core: a multipart body ends
     at its closing delimiter line (CRLF or LF, in any read sizes) or at the Content-Length,
     a quoted boundary is found, `--boundary--` inside a line of a file does not end it.

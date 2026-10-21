@@ -8,7 +8,9 @@ import ast
 import email.message
 import email.parser
 import email.policy
+import importlib.util
 import io
+import logging
 import os
 from pathlib import Path
 import re
@@ -32,7 +34,11 @@ def load_parser():
         return False
 
     nodes = [node for node in tree.body if wanted(node)]
-    namespace = dict(email=email, re=re, Optional=Optional)
+    spec = importlib.util.spec_from_file_location("logtext_of_http", root / "logtext.py")
+    logtext = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(logtext)
+    namespace = dict(email=email, re=re, Optional=Optional, logger=logging.getLogger("http"),
+                     log_text=logtext.log_text)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
     return namespace["iter_uploaded_files"]
 
@@ -219,3 +225,63 @@ def test_32_mib_three_levels_deep_is_linear():
     result, seconds = _timed(nest(3, content), 10)
     assert result == [("files", "deep.bin", content)]
     assert seconds < 2, seconds
+
+
+# a part whose headers the email package can not read (IndexError of get_parameter for a
+# parameter with "*" and no value, in Content-Disposition or Content-Type) is skipped with one
+# info line; the other parts of the body are read
+BAD_PART_HEADERS = [
+    b'Content-Disposition: form-data; name="file"; filename*\r\n',
+    b'Content-Disposition: form-data; name="file"; filename="bad.bin"\r\nContent-Type: text/plain; charset*\r\n',
+]
+
+
+@pytest.mark.parametrize("headers", BAD_PART_HEADERS)
+def test_a_part_whose_headers_can_not_be_read_is_skipped(headers, caplog):
+    bad = b"--" + BOUNDARY + b"\r\n" + headers + b"\r\nnot stored\r\n"
+    body = part(b"MZ first") + bad + part(b"MZ second\x00\xff") + b"--" + BOUNDARY + b"--\r\n"
+    with caplog.at_level(logging.DEBUG, logger="http"):
+        files = uploaded(body, limit=10)
+    assert files == [("file", "sample.bin", b"MZ first"), ("file", "sample.bin", b"MZ second\x00\xff")]
+    records = [r for r in caplog.records if r.name == "http"]
+    assert [(r.levelno, r.exc_info) for r in records] == [(logging.INFO, None)]
+    assert records[0].getMessage().startswith("Skipping a part of a multipart body, its headers can not be read")
+
+
+def test_a_nested_part_whose_headers_can_not_be_read_is_skipped(caplog):
+    inner = b"inner-boundary"
+    body = (b"--" + BOUNDARY + b'\r\nContent-Disposition: form-data; name="files"\r\n'
+            b"Content-Type: multipart/mixed; boundary=inner-boundary\r\n\r\n"
+            b"--" + inner + b'\r\nContent-Disposition: file; filename="one.exe"\r\n\r\nMZ one\r\n'
+            b"--" + inner + b"\r\nContent-Disposition: file; filename*\r\n\r\nMZ bad\r\n"
+            b"--" + inner + b'\r\nContent-Disposition: file; filename="two.exe"\r\n\r\nMZ two\r\n'
+            b"--" + inner + b"--\r\n--" + BOUNDARY + b"--\r\n")
+    with caplog.at_level(logging.DEBUG, logger="http"):
+        files = uploaded(body, limit=10)
+    assert files == [("files", "one.exe", b"MZ one"), ("files", "two.exe", b"MZ two")]
+    assert [r.levelno for r in caplog.records if r.name == "http"] == [logging.INFO]
+
+
+def test_the_info_line_of_a_skipped_part_is_printable_and_bounded(caplog):
+    headers = b"Content-Disposition: form-data; name=\"\x1b[31m" + b"n" * 600 + b"\"; filename*\r\n"
+    body = b"--" + BOUNDARY + b"\r\n" + headers + b"\r\nx\r\n--" + BOUNDARY + b"--\r\n"
+    with caplog.at_level(logging.DEBUG, logger="http"):
+        assert uploaded(body, limit=10) == []
+    (record,) = [r for r in caplog.records if r.name == "http"]
+    message = record.getMessage()
+    assert all(0x20 <= ord(c) <= 0x7e for c in message)
+    assert len(message) < 400
+
+
+def test_a_content_type_whose_parameters_can_not_be_read_gives_no_files(monkeypatch, caplog):
+    # Python 3.12 raises TypeError in email.utils.decode_params for some RFC 2231 continuations
+    # of the Content-Type of the request (3.14 does not): no files, one info line
+    def raising(self, failobj=None):
+        raise TypeError("'<' not supported between instances of 'NoneType' and 'int'")
+
+    monkeypatch.setattr(email.message.Message, "get_boundary", raising)
+    with caplog.at_level(logging.DEBUG, logger="http"):
+        assert uploaded(part(b"MZ") + b"--" + BOUNDARY + b"--\r\n") == []
+    records = [r for r in caplog.records if r.name == "http"]
+    assert [(r.levelno, r.exc_info) for r in records] == [(logging.INFO, None)]
+    assert records[0].getMessage().startswith("Ignoring the POST data, its Content-Type can not be read")

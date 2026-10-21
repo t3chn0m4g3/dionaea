@@ -12,14 +12,18 @@
  * makes it (modules/emu/profile.c): msvcrt fwrite, kernel32 WriteFile and
  * _lwrite, ws2_32 send, sendto and recv.
  *
- *  - fwrite and WriteFile copy at most 1 MiB per call. size * count of
- *    fwrite is computed in 64 bits. A longer write writes nothing: fwrite
- *    returns 0, WriteFile returns 0 with 0 bytes written, and the profile
- *    holds an empty byte argument.
+ *  - fwrite, WriteFile and _lwrite copy at most 1 MiB per call. size *
+ *    count of fwrite is computed in 64 bits. A longer write writes nothing:
+ *    fwrite returns 0, WriteFile returns 0 with 0 bytes written, _lwrite
+ *    returns -1 (HFILE_ERROR), and the profile holds an empty byte argument.
  *  - send copies at most 64 KiB; a longer one returns -1 with an empty byte
  *    argument.
  *  - recv gives the emulated program at most 4096 bytes and writes no more
- *    than that into its buffer.
+ *    than that into its buffer, nor more than the hook returned; a longer
+ *    one prints nothing.
+ *  - The byte arguments of one profile hold at most 8 MiB in all: an
+ *    argument that does not fit what is left is recorded with 0 bytes, the
+ *    call itself is not changed.
  *  - When the copy can not be allocated (calloc is wrapped with
  *    -Wl,--wrap=calloc), the call returns its error value and the emulated
  *    program goes on at its return address.
@@ -35,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <emu/emu.h>
 #include <emu/emu_cpu.h>
@@ -204,7 +209,7 @@ static void test_fwrite_one_mib(void)     { fwrite_case(1, MIB, MIB, MIB); }
 static void test_fwrite_over_one_mib(void) { fwrite_case(1, MIB + 1, 0, 0); }
 static void test_fwrite_256_mib(void)     { fwrite_case(0x01000000, 0x10, 0, 0); }
 static void test_fwrite_4_gib(void)       { fwrite_case(0xffffffff, 1, 0, 0); }
-static void test_fwrite_wraps_32_bits(void) { fwrite_case(0x10000, 0x10000, 0, 0); }
+static void test_fwrite_wraps_32_bits(void) { fwrite_case(0x10001, 0x10000, 0, 0); }
 static void test_fwrite_count_zero(void)  { fwrite_case(0x10, 0, 0, 0); }
 
 static void test_fwrite_no_memory(void)
@@ -258,7 +263,23 @@ static void test_writefile_no_memory(void)
 	stop(&r);
 }
 
-/* ---- kernel32 _lwrite(file, buffer, n), stdcall: below 1 MiB ---- */
+/* ---- kernel32 _lwrite(file, buffer, n), stdcall: at most 1 MiB ---- */
+
+static void lwrite_case(uint32_t n, uint32_t want_eax, uint32_t want_bytes)
+{
+	struct run r = start();
+	fill(&r, 4096);
+	uint32_t args[] = { 0x4711, DATA, n };
+	CHECK(call(&r, "kernel32", "_lwrite", args, 3, STACK + 4 + 3 * 4) == want_eax);
+	struct emu_profile_argument *b = bytea(&r, "_lwrite");
+	CHECK(b != NULL);
+	CHECK(b->value.bytea.size == want_bytes);
+	CHECK(is_fill(b->value.bytea.data, want_bytes < 4096 ? want_bytes : 4096));
+	stop(&r);
+}
+
+static void test_lwrite_one_mib(void)      { lwrite_case(MIB, MIB, MIB); }
+static void test_lwrite_over_one_mib(void) { lwrite_case(MIB + 1, 0xffffffff, 0); }
 
 static void test_lwrite_small(void)
 {
@@ -351,6 +372,9 @@ static void test_sendto_no_memory(void)
 
 /* ---- ws2_32 recv(s, buffer, n, flags), stdcall: at most 4096 bytes ---- */
 
+/* the hook fills the whole buffer with 'R' and returns its length plus recv_extra */
+static int recv_extra;
+
 static uint32_t recv_hook(struct emu_env *env, struct emu_env_hook *hook, ...)
 {
 	(void)env;
@@ -362,8 +386,45 @@ static uint32_t recv_hook(struct emu_env *env, struct emu_env_hook *hook, ...)
 	int len = va_arg(vl, int);
 	va_end(vl);
 	memset(buffer, 'R', len);
-	return len;
+	return len + recv_extra;
 }
+
+/* recv of n bytes: EAX want_eax, the first want bytes of the buffer written */
+static void recv_case_hook(uint32_t n, int extra, uint32_t want_eax, uint32_t want)
+{
+	struct run r = start();
+	recv_extra = extra;
+	CHECK(emu_env_w32_export_hook(r.env, "recv", recv_hook, NULL) == 0);
+	unsigned char before[8192];
+	memset(before, 'Z', sizeof(before));
+	CHECK(emu_memory_write_block(emu_memory_get(r.e), DATA, before, sizeof(before)) == 0);
+	uint32_t args[] = { 0x77, DATA, n, 0 };
+	/* what the hook prints goes to a file */
+	fflush(stdout);
+	FILE *out = tmpfile();
+	CHECK(out != NULL);
+	int saved = dup(STDOUT_FILENO);
+	CHECK(saved >= 0 && dup2(fileno(out), STDOUT_FILENO) >= 0);
+	uint32_t eax = call(&r, "ws2_32", "recv", args, 4, STACK + 4 + 4 * 4);
+	fflush(stdout);
+	CHECK(dup2(saved, STDOUT_FILENO) >= 0);
+	close(saved);
+	CHECK(fseek(out, 0, SEEK_END) == 0);
+	long printed = ftell(out);
+	fclose(out);
+	recv_extra = 0;
+	CHECK(eax == want_eax);
+	CHECK(printed == 0);
+	unsigned char after[8192];
+	CHECK(emu_memory_read_block(emu_memory_get(r.e), DATA, after, sizeof(after)) == 0);
+	for( uint32_t i = 0; i < sizeof(after); i++ )
+		CHECK(after[i] == (i < want ? 'R' : 'Z'));
+	stop(&r);
+}
+
+static void test_recv_returns_less(void) { recv_case_hook(100, -90, 10, 10); }
+static void test_recv_returns_more(void) { recv_case_hook(100, 1000, 1100, 100); }
+static void test_recv_64_kib_returns_more(void) { recv_case_hook(0x10000, 1000, 4096 + 1000, 4096); }
 
 static void recv_case(uint32_t n, uint32_t want)
 {
@@ -396,6 +457,60 @@ static void test_recv_no_memory(void)
 	stop(&r);
 }
 
+/* ---- the byte arguments of one profile: at most 8 MiB in all ---- */
+
+static void test_profile_budget_fwrite(void)
+{
+	struct run r = start();
+	fill(&r, 4096);
+	uint32_t args[] = { DATA, 1, MIB, 0x1234 };
+	for( int n = 0; n < 12; n++ )
+	{
+		CHECK(call(&r, "msvcrt", "fwrite", args, 4, STACK + 4) == MIB);
+		struct emu_profile_argument *b = bytea(&r, "fwrite");
+		CHECK(b != NULL);
+		CHECK(b->value.bytea.size == (n < 8 ? MIB : 0));
+		CHECK(is_fill(b->value.bytea.data, n < 8 ? 4096 : 0));
+	}
+	CHECK(profiled_calls(&r) == 12);
+	stop(&r);
+}
+
+static uint32_t last_bytea_size(struct emu_profile *profile)
+{
+	struct emu_profile_function *f = emu_profile_functions_last(profile->functions);
+	CHECK(!emu_profile_functions_istail(f));
+	struct emu_profile_argument *a = emu_profile_arguments_last(f->arguments);
+	CHECK(!emu_profile_arguments_istail(a) && a->render == render_bytea);
+	return a->value.bytea.size;
+}
+
+static void test_profile_budget_exact(void)
+{
+	struct emu_profile *profile = emu_profile_new();
+	unsigned char *data = calloc(1, MIB);
+	CHECK(data != NULL);
+	emu_profile_function_add(profile, "f");
+	for( int n = 0; n < 7; n++ )
+	{
+		emu_profile_argument_add_bytea(profile, "", "", data, MIB);
+		CHECK(last_bytea_size(profile) == MIB);
+	}
+	emu_profile_argument_add_bytea(profile, "", "", data, MIB - 1);
+	CHECK(last_bytea_size(profile) == MIB - 1);
+	/* 1 byte is left: 2 do not fit, 1 does, then nothing */
+	emu_profile_argument_add_bytea(profile, "", "", data, 2);
+	CHECK(last_bytea_size(profile) == 0);
+	emu_profile_argument_add_bytea(profile, "", "", data, 1);
+	CHECK(last_bytea_size(profile) == 1);
+	emu_profile_argument_add_bytea(profile, "", "", data, 1);
+	CHECK(last_bytea_size(profile) == 0);
+	emu_profile_argument_add_bytea(profile, "", "", NULL, 0);
+	CHECK(last_bytea_size(profile) == 0);
+	free(data);
+	emu_profile_free(profile);
+}
+
 /* ---- */
 
 static const struct
@@ -419,6 +534,8 @@ static const struct
 	CASE(writefile_4_gib),
 	CASE(writefile_no_memory),
 	CASE(lwrite_small),
+	CASE(lwrite_one_mib),
+	CASE(lwrite_over_one_mib),
 	CASE(lwrite_4_gib),
 	CASE(lwrite_no_memory),
 	CASE(send_small),
@@ -432,6 +549,11 @@ static const struct
 	CASE(recv_4096),
 	CASE(recv_64_kib),
 	CASE(recv_no_memory),
+	CASE(recv_returns_less),
+	CASE(recv_returns_more),
+	CASE(recv_64_kib_returns_more),
+	CASE(profile_budget_fwrite),
+	CASE(profile_budget_exact),
 #undef CASE
 };
 

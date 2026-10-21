@@ -8,9 +8,12 @@
  * file is closed once; its limits config.max_size and config.max_files
  * (src/streamcap.c): no dump past them, the counting thread, the warnings.
  */
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <locale.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -425,10 +428,116 @@ static void streamdumper_closes_once(void)
 	g_free(dir);
 }
 
-/* ---- the limits (config.max_size, config.max_files, src/streamcap.c) ---- */
-
 #define KIB 1024
 #define MIB (1024 * 1024)
+
+struct large_read
+{
+	struct dump *dump;
+	const char *data;
+	size_t size;
+};
+
+static void *large_read_thread(void *arg)
+{
+	struct large_read *read = arg;
+	dump_io(read->dump, bistream_in, read->data, read->size);
+	return NULL;
+}
+
+/*
+ * A TCP read takes what the socket holds and one byte (connection_tcp.c); the
+ * receive buffer of a host holds up to net.ipv4.tcp_rmem, 6 MiB by default.
+ * Such a read is dumped in full, from a thread with a stack of 512 KiB.
+ */
+static void streamdumper_large_read(void)
+{
+	char *dir = tmp_dir();
+	struct processor *p = streamdumper_new(dir, NULL);
+	const size_t size = 6 * MIB + 1;
+	char *data = g_malloc(size);
+	for( size_t i = 0; i < size; i++ )
+		data[i] = (i % 3 == 0) ? (char)(i & 0xff) : (char)('a' + i % 26);
+
+	struct dump d;
+	dump_open(&d, p, 1001);
+	struct large_read read = { &d, data, size };
+	pthread_attr_t attr;
+	g_assert_cmpint(pthread_attr_init(&attr), ==, 0);
+	g_assert_cmpint(pthread_attr_setstacksize(&attr, 512 * KIB), ==, 0);
+	pthread_t thread;
+	g_assert_cmpint(pthread_create(&thread, &attr, large_read_thread, &read), ==, 0);
+	g_assert_cmpint(pthread_join(thread, NULL), ==, 0);
+	pthread_attr_destroy(&attr);
+	dump_close(&d);
+
+	GString *want = g_string_new("stream = [('in', b'");
+	for( size_t i = 0; i < size; i++ )
+	{
+		unsigned char c = (unsigned char)data[i];
+		if( c >= 0x20 && c <= 0x7e && c != '\'' && c != '\\' )
+			g_string_append_c(want, (char)c);
+		else
+			g_string_append_printf(want, "\\x%02x", c);
+	}
+	g_string_append(want, "')]");
+	char *content = only_dump(dir);
+	g_assert_cmpuint(strlen(content), ==, want->len);
+	g_assert_true(strcmp(content, want->str) == 0);
+	g_free(content);
+	g_string_free(want, TRUE);
+	g_free(data);
+
+	streamdumper_free(p);
+	rm_rf(dir);
+	g_free(dir);
+}
+
+/*
+ * The dump has a byte of 0x20..0x7e other than ' and \ as it is and every other byte as \xNN,
+ * in every locale: Python sets LC_CTYPE of the process from the environment, and in a locale
+ * of one byte per character isprint() takes bytes above 0x7e as well (the processor-test stage
+ * of the Dockerfile makes en_US.ISO-8859-1).
+ */
+static void streamdumper_locale(void)
+{
+	if( setlocale(LC_CTYPE, "en_US.ISO-8859-1") == NULL )
+	{
+		g_test_skip("no locale en_US.ISO-8859-1");
+		return;
+	}
+	g_assert_true(isprint(0xe4));
+	char *dir = tmp_dir();
+	struct processor *p = streamdumper_new(dir, NULL);
+	char data[256];
+	for( int i = 0; i < 256; i++ )
+		data[i] = (char)i;
+	struct dump d;
+	dump_open(&d, p, 1002);
+	dump_io(&d, bistream_in, data, sizeof(data));
+	dump_close(&d);
+	setlocale(LC_CTYPE, "C");
+
+	GString *want = g_string_new("stream = [('in', b'");
+	for( int i = 0; i < 256; i++ )
+	{
+		unsigned char c = (unsigned char)i;
+		if( c >= 0x20 && c <= 0x7e && c != '\'' && c != '\\' )
+			g_string_append_c(want, (char)c);
+		else
+			g_string_append_printf(want, "\\x%02x", c);
+	}
+	g_string_append(want, "')]");
+	char *content = only_dump(dir);
+	g_assert_cmpstr(content, ==, want->str);
+	g_free(content);
+	g_string_free(want, TRUE);
+	streamdumper_free(p);
+	rm_rf(dir);
+	g_free(dir);
+}
+
+/* ---- the limits (config.max_size, config.max_files, src/streamcap.c) ---- */
 
 struct streamcap *proc_streamdumper_cap(void *cfg);
 
@@ -2522,6 +2631,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/tempfile/close-keeps-the-next-file", tempfile_close_keeps_the_next_file);
 	g_test_add_func("/tempfile/new-fails-cleanly", tempfile_new_fails_cleanly);
 	g_test_add_func("/streamdumper/closes-once", streamdumper_closes_once);
+	g_test_add_func("/streamdumper/large-read", streamdumper_large_read);
+	g_test_add_func("/streamdumper/locale", streamdumper_locale);
 	g_test_add_func("/streamcap/parse", parse);
 	g_test_add_func("/streamcap/base", base);
 	g_test_add_func("/streamcap/parse-env", parse_env);

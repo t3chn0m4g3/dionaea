@@ -328,6 +328,23 @@ def test_an_upload_error_with_the_control_connection_gone(session, error):
     assert con.mode is None
 
 
+@pytest.mark.parametrize("mode", [None, "list", "file"])
+def test_data_that_is_no_upload_is_taken(session, mode):
+    # data after a dropped upload (the client sends on until the close) or on a data connection
+    # of a LIST or RETR: read and left; the binding takes the int handle_io_in returns
+    con = data_connection(session)
+    con.mode = mode
+    assert con.handle_io_in(b"more data") == 9
+
+
+def test_data_after_a_dropped_upload_is_taken(session):
+    con = data_connection(session)
+    con.mode = "recv_file"
+    con.upload = TooLarge(ftp.UploadTooLarge("too large"))
+    assert con.handle_io_in(b"abc") == 3
+    assert con.handle_io_in(b"defg") == 4
+
+
 def test_an_upload_error_answers_the_client(session):
     con = data_connection(session)
     con.mode = "recv_file"

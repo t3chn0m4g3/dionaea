@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: none
 # SPDX-License-Identifier: CC0-1.0
 
-# Exclude vendored sources and canonical licence texts from formatting hooks.
+# Exclude vendored sources, canonical licence texts and the binary seeds of the
+# fuzz targets from formatting hooks.
 # REUSE still inspects the complete tree through its repository-wide hook.
-exclude: ^(third_party/libemu/|LICENSES/)
+exclude: ^(third_party/libemu/|LICENSES/|tests/fuzz/corpus/[^/]+/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 from dionaea.core import dlhfn
+from dionaea.logtext import LogTextFormatter
 import logging
 
 handler = None
@@ -14,6 +15,8 @@ logger = None
 class DionaeaLogHandler(logging.Handler):
     def __init__(self):
         logging.Handler.__init__(self, logging.DEBUG)
+        # tracebacks as printable lines, at most 40 (logtext.py)
+        self.setFormatter(LogTextFormatter())
 
     def emit(self, record):
         msg = self.format(record)

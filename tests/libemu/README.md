@@ -40,11 +40,22 @@ CF and OF, with both flags clear and set before. mul.c and imul.c compute no
 product that overflows its C type, so the test also passes with
 `-fsanitize=signed-integer-overflow` on them.
 
+`test_rotate.c` runs ROL, ROR, RCL and RCR (D0 to D3, C0 and C1: by 1, by CL
+and by an immediate; 8, 16 and 32 bits) on AL, AX and EAX and on memory, with
+every count from 0 to 31 and some above, CF clear and set and the other flags
+clear and set before. It checks the result in full against the rotation of
+x86 and the flags as the Intel SDM gives them: none for a masked count of 0, CF
+otherwise, OF for a masked count of 1, SF, ZF, AF and PF never (OF of a larger
+count is undefined and not checked). The rotations shift in 64 bits by less
+than 64; the test build turns the shift checks off for all of libemu, see below.
+
 `test_w32_hooks.c` calls the hooks that copy a buffer of the emulated program
-with a profile, as dionaea's profile run does: fwrite and WriteFile (at most
-1 MiB per call), _lwrite (below 1 MiB), send and sendto (at most 64 KiB) and recv
-(at most 4096 bytes). It checks EAX, EIP, ESP, the bytes written and the byte
-argument of the profile; with `-Wl,--wrap=calloc` it makes the copy fail.
+with a profile, as dionaea's profile run does: fwrite, WriteFile and _lwrite (at
+most 1 MiB per call), send and sendto (at most 64 KiB) and recv
+(at most 4096 bytes and no more than the hook returned, without output). It checks EAX, EIP, ESP, the bytes written and the byte
+argument of the profile; with `-Wl,--wrap=calloc` it makes the copy fail. The
+byte arguments of one profile hold at most 8 MiB in all: 12 fwrite calls of
+1 MiB record 8 of 1 MiB and 4 of 0 bytes and return 1 MiB each.
 `./test_w32_hooks <case>` runs one case.
 
 - UBSan runs without `shift` and `signed-integer-overflow`: the emulated x86

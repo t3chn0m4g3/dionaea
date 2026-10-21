@@ -12,6 +12,8 @@ tests/functional
 
 build/
 **/build/
+build-fuzz/
+build-cov/
 CMakeCache.txt
 CMakeFiles/
 cmake-build-*/

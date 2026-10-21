@@ -105,12 +105,18 @@ struct emu_profile_function
 header_list_functions(emu_profile_functions,emu_profile_function_root, emu_profile_function, link);
 
 
+/* the byte arguments of one profile hold at most this many bytes in all; an argument that
+ * does not fit what is left has 0 bytes (emu_profile_argument_add_bytea) */
+#define EMU_PROFILE_BYTEA_BUDGET (8u * 1024u * 1024u)
+
 struct emu_profile
 {
 
 	emu_profile_function_root *functions;
 	struct emu_stack *argument_stack;
 	struct emu_profile_argument *last_ref;
+	/* the bytes of the byte arguments so far, at most EMU_PROFILE_BYTEA_BUDGET */
+	uint32_t bytea_total;
 };
 
 

@@ -7,7 +7,9 @@
 from dionaea import IHandlerLoader
 from dionaea.core import ihandler, incident
 from dionaea.core import connection
+from dionaea.logtext import log_text
 import logging
+import re
 
 logger = logging.getLogger('cmd')
 logger.setLevel(logging.DEBUG)
@@ -19,6 +21,15 @@ class CMDShellHandlerLoader(IHandlerLoader):
     @classmethod
     def start(cls, config=None):
         return cmdshellhandler("dionaea.service.shell.*", config=config)
+
+
+def ftp_port(text):
+    """The port of an FTP script: 1 to 65535 in decimal digits, None for any other text (an info
+    line says so; the script gives no download offer then)."""
+    if re.fullmatch(r"[0-9]{1,5}", text) and 1 <= int(text) <= 65535:
+        return int(text)
+    logger.info("FTP script: %s is no port, no download offer", log_text(text))
+    return None
 
 
 class cmdexe:
@@ -147,17 +158,15 @@ class cmdexe:
             if state == 'NEXT_IS_SOMETHING':
                 if args[0] == 'open':
                     if len(args) == 1:
+                        # ftp asks "To": the next line has the host and maybe a port
                         state = 'NEXT_IS_HOST'
                     else:
                         host = args[1]
-                        if len(args) == 3:
-                            port = int(args[2])
+                        port = ftp_port(args[2]) if len(args) >= 3 else 21
+                        if autoconnect == True and user == None:
+                            state = 'NEXT_IS_USER'
                         else:
-                            port = 21
-                    if autoconnect == True and user == None:
-                        state = 'NEXT_IS_USER'
-                    else:
-                        state = 'NEXT_IS_SOMETHING'
+                            state = 'NEXT_IS_SOMETHING'
                 elif args[0] == 'user':
                     if user != None:
                         logger.debug("State error USER")
@@ -173,6 +182,8 @@ class cmdexe:
                 elif args[0] == 'get':
                     if len(args) == 1:
                         state = 'NEXT_IS_FILE'
+                    elif len(args) == 2 and port is None:
+                        dfile = args[1]
                     elif len(args) == 2:
                         dfile = args[1]
                         i = incident("dionaea.download.offer")
@@ -193,13 +204,15 @@ class cmdexe:
                     ftpmode = 'binary'
 
             elif state == 'NEXT_IS_HOST':
-                if len(args) >= 2:
-                    host = args[1]
-                if len(args) == 3:
-                    port = args[2]
+                words = args[1:] if args[0].lower() == 'to' else args
+                if len(words) >= 1:
+                    host = words[0]
+                    port = ftp_port(words[1]) if len(words) >= 2 else 21
                 else:
-                    port = 21
-                if user == None:
+                    # no host: the script gives no download offer (port None, as for a bad port)
+                    logger.info("FTP script: no host after open, no download offer")
+                    port = None
+                if autoconnect == True and user == None:
                     state = 'NEXT_IS_USER'
                 else:
                     state = 'NEXT_IS_SOMETHING'
@@ -218,7 +231,10 @@ class cmdexe:
                     state = 'NEXT_IS_SOMETHING'
 
             elif state == 'NEXT_IS_FILE':
-                if len(args) == 1:
+                if len(args) == 1 and port is None:
+                    dfile = args[0]
+                    state = 'NEXT_IS_SOMETHING'
+                elif len(args) == 1:
                     dfile = args[0]
                     state = 'NEXT_IS_SOMETHING'
                     i = incident("dionaea.download.offer")
@@ -235,8 +251,10 @@ class cmdexe:
                 if len(args) == 1:
                     fpath = args[0]
                     state = 'NEXT_IS_SOMETHING'
-        logger.info("ftp://%s:%s@%s:%i/%s/%s" %
-                    (user,passwd,host,port,fpath,dfile))
+        # the url of the offer keeps the password (the honeypot records it); the log line does
+        # not, and it writes the texts of the client as log_text
+        logger.info("FTP script: user %s, host %s, port %s, path %s, file %s", log_text(user),
+                    log_text(host), log_text(port), log_text(fpath), log_text(dfile))
         return out,None
 
     def cmd_TFTP(self, args):

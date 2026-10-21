@@ -49,8 +49,8 @@ ARG LIBEMU_TEST_CFLAGS=""
 RUN mkdir -p /src/build-test && \
     cd /src/build-test && \
     cmake -DDIONAEA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="${LIBEMU_TEST_CFLAGS}" .. && \
-    make -j"$(nproc)" test_libemu test_synthetic_pe test_mul test_w32_hooks && \
-    ctest -R '^(libemu|synthetic_pe|mul|w32_hooks)$' --output-on-failure
+    make -j"$(nproc)" test_libemu test_synthetic_pe test_mul test_rotate test_w32_hooks && \
+    ctest -R '^(libemu|synthetic_pe|mul|rotate|w32_hooks)$' --output-on-failure
 
 
 # Unit tests of the stream processing (tests/processor: bistream limits, streamdumper, processor
@@ -65,6 +65,11 @@ RUN mkdir -p /src/build-test && \
 FROM builder AS processor-test
 
 ARG PROCESSOR_TEST_CFLAGS=""
+
+# a locale of one byte per character for the JSON of a profile and the streamdumper
+# (test_profile.c, test_streamdumper.c)
+RUN apt-get install -y --no-install-recommends locales && \
+    localedef -i en_US -f ISO-8859-1 en_US.ISO-8859-1
 
 RUN mkdir -p /src/build-processor-test && \
     cd /src/build-processor-test && \

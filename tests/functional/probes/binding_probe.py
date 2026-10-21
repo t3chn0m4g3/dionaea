@@ -27,6 +27,14 @@ after the start:
                       every time, which parsed the text signature of the Cython __init__
                       and left a class (RewriteSymbolics) in a cycle per read
     wrapper_us        microseconds per read
+    raised            an ihandler whose handle_incident raises (with a text of 1000 characters,
+                      an escape sequence and 60 line breaks in its message) got its incident: the
+                      exception leaves the binding to the C code of the python module
+                      (traceable_ihandler_cb, traceback()), which logs it
+
+At the stop of dionaea the probe removes the handlers of logging (as the stop of dionaea.log
+does) and its stop() raises: the C code of the python module (traceback()) writes that
+exception itself, through the same rule, and logging writes nothing raw to stderr.
 
 dionaea has to go on running afterwards (the host check looks).
 """
@@ -73,6 +81,21 @@ def _raises():
 
 
 wrappers = {}
+handlers = []
+RAISE_ORIGIN = "dionaea.binding_probe.raise"
+RAISE_MESSAGE = "binding probe\x1b[31m" + "z" * 1000 + "\n" * 60 + "end of the binding probe"
+STOP_MESSAGE = "binding probe at stop\x1b[2J" + "s" * 1000 + "\n" * 60 + "end of the stop"
+
+
+def _raising_handler():
+    from dionaea.core import ihandler
+
+    class RaisingHandler(ihandler):
+        def handle_incident(self, i):
+            wrappers["raised"] = wrappers.get("raised", 0) + 1
+            raise ValueError(RAISE_MESSAGE) from None
+
+    return RaisingHandler(RAISE_ORIGIN)
 
 
 def _wrappers():
@@ -99,6 +122,11 @@ def _report():
         _wrappers()
     except Exception as e:   # the probe must not stop dionaea
         wrappers["wrapper_error"] = repr(e)
+    try:
+        from dionaea.core import incident
+        incident(RAISE_ORIGIN).report()
+    except Exception as e:
+        wrappers["raise_error"] = repr(e)
     OUT.write_text(json.dumps({"calls": calls, "errors": errors, **wrappers}) + "\n")
 
 
@@ -116,9 +144,14 @@ def start():
     timers["raises"] = timer(_raises, 0.1, 0.1)
     timers["stopped_early"] = timer(lambda: _count("stopped_early"), 0.5)
     timers["stopped_early"].stop()
+    handlers.append(_raising_handler())
     timers["report"] = timer(_report, 2.0)
 
 
 def stop():
     for t in timers.values():
         t.stop()
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    raise ValueError(STOP_MESSAGE)

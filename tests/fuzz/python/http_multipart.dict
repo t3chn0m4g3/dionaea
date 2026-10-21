@@ -1,0 +1,15 @@
+# This file is part of the dionaea honeypot
+# SPDX-FileCopyrightText: none
+# SPDX-License-Identifier: CC0-1.0
+# tokens of multipart/form-data
+"Content-Disposition: form-data; name=\"a\""
+"; filename=\"f\""
+"filename*=UTF-8''f"
+"Content-Type: multipart/mixed; boundary="
+"Content-Transfer-Encoding: base64"
+"\x0d\x0a\x0d\x0a"
+"\x0a\x0a"
+"--"
+"\x0d\x0a--"
+"; boundary="
+"\""

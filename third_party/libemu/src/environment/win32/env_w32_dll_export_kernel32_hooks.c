@@ -1113,7 +1113,9 @@ LONG _lwrite(
 	uint32_t returnvalue;
 	unsigned char *buffer = NULL;
 
-	if( size < 1*1024*1024 )
+	/* at most 1 MiB per call, as fwrite and WriteFile: a longer write writes
+	 * nothing and returns -1 (HFILE_ERROR) */
+	if( size <= 1*1024*1024 )
 		buffer = calloc(1, (size_t)size + 1);
 
 	if( buffer != NULL )
@@ -1647,8 +1649,8 @@ BOOL WriteFile(
 	uint32_t p_overlapped;
 	POP_DWORD(c,  &p_overlapped);
 
-	/* at most 1 MiB per call as for _lwrite: a longer write writes nothing
-	 * and returns 0 with 0 bytes written */
+	/* at most 1 MiB per call, as fwrite and _lwrite: a longer write writes
+	 * nothing and returns 0 with 0 bytes written */
 	uint32_t len = bytestowrite <= 1*1024*1024 ? bytestowrite : 0;
 	unsigned char *buffer = calloc(1, (size_t)len + 1);
 	if( buffer == NULL )

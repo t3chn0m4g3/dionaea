@@ -17,7 +17,7 @@ from time import time, localtime, altzone
 from dionaea import ndrlib
 from dionaea.core import g_dionaea, incident
 from dionaea.logtext import log_text
-from dionaea.upload import incoming_file
+from dionaea.upload import DEFAULT_MAX_UPLOAD_SIZE, incoming_file
 from .include.smbfields import DCERPC_Header, DCERPC_Response
 
 rpclog = logging.getLogger('rpcservices')
@@ -2855,15 +2855,28 @@ class spoolss(RPCService):
         # FIXME actually this defragmentation should be in
         # smbd.process_dcerpc_packet
 
-        if p.PacketFlags == 0:
+        #
+        # con.printer holds the fragments of one job (a bytearray: a fragment is added in the
+        # time of its own length), None for a job that was dropped (above max_upload_size)
+        # until the first fragment of the next one
+        if p.PacketFlags in (0, 1, 2):
+            if p.PacketFlags == 1:
+                con.printer = bytearray()
+            if con.printer is None:
+                if p.PacketFlags == 2:
+                    con.printer = bytearray()
+                return None
             con.printer += p.StubData
-            return None
-        elif p.PacketFlags == 1:
-            con.printer += p.StubData
-            return None
-        elif p.PacketFlags == 2:
-            con.printer += p.StubData
-            x = ndrlib.Unpacker(con.printer)
+            limit = getattr(con.config, "max_upload_size", DEFAULT_MAX_UPLOAD_SIZE)
+            if len(con.printer) > limit:
+                rpclog.warning("print job of %s dropped: its fragments are above max_upload_size (%d bytes)",
+                               con.remote.host, limit)
+                con.printer = None
+                return None
+            if p.PacketFlags != 2:
+                return None
+            x = ndrlib.Unpacker(bytes(con.printer))
+            con.printer = bytearray()
             hPrinter = x.unpack_raw(20)
             cbBuf = x.unpack_long()
             Buf = x.unpack_raw(cbBuf)
@@ -3411,6 +3424,9 @@ class SRVSVC(RPCService):
         #   [case(503)]
         # 	SHARE_INFO_503_CONTAINER* Level503;
         # } SHARE_ENUM_UNION;
+        if infostruct_share not in (0, 1, 502):
+            # the levels the service answers
+            raise DCERPCValueError("Level", "not supported", infostruct_share)
         if infostruct_share == 0:
             buffer = SRVSVC.SHARE_INFO_0_CONTAINER(x)
         elif infostruct_share == 1:

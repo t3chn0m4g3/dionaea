@@ -9,12 +9,22 @@
  * WriteFile or send. A byte argument is one JSON string: a printable ASCII
  * byte other than " and \ as it is, every other byte as \\x and two hex
  * digits. The string holds exactly the bytes of the argument: none for an
- * empty one, all of them for a long one.
+ * empty one, all of them for a long one. The rule does not depend on the
+ * locale: Python sets LC_CTYPE of the process from the environment, and in a
+ * locale of one byte per character isprint() takes bytes above 0x7e as well
+ * (the processor-test stage of the Dockerfile makes en_US.ISO-8859-1).
+ *
+ * A string argument (a file name, a URL, a command line of the emulated
+ * program) goes to the Python ihandlers as well, which read the JSON as
+ * UTF-8: a string that is valid UTF-8 stays as it is (with the escapes of
+ * JSON), every byte that is not part of a valid UTF-8 sequence is \u00NN,
+ * the character of the same number.
  *
  * The rest of dionaea that profile.c calls (the emulation, the incidents,
  * the threads) is not used here and stubbed out.
  */
 #include <ctype.h>
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,6 +235,63 @@ static void test_long(void)
 	g_free(data);
 }
 
+static void test_locale(void)
+{
+	if( setlocale(LC_CTYPE, "en_US.ISO-8859-1") == NULL )
+	{
+		g_test_skip("no locale en_US.ISO-8859-1");
+		return;
+	}
+	g_assert_true(isprint(0xe4));
+	unsigned char all[256];
+	for( int i = 0; i < 256; i++ )
+		all[i] = (unsigned char)i;
+	check_bytes(all, sizeof(all));
+	char *got = json_of_bytes((const unsigned char *)"\xe4\xa0", 2);
+	g_assert_cmpstr(got, ==, "\\\\xe4\\\\xa0");
+	g_free(got);
+	setlocale(LC_CTYPE, "C");
+}
+
+/* the profile of one call "f" with a string argument; returns the whole JSON */
+static char *json_of_string(const char *value)
+{
+	struct emu_profile *profile = emu_profile_new();
+	emu_profile_function_add(profile, "f");
+	emu_profile_argument_add_string(profile, "char *", "", (char *)value);
+	emu_profile_function_returnvalue_int_set(profile, "int", 0);
+	GString *json = g_string_new(NULL);
+	json_profile_debug(profile, json);
+	emu_profile_free(profile);
+	return g_string_free(json, FALSE);
+}
+
+static void check_string(const char *value, const char *want)
+{
+	char *json = json_of_string(value);
+	g_assert_true(g_utf8_validate(json, -1, NULL));
+	char *quoted = g_strdup_printf("\"%s\"\n", want);
+	g_assert_nonnull(strstr(json, quoted));
+	g_free(quoted);
+	g_free(json);
+}
+
+static void test_string_utf8(void)
+{
+	check_string("http://192.0.2.1/x.exe", "http:\\/\\/192.0.2.1\\/x.exe");
+	check_string("a\"b\\c\n\x01", "a\\\"b\\\\c\\n\\u0001");
+	/* valid UTF-8 as it is: two, three and four bytes */
+	check_string("\xc3\xa4 \xe2\x82\xac \xf0\x9f\x98\x80", "\xc3\xa4 \xe2\x82\xac \xf0\x9f\x98\x80");
+	/* the bytes of no valid sequence: alone, cut off, overlong, a surrogate, past U+10FFFF */
+	check_string("\xff\xfe", "\\u00ff\\u00fe");
+	check_string("a\xc3", "a\\u00c3");
+	check_string("\xe2\x82x", "\\u00e2\\u0082x");
+	check_string("\xc0\xaf", "\\u00c0\\u00af");
+	check_string("\xed\xa0\x80", "\\u00ed\\u00a0\\u0080");
+	check_string("\xf4\x90\x80\x80", "\\u00f4\\u0090\\u0080\\u0080");
+	check_string("\x80\xc3\xa4\x80", "\\u0080\xc3\xa4\\u0080");
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -232,5 +299,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/profile/bytea/one_byte", test_one_byte);
 	g_test_add_func("/profile/bytea/escapes", test_escapes);
 	g_test_add_func("/profile/bytea/long", test_long);
+	g_test_add_func("/profile/bytea/locale", test_locale);
+	g_test_add_func("/profile/string/utf8", test_string_utf8);
 	return g_test_run();
 }

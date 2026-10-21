@@ -111,18 +111,27 @@ def _multipart_files(body: bytes, start: int, end: int, boundary: str, budget, d
         pos = body.find(separator, part_start, part_end)
         if pos < 0:
             continue
-        part_headers = parser.parsebytes(body[part_start:pos + len(eol)], headersonly=True)
+        try:
+            part_headers = parser.parsebytes(body[part_start:pos + len(eol)], headersonly=True)
+            name = field
+            if name is None:
+                name = part_headers.get_param("name", header="content-disposition")
+            filename = part_headers.get_filename()
+            inner = None
+            if filename is None and part_headers.get_content_maintype() == "multipart":
+                inner = part_headers.get_boundary()
+        except Exception as e:
+            # the email package raises on some malformed headers (e.g. a parameter "filename*"
+            # without a value): this part is left out, the others are read
+            logger.info("Skipping a part of a multipart body, its headers can not be read (%s: %s)",
+                        type(e).__name__, log_text(e))
+            continue
         content_start = pos + len(separator)
         if index == len(markers) - 1 and body.endswith(eol, content_start, part_end):
             # no closing boundary (the HTTP service cuts it off): the line
             # break in front of it is not part of the content
             part_end -= len(eol)
-        name = field
-        if name is None:
-            name = part_headers.get_param("name", header="content-disposition")
-        filename = part_headers.get_filename()
         if filename is None:
-            inner = part_headers.get_boundary() if part_headers.get_content_maintype() == "multipart" else None
             if inner and depth < MULTIPART_MAX_DEPTH:
                 yield from _multipart_files(body, content_start, part_end, inner, budget, depth + 1, name)
             continue
@@ -140,8 +149,9 @@ def iter_uploaded_files(fp, content_type: str, max_num_fields: Optional[int] = N
     returned as it was sent, a Content-Transfer-Encoding is not decoded (as with
     cgi). Parts that are not files are ignored; the files of nested multipart
     parts (multipart/mixed) are returned with the field name of the part that
-    holds them, up to MULTIPART_MAX_DEPTH levels deep. Nothing is copied but the
-    content of the files.
+    holds them, up to MULTIPART_MAX_DEPTH levels deep. A part whose headers the
+    email package can not read is left out with one info line, the other parts are
+    read. Nothing is copied but the content of the files.
 
     :param fp: File object with the request body
     :param content_type: Value of the Content-Type header of the request
@@ -154,7 +164,14 @@ def iter_uploaded_files(fp, content_type: str, max_num_fields: Optional[int] = N
 
     header = email.message.Message()
     header["Content-Type"] = content_type
-    boundary = header.get_boundary()
+    try:
+        boundary = header.get_boundary()
+    except Exception as e:
+        # the email package of some Python versions raises on malformed parameters (3.12:
+        # decode_params of RFC 2231 continuations); without a boundary there are no files
+        logger.info("Ignoring the POST data, its Content-Type can not be read (%s: %s)",
+                    type(e).__name__, log_text(e))
+        return
     if not boundary:
         return
 

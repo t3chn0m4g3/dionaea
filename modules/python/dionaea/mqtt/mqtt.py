@@ -7,15 +7,30 @@
 from dionaea.core import *
 
 import datetime
-import traceback
 import logging
 import binascii
 import os
+import struct
 import tempfile
 
 from dionaea.mqtt.include.packets import *
 
 logger = logging.getLogger('mqtt')
+
+# what the packet classes raise for a packet whose body does not hold the fields of its type
+MALFORMED = (AttributeError, IndexError, KeyError, TypeError, ValueError, struct.error)
+
+
+class MalformedPacket(Exception):
+	"""A packet of the client the packet classes can not read (not an error of the service)."""
+
+
+def read_packet(cls, data):
+	"""The packet cls of the bytes data; MalformedPacket if they do not hold its fields."""
+	try:
+		return cls(data)
+	except MALFORMED as e:
+		raise MalformedPacket(e.__class__.__name__) from e
 
 # the largest packet (fixed header and remaining length) a connection buffers, for up
 # to its idle timeout (120 s): larger ones close the connection
@@ -250,7 +265,14 @@ class mqttd(connection):
 				return len(data)
 			if offset + length > len(data):
 				break
-			self.handle_packet(data[offset:offset + length])
+			try:
+				self.handle_packet(data[offset:offset + length])
+			except MalformedPacket as e:
+				# MQTT 3.1.1 4.8, MQTT 5.0 4.13: a malformed packet closes the network connection
+				logger.info("malformed MQTT packet (type %d) from %s:%s, closing the connection: %s",
+					data[offset] >> 4, self.remote.host, self.remote.port, e)
+				self.close()
+				return len(data)
 			offset += length
 		return offset
 
@@ -274,16 +296,15 @@ class mqttd(connection):
 				if len(data) == 0:
 					logger.warning("Bad MQTT Packet, Length = 0")
 
-			except:
-				t = traceback.format_exc()
-				logger.error(t)
+			except Exception:
+				logger.error("Unable to read the type of an MQTT packet", exc_info=True)
 				return l
 
 			if self.pendingPacketType == MQTT_CONTROLMESSAGE_TYPE_CONNECT:
 				level = connect_level(data)
 				if level is not None:
 					self.protocol_level = level
-				x = MQTT_Connect(data)
+				x = read_packet(MQTT_Connect, data)
 
 				i = incident("dionaea.modules.python.mqtt.connect")
 				i.con = self
@@ -296,37 +317,37 @@ class mqttd(connection):
 
 			elif (  ((self.pendingPacketType & MQTT_CONTROLMESSAGE_TYPE_PUBLISH) == 48) &
 				((self.pendingPacketType & MQTT_CONTROLMESSAGE_TYPE_QoS1) > 0) ) :
-				x = MQTT_Publish(data)
+				x = read_packet(MQTT_Publish, data)
 				self.report_publish(data, x)
 
 			elif (  ((self.pendingPacketType & MQTT_CONTROLMESSAGE_TYPE_PUBLISH) == 48) &
 				((self.pendingPacketType & MQTT_CONTROLMESSAGE_TYPE_QoS2) > 0) ) :
-				x = MQTT_Publish(data)
+				x = read_packet(MQTT_Publish, data)
 				self.report_publish(data, x)
 
 			elif (  ((self.pendingPacketType & MQTT_CONTROLMESSAGE_TYPE_PUBLISHREL) == 96) &
 				((self.pendingPacketType & MQTT_CONTROLMESSAGE_TYPE_QoS1) > 0) ) :
-				x = MQTT_Publish_Release(data)
+				x = read_packet(MQTT_Publish_Release, data)
 
 			elif self.pendingPacketType >> 4 == MQTT_CONTROLMESSAGE_TYPE_PUBLISH >> 4:
 				# QoS 0, also with the RETAIN or DUP flag
-				x = MQTT_Publish(data)
+				x = read_packet(MQTT_Publish, data)
 				self.report_publish(data, x)
 
 			elif (  ((self.pendingPacketType & MQTT_CONTROLMESSAGE_TYPE_SUBSCRIBE) == 128) &
 				((self.pendingPacketType & MQTT_CONTROLMESSAGE_TYPE_QoS1) > 0) ) :
-				x = MQTT_Subscribe(data)
+				x = read_packet(MQTT_Subscribe, data)
 				self.report_subscribe(data, x)
 
 			elif self.pendingPacketType == MQTT_CONTROLMESSAGE_TYPE_SUBSCRIBE:
-				x = MQTT_Subscribe(data)
+				x = read_packet(MQTT_Subscribe, data)
 				self.report_subscribe(data, x)
 
 			elif self.pendingPacketType == MQTT_CONTROLMESSAGE_TYPE_PINGREQ:
-				x = MQTT_PingRequest(data)
+				x = read_packet(MQTT_PingRequest, data)
 
 			elif self.pendingPacketType == MQTT_CONTROLMESSAGE_TYPE_DISCONNECT:
-				x = MQTT_DisconnectReq(data)
+				x = read_packet(MQTT_DisconnectReq, data)
 
 			self.buf = b''
 			if x is None:

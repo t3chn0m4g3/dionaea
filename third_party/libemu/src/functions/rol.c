@@ -28,35 +28,37 @@
 #include <stdint.h>
 #include <errno.h>
 
+/* ROL as x86 does it (Intel SDM vol. 2): the count masked to 5 bits, the
+ * rotation by it modulo the width. With a masked count of 0 no flag changes;
+ * else CF is the low bit of the result and, for a masked count of 1, OF its
+ * high bit XOR CF (OF of a larger count is undefined and stays). SF, ZF, AF
+ * and PF stay. The shifts are of 64 bits and below 64. */
 #define INSTR_CALC(bits, a, b, cpu) \
-UINTOF(bits) operation_result = (a); \
-uint8_t operand_b = (b); \
 { \
-	operand_b %= sizeof(operation_result) * 8; \
-	operation_result = operation_result << operand_b | operation_result >> (bits - operand_b); \
-	if( operation_result & 1 ) \
+	uint8_t rotate_count = (b) & 0x1f; \
+	if( rotate_count != 0 ) \
 	{ \
-		CPU_FLAG_SET(cpu, f_cf); \
-	} \
-	if( operand_b == 1 ) \
-	{ \
-		if( (operation_result >> (bits - 1)) ^ (cpu->eflags >> f_cf) ) \
-		{ \
-			CPU_FLAG_SET(cpu, f_of); \
-		} \
+		unsigned rotate_n = rotate_count % (bits); \
+		uint64_t rotate_v = (UINTOF(bits))(a); \
+		UINTOF(bits) operation_result = (UINTOF(bits))(rotate_v << rotate_n | rotate_v >> ((bits) - rotate_n)); \
+		unsigned rotate_cf = operation_result & 1; \
+		if( rotate_cf ) \
+			CPU_FLAG_SET(cpu, f_cf); \
 		else \
+			CPU_FLAG_UNSET(cpu, f_cf); \
+		if( rotate_count == 1 ) \
 		{ \
-			CPU_FLAG_UNSET(cpu, f_of); \
+			if( (((unsigned)(operation_result >> ((bits) - 1)) & 1) ^ rotate_cf) != 0 ) \
+				CPU_FLAG_SET(cpu, f_of); \
+			else \
+				CPU_FLAG_UNSET(cpu, f_of); \
 		} \
+		a = operation_result; \
 	} \
-	a = operation_result; \
 }
 
 #define INSTR_CALC_AND_SET_FLAGS(bits, cpu, a, b) \
-INSTR_CALC(bits, a, b, cpu) \
-INSTR_SET_FLAG_ZF(cpu) \
-INSTR_SET_FLAG_PF(cpu) \
-INSTR_SET_FLAG_SF(cpu)
+INSTR_CALC(bits, a, b, cpu)
 
 #include "emu/emu.h"
 #include "emu/emu_cpu.h"

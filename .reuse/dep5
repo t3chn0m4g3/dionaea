@@ -30,3 +30,8 @@ License: GPL-3.0-only
 Files: tests/functional/fixtures/*.json
 Copyright: none
 License: CC0-1.0
+
+# Seeds of the fuzz targets (binary inputs, written by tests/fuzz/corpus/make_seeds.py).
+Files: tests/fuzz/corpus/*/*
+Copyright: none
+License: CC0-1.0

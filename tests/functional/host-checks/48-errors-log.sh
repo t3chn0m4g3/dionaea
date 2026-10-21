@@ -14,6 +14,9 @@
 # A second dionaea gets scenarios/routine_requests.py and is stopped (the logs are
 # written then). Its dionaea-errors.log must have none of these lines; dionaea.log
 # (info and above) must still have the ones that moved to info.
+#
+# The errors log of the sample configuration (conf/dionaea.cfg.cmake) takes critical as well:
+# a record of Python's logging at error is a glib critical.
 
 set -Eeuo pipefail
 unset CDPATH
@@ -22,6 +25,20 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 . "${HERE}/lib.sh"
 
 hc_running || { hc_fail "dionaea is not running"; exit 1; }
+
+sample="${DIONAEA_TESTS_DIR}/../../conf/dionaea.cfg.cmake"
+sample_levels="$(sed -n 's/^errors\.levels=//p' "${sample}")"
+case ",${sample_levels}," in
+  *,warning,*) ;;
+  *) hc_fail "errors.levels of ${sample##*/} has no warning: ${sample_levels}"; exit 1 ;;
+esac
+for level in error critical; do
+  case ",${sample_levels}," in
+    *",${level},"*) ;;
+    *) hc_fail "errors.levels of ${sample##*/} has no ${level}: ${sample_levels}"; exit 1 ;;
+  esac
+done
+hc_say "errors.levels of ${sample##*/}: ${sample_levels}"
 
 inst="${DIONAEA_CONTAINER}-quiet"
 root="${DIONAEA_TMP_ROOT}/quiet"

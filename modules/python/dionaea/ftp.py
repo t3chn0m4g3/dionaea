@@ -849,7 +849,9 @@ class FTPDataCon(connection):
                 # the control connection can be gone already
                 self._ctrl_call(drop)
                 self.close()
-            return len(data)
+        # data that is no upload (after a dropped one, until the close; on the connection of a
+        # LIST or RETR) is read and left
+        return len(data)
 
     def handle_io_out(self):
         logger.debug("io_out")

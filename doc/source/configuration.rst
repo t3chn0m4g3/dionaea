@@ -91,11 +91,13 @@ It is not recommended to analyse this files to track attacks.
 
     Examples:
 
-   Log only messages with level warning and error
+   Log only messages with level warning, error and critical (a record of Python's logging at
+   error, e.g. of a service, is a critical one; a file with neither debug nor info is written
+   line by line)
 
     .. code-blocK:: ini
 
-        errors.levels=warning,error
+        errors.levels=warning,error,critical
 
     Log all log messages but exclude messages with log level debug
 

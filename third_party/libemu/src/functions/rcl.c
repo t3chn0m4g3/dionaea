@@ -28,39 +28,38 @@
 #include <stdint.h>
 #include <errno.h>
 
+/* RCL as x86 does it (Intel SDM vol. 2): the operand and CF rotate as one
+ * value of the width plus one bit, by the count masked to 5 bits modulo the
+ * width plus one; CF is the last bit rotated out (unchanged when nothing
+ * rotates). For a masked count of 1, OF is the high bit of the result XOR CF
+ * (OF of a larger count is undefined and stays). SF, ZF, AF and PF stay. The
+ * shifts are of 64 bits and below 64. */
 #define INSTR_CALC(bits, a, b, cpu) \
-UINTOF(bits) operation_result = (a); \
-uint8_t operand_b = (b); \
 { \
-	operand_b = (operand_b & 0x1f) % (sizeof(operation_result) * 8 + 1); \
-	operation_result = operation_result << operand_b | operation_result >> (bits - operand_b + 1); \
-	if( CPU_FLAG_ISSET(cpu, f_cf) && operand_b > 0 ) \
+	uint8_t rotate_count = (b) & 0x1f; \
+	unsigned rotate_n = rotate_count % ((bits) + 1); \
+	if( rotate_n != 0 ) \
 	{ \
-		operation_result |= 1 << (operand_b - 1); \
-	} \
-	if( (a) & (1 << (bits - operand_b)) ) \
-	{ \
-		CPU_FLAG_SET(cpu, f_cf); \
-	} \
-	if( operand_b == 1 ) \
-	{ \
-		if( (operation_result >> (bits - 1)) ^ (cpu->eflags >> f_cf) ) \
-		{ \
-			CPU_FLAG_SET(cpu, f_of); \
-		} \
+		uint64_t rotate_all = ((uint64_t)1 << ((bits) + 1)) - 1; \
+		uint64_t rotate_w = (uint64_t)(UINTOF(bits))(a) | (uint64_t)(CPU_FLAG_ISSET(cpu, f_cf) ? 1 : 0) << (bits); \
+		rotate_w = (rotate_w << rotate_n | rotate_w >> ((bits) + 1 - rotate_n)) & rotate_all; \
+		a = (UINTOF(bits))rotate_w; \
+		if( (rotate_w >> (bits)) & 1 ) \
+			CPU_FLAG_SET(cpu, f_cf); \
 		else \
-		{ \
-			CPU_FLAG_UNSET(cpu, f_of); \
-		} \
+			CPU_FLAG_UNSET(cpu, f_cf); \
 	} \
-	a = operation_result; \
+	if( rotate_count == 1 ) \
+	{ \
+		if( ((((unsigned)((UINTOF(bits))(a) >> ((bits) - 1))) & 1) ^ (CPU_FLAG_ISSET(cpu, f_cf) ? 1u : 0u)) != 0 ) \
+			CPU_FLAG_SET(cpu, f_of); \
+		else \
+			CPU_FLAG_UNSET(cpu, f_of); \
+	} \
 }
 
 #define INSTR_CALC_AND_SET_FLAGS(bits, cpu, a, b) \
-INSTR_CALC(bits, a, b, cpu) \
-INSTR_SET_FLAG_ZF(cpu) \
-INSTR_SET_FLAG_PF(cpu) \
-INSTR_SET_FLAG_SF(cpu)
+INSTR_CALC(bits, a, b, cpu)
 
 #include "emu/emu.h"
 #include "emu/emu_cpu.h"

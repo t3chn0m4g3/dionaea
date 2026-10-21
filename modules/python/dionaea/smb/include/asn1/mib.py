@@ -21,8 +21,9 @@ from scapy.utils import do_graph
 
 _mib_re_integer = re.compile(r"^[0-9]+$")
 _mib_re_both = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_-]*)\(([0-9]+)\)$")
+# the pattern matches an OBJECT declaration of a MIB file (braces up to two levels deep)
 _mib_re_oiddecl = re.compile(
-    r"$\s*([a-zA-Z0-9_-]+)\s+OBJECT([^:\{\}]|\{[^:]+\})+::=\s*\{([^\}]+)\}",re.M)
+    r"$\s*([a-zA-Z0-9_-]+)\s+OBJECT(?:[^:{}]|\{(?:[^:{}]|\{[^:{}]*\})*\})+::=\s*\{([^}]+)\}", re.M)
 _mib_re_strings = re.compile(r'"[^"]*"')
 _mib_re_comments = re.compile(r'--.*(\r|\n)')
 

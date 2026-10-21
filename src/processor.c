@@ -7,7 +7,6 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#include <ctype.h>
 
 #include "dionaea.h"
 #include "connection.h"
@@ -919,6 +918,45 @@ static bool streamdumper_create(struct connection *con, struct streamdumper_ctx 
 	return true;
 }
 
+/* a byte of the stream that the dump has as \xNN: all but 0x20..0x7e, and ' and \; in every
+ * locale (isprint() of a locale of one byte per character takes bytes above 0x7e as well) */
+static bool streamdumper_escaped(unsigned char c)
+{
+	return c < 0x20 || c > 0x7e || c == '\'' || c == '\\';
+}
+
+/*
+ * write size bytes of the stream as the text of a Python bytes literal; in
+ * pieces of a fixed buffer, as a read can be several MiB (connection_tcp.c
+ * reads what the socket holds)
+ */
+static bool streamdumper_write_escaped(struct streamdumper_ctx *ctx, const unsigned char *data, size_t size)
+{
+	static const char conv[] = "0123456789abcdef";
+	char buf[4096];
+	size_t used = 0;
+	for( size_t i = 0; i < size; i++ )
+	{
+		if( used + 4 > sizeof(buf) )
+		{
+			if( !streamdumper_write(ctx, buf, used, "data") )
+				return false;
+			used = 0;
+		}
+		unsigned char c = data[i];
+		if( !streamdumper_escaped(c) )
+			buf[used++] = (char)c;
+		else
+		{
+			buf[used++] = '\\';
+			buf[used++] = 'x';
+			buf[used++] = conv[c >> 4];
+			buf[used++] = conv[c & 0x0f];
+		}
+	}
+	return used == 0 || streamdumper_write(ctx, buf, used, "data");
+}
+
 void proc_streamdumper_on_io(struct connection *con, struct processor_data *pd, void *data, int size, enum bistream_direction dir)
 {
 //	g_warning("%s con %p pd %p data %p size %i dir %i", __PRETTY_FUNCTION__, con, pd, data, size, dir);
@@ -928,24 +966,10 @@ void proc_streamdumper_on_io(struct connection *con, struct processor_data *pd, 
 	if( ctx->refused || ctx->stopped )
 		return;
 
-	char *cdata = data;
-	char xdata[size*4];
-	memset(xdata, 0, size*4);
-	char conv[] = "0123456789abcdef";
-	int writesize = 0;
-	for( int i=0; i<size;i++ )
-	{
-		if( isprint(cdata[i]) && cdata[i] != '\'' && cdata[i] != '\\' )
-		{
-			xdata[writesize++] = cdata[i];
-		}else
-		{
-			xdata[writesize++] = '\\';
-			xdata[writesize++] = 'x';
-			xdata[writesize++] = conv[((cdata[i] & 0xFF) >> 4)];
-			xdata[writesize++] = conv[((cdata[i] & 0xff) & 0x0F)];
-		}
-	}
+	const unsigned char *cdata = data;
+	size_t writesize = 0;
+	for( int i = 0; i < size; i++ )
+		writesize += streamdumper_escaped(cdata[i]) ? 4 : 1;
 
 	if( ctx->file == NULL )
 	{
@@ -964,7 +988,7 @@ void proc_streamdumper_on_io(struct connection *con, struct processor_data *pd, 
 	} else if( ctx->dump != NULL )
 	{
 		/* this chunk must fit below max_size, else the dump ends before it */
-		size_t chunk = (size_t)writesize;
+		size_t chunk = writesize;
 		if( ctx->last_was != dir )
 			chunk += strlen(streamdumper_change_stream) + strlen(streamdumper_direction[dir]) +
 				strlen(streamdumper_new_data);
@@ -991,7 +1015,7 @@ void proc_streamdumper_on_io(struct connection *con, struct processor_data *pd, 
 	}
 
 	if( writesize > 0 )
-		streamdumper_write(ctx, xdata, writesize, "data");
+		streamdumper_write_escaped(ctx, cdata, (size_t)size);
 }
 
 

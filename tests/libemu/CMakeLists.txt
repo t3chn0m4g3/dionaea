@@ -42,3 +42,10 @@ target_compile_definitions(test_w32_hooks PRIVATE _GNU_SOURCE)
 add_test(NAME w32_hooks COMMAND test_w32_hooks)
 set_tests_properties(w32_hooks PROPERTIES
   ENVIRONMENT "ASAN_OPTIONS=detect_leaks=1;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
+
+add_executable(test_rotate test_rotate.c)
+target_link_libraries(test_rotate PRIVATE emu)
+target_compile_definitions(test_rotate PRIVATE _GNU_SOURCE)
+add_test(NAME rotate COMMAND test_rotate)
+set_tests_properties(rotate PROPERTIES
+  ENVIRONMENT "ASAN_OPTIONS=detect_leaks=1;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")

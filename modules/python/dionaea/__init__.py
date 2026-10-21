@@ -8,7 +8,6 @@
 import glob
 import logging
 import pkgutil
-import traceback
 from threading import Event, Thread
 from typing import Callable, Optional
 
@@ -149,10 +148,7 @@ def load_submodules(base_pkg=None):
         try:
             __import__(modname, fromlist="dummy")
         except Exception as e:
-            logger.warning("Error loading module: {}".format(str(e)))
-
-            for msg in traceback.format_exc().split("\n"):
-                logger.warning(msg.rstrip())
+            logger.warning("Error loading module: %s", e, exc_info=True)
 
         loaded_submodules.append(modname)
 
