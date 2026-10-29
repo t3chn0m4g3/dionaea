@@ -38,6 +38,7 @@
 #include "util.h"
 #include "module.h"
 #include "log_summary.h"
+#include "hooks.h"
 
 struct dionaea *g_dionaea;
 
@@ -135,11 +136,42 @@ static void reported_free(gpointer data)
 NOT_REACHED(struct async_cmd *, async_cmd_new, async_cmd_cb function, void *data)
 NOT_REACHED(void, async_incident_report, void *data)
 NOT_REACHED(bool, bind_local, struct connection *con)
-NOT_REACHED(bool, connection_bind, struct connection *con, const char *addr, uint16_t port, const char *iface_scope)
-NOT_REACHED(void, connection_connect, struct connection *con, const char *addr, uint16_t port, const char *iface_scope)
+static bool connect_called;
+static bool connect_seen_download_guard;
+static bool connect_refused_sync;
+static char connect_addr[64];
+static uint16_t connect_port;
+
+bool connection_bind(struct connection *con, const char *addr, uint16_t port, const char *iface_scope)
+{
+	(void)iface_scope;
+	g_strlcpy(con->local.ip_string, addr, sizeof(con->local.ip_string));
+	con->local.port = htons(port);
+	return true;
+}
+
+void connection_connect(struct connection *con, const char *addr, uint16_t port, const char *iface_scope)
+{
+	(void)iface_scope;
+	connect_called = true;
+	connect_seen_download_guard = con->download_guard;
+	g_strlcpy(connect_addr, addr, sizeof(connect_addr));
+	connect_port = port;
+	if( connect_refused_sync )
+		con->state = connection_state_close;
+}
 NOT_REACHED(void, connection_listen_timeout_cb, struct ev_loop *loop, struct ev_timer *w, int revents)
-NOT_REACHED(struct connection *, connection_new, enum connection_transport type)
-NOT_REACHED(void, connection_protocol_set, struct connection *con, struct protocol *proto)
+struct connection *connection_new(enum connection_transport type)
+{
+	struct connection *con = g_malloc0(sizeof(*con));
+	con->trans = type;
+	con->socket = -1;
+	return con;
+}
+void connection_protocol_set(struct connection *con, struct protocol *proto)
+{
+	con->protocol = *proto;
+}
 NOT_REACHED(void, connection_send, struct connection *con, const void *data, uint32_t size)
 NOT_REACHED(void, connection_set_nonblocking, struct connection *con)
 NOT_REACHED(const char *, connection_state_to_string, enum connection_state state)
@@ -153,7 +185,13 @@ NOT_REACHED(int, connection_unref, struct connection *con)
 NOT_REACHED(void, connection_free, struct connection *con)
 NOT_REACHED(const char *, connection_type_to_string, enum connection_type type)
 NOT_REACHED(void, connection_close, struct connection *con)
-NOT_REACHED(bool, incident_value_con_set, struct incident *e, const char *name, struct connection *val)
+bool incident_value_con_set(struct incident *e, const char *name, struct connection *val)
+{
+	(void)e;
+	(void)name;
+	(void)val;
+	return true;
+}
 NOT_REACHED(struct thread *, thread_new, struct connection *con, void *data, GFunc function)
 NOT_REACHED(bool, thread_submit, struct thread *t)
 
@@ -447,6 +485,66 @@ static void open_file_is_no_sample(void)
 	g_free(path);
 }
 
+/* an emulation socket connect is guarded and reports no success-shaped link on sync refusal */
+static void emu_socket_connect_policy_guard_and_linking(void)
+{
+	struct emulation e;
+	emulation_init(&e);
+	e.conf.limits.sockets = 2;
+	e.ctx.sockets = g_hash_table_new_full(g_int_hash, g_int_equal, g_free, g_free);
+	struct connection parent = {0};
+	g_strlcpy(parent.local.ip_string, "198.51.100.8", sizeof(parent.local.ip_string));
+	e.ctx.ctxcon = &parent;
+	g_ptr_array_set_size(reports, 0);
+
+	uint32_t s = user_hook_socket(&e.env, NULL, AF_INET, SOCK_STREAM, 0);
+	g_assert_cmpuint(s, !=, (uint32_t)-1);
+	struct connection *con = g_hash_table_lookup(e.ctx.sockets, &s);
+	g_assert_nonnull(con);
+
+	struct async_connect_helper *help = g_malloc0(sizeof(*help));
+	help->parent = &parent;
+	help->con = con;
+	help->hostname = g_strdup("203.0.113.5");
+	help->port = 4444;
+
+	connect_called = false;
+	connect_seen_download_guard = false;
+	connect_refused_sync = true;
+	connect_addr[0] = '\0';
+	connect_port = 0;
+	async_connection_connect(help);
+	g_assert_true(connect_called);
+	g_assert_true(connect_seen_download_guard);
+	g_assert_cmpstr(connect_addr, ==, "203.0.113.5");
+	g_assert_cmpuint(connect_port, ==, 4444);
+	g_assert_cmpuint(reports->len, ==, 0);
+
+	uint32_t allowed_socket = user_hook_socket(&e.env, NULL, AF_INET, SOCK_STREAM, 0);
+	g_assert_cmpuint(allowed_socket, !=, (uint32_t)-1);
+	struct connection *allowed_con = g_hash_table_lookup(e.ctx.sockets, &allowed_socket);
+	g_assert_nonnull(allowed_con);
+
+	help = g_malloc0(sizeof(*help));
+	help->parent = &parent;
+	help->con = allowed_con;
+	help->hostname = g_strdup("198.51.100.77");
+	help->port = 5555;
+	connect_called = false;
+	connect_seen_download_guard = false;
+	connect_refused_sync = false;
+	async_connection_connect(help);
+	g_assert_true(connect_called);
+	g_assert_true(connect_seen_download_guard);
+	g_assert_cmpuint(reports->len, ==, 1);
+	struct reported *r = g_ptr_array_index(reports, 0);
+	g_assert_cmpstr(r->origin, ==, "dionaea.connection.link");
+	g_assert_cmpstr(allowed_con->local.ip_string, ==, "198.51.100.8");
+
+	g_hash_table_destroy(e.ctx.sockets);
+	emulation_clear(&e);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -460,6 +558,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/emu-hooks/files/create-write-close-is-a-sample", create_write_close_is_a_sample);
 	g_test_add_func("/emu-hooks/files/open-file-is-no-sample", open_file_is_no_sample);
 	g_test_add_func("/emu-hooks/WriteFile/write-failures", write_failures_are_info_and_one_warning_a_minute);
+	g_test_add_func("/emu-hooks/socket/connect-policy-guard-and-linking", emu_socket_connect_policy_guard_and_linking);
 	int result = g_test_run();
 	g_ptr_array_free(reports, TRUE);
 	g_ptr_array_free(warnings, TRUE);
