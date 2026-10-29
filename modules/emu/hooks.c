@@ -36,6 +36,7 @@
 #include "incident.h"
 #include "util.h"
 #include "log_summary.h"
+#include "hooks.h"
 
 #define D_LOG_DOMAIN "hooks"
 
@@ -575,14 +576,6 @@ uint32_t user_hook_bind(struct emu_env *env, struct emu_env_hook *hook, ...)
 	return 0;
 }
 
-struct async_connect_helper
-{
-	struct connection *parent;
-	struct connection *con;
-	char *hostname;
-	int port;
-};
-
 /**
  * Helper function for async_cmd
  * sets a connection into the ev_loop by calling connection_connect
@@ -600,15 +593,19 @@ void async_connection_connect(void *data)
 	// bind to parent address
 	connection_bind(help->con, help->parent->local.ip_string, 0, NULL);
 
-
+	/* an emulation connect follows the download destination policy */
+	con->download_guard = true;
 	connection_connect(con, help->hostname, help->port, NULL);
 //	connection_connect(con, "127.0.0.1", 4444, NULL);
 
-	struct incident *i = incident_new("dionaea.connection.link");
-	incident_value_con_set(i, "parent", help->parent);
-	incident_value_con_set(i, "child", help->con);
-	incident_report(i);
-	incident_free(i);
+	if( con->state != connection_state_close )
+	{
+		struct incident *i = incident_new("dionaea.connection.link");
+		incident_value_con_set(i, "parent", help->parent);
+		incident_value_con_set(i, "child", help->con);
+		incident_report(i);
+		incident_free(i);
+	}
 
 	g_free(help->hostname);
 	g_free(help);

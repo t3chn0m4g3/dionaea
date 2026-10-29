@@ -2,7 +2,7 @@ dionaea - catches bugs
 ======================
 
 This fork is maintained at [t3chn0m4g3/dionaea](https://github.com/t3chn0m4g3/dionaea)
-for T-Pot. Version 0.12.4 builds on Ubuntu 26.04 and uses a bundled GPL-2.0
+for T-Pot. Version 0.12.5 builds on Ubuntu 26.04 and uses a bundled GPL-2.0
 libemu sources (`third_party/libemu`); no archived libemu packages are needed.
 Windows DLL byte images are replaced by independently generated PE32 export
 metadata. Existing API hooks and addresses remain; shdocvw ordinals other than

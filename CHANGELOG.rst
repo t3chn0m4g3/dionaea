@@ -8,7 +8,22 @@
 Changelog
 =========
 
-0.12.4 - (`master`_)
+0.12.5 - (`master`_)
+--------------------
+
+**downloads**
+
+* Outbound connections made by emulated socket calls and profile-shell callbacks follow
+  the configured download destination policy. A rejected connection records no connection
+  link.
+* The JSON keys and value types and the SQLite schema stay compatible.
+
+**tests**
+
+* C and Python regression tests cover destination-policy selection and connection links
+  for allowed and rejected emulated connections and profile-shell callbacks.
+
+0.12.4 - (2026-10-21)
 --------------------
 
 **logs**

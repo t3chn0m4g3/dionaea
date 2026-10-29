@@ -411,10 +411,10 @@ class cmdshellhandler(ihandler):
         logger.debug("do shell")
         con = icd.con
         c = remoteshell()
-        i = incident("dionaea.connection.link")
-        i.parent = icd.con
-        i.child = c
         if icd.origin == "dionaea.service.shell.listen":
+            i = incident("dionaea.connection.link")
+            i.parent = icd.con
+            i.child = c
             if c.bind(con.local.host,icd.get('port')) == True and c.listen() == True:
                 i.report()
             else:
@@ -422,7 +422,18 @@ class cmdshellhandler(ihandler):
 #                con.unref()
         elif icd.origin == "dionaea.service.shell.connect":
             c.bind(con.local.host,0)
-            c.connect(icd.get('host'), icd.get('port'))
+            c.connect(icd.get('host'), icd.get('port'), download=True)
+            try:
+                if c.status == "close":
+                    return
+            except ReferenceError:
+                return
+            i = incident("dionaea.connection.link")
+            i.parent = icd.con
+            try:
+                i.child = c
+            except ReferenceError:
+                return
             i.report()
         else:
             c.close()
