@@ -1,7 +1,7 @@
 dionaea - catches bugs
 ======================
 
-This fork is maintained at [t3chn0m4g3/dionaea](https://github.com/t3chn0m4g3/dionaea)
+This fork is maintained at [telekom-security/dionaea](https://github.com/telekom-security/dionaea)
 for T-Pot. Version 0.12.5 builds on Ubuntu 26.04 and uses a bundled GPL-2.0
 libemu sources (`third_party/libemu`); no archived libemu packages are needed.
 Windows DLL byte images are replaced by independently generated PE32 export
@@ -56,8 +56,8 @@ Documentation
 -------------
 
 * [Documentation](https://dionaea.readthedocs.io/)
-* [Source](https://github.com/t3chn0m4g3/dionaea)
-* [Issues](https://github.com/t3chn0m4g3/dionaea/issues)
+* [Source](https://github.com/telekom-security/dionaea)
+* [Issues](https://github.com/telekom-security/dionaea/issues)
 
 Licenses
 --------
